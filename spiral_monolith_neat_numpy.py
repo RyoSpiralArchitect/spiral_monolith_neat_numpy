@@ -16,9 +16,21 @@
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
 import math, argparse, os
-import numpy as np
 import matplotlib
-matplotlib.use("Agg")
+
+
+def _ensure_matplotlib_agg(force: bool = False):
+    """Select Agg backend even if pyplot was already imported elsewhere."""
+    try:
+        matplotlib.use("Agg", force=force)
+    except TypeError:  # pragma: no cover - older matplotlib doesn't support force
+        matplotlib.use("Agg")
+    return matplotlib
+
+
+_ensure_matplotlib_agg()
+
+import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
 import imageio.v2 as imageio
@@ -34,8 +46,9 @@ __all__ = [
     "fitness_backprop_classifier","make_circles","make_xor","make_spirals",
     "draw_genome_png","export_regen_gif","export_morph_gif","export_double_exposure",
     "plot_learning_and_complexity","plot_decision_boundary",
-    "export_decision_boundaries_all","render_lineage"
-, "output_dim_from_space","build_action_mapper","run_policy_in_env","run_gym_neat_experiment"]
+    "export_decision_boundaries_all","render_lineage",
+    "output_dim_from_space","build_action_mapper","run_policy_in_env","run_gym_neat_experiment",
+]
 
 @dataclass
 class NodeGene:
@@ -675,16 +688,10 @@ class ReproPlanaNEATPlus:
             species=self.speciate(fitnesses)
             self._adapt_compat_threshold(len(species))
             self.reproduce(species, fitnesses)
-        # Final best
-        best=None; bestf=-1e9
-        for g in self.population:
-            f = fitness_fn(g)
-            if not self.mode.vanilla:
-                f *= self.sex_fitness_scale.get(g.sex, 1.0) * (getattr(g,'hybrid_scale',1.0))
-                if g.regen: f += self.regen_bonus
-            f -= self._complexity_penalty(g)
-            if f > bestf: bestf=f; best=g
-        return best or best_ever, history
+        # Champion across all generations
+        if best_ever is None and self.population:
+            best_ever = self.population[0].copy()
+        return best_ever, history
 
 # ============================================================
 # 4) Backprop NEAT (NumPy only)
@@ -976,7 +983,7 @@ def export_regen_gif(genomes: List[Genome], scars_seq: List[Dict[int, 'Scar']], 
         prev = g
     imageio.mimsave(out_path, frames, fps=fps)
 
-def export_morph_gif(genomes: List[Genome], scars_seq: List[Dict[int, 'Scar']], out_path: str,
+def _export_morph_gif_with_scars(genomes: List[Genome], scars_seq: List[Dict[int, 'Scar']], out_path: str,
                      fps: int = 12, morph_frames: int = 12, decay_horizon: float = 8.0):
     assert len(genomes) == len(scars_seq)
     pos = layout_by_depth_union(genomes)
@@ -1206,6 +1213,37 @@ def export_decision_boundaries_all(genome: Genome, out_dir: str, steps: int = 50
     plot_decision_boundary(genome, Xs, ys, path_s, steps=steps)
     return {"circles": path_c, "xor": path_x, "spiral": path_s}
 
+
+def export_task_gallery(
+    tasks: Tuple[str, ...],
+    gens: int,
+    pop: int,
+    steps: int,
+    out_dir: str,
+) -> Dict[str, str]:
+    """Run a batch of miniature experiments and collect figure paths."""
+
+    os.makedirs(out_dir or ".", exist_ok=True)
+    outputs: Dict[str, str] = {}
+    for task in tasks:
+        tag = f"{task}_g{gens}_p{pop}_s{steps}"
+        res = run_backprop_neat_experiment(
+            task,
+            gens=gens,
+            pop=pop,
+            steps=steps,
+            out_prefix=os.path.join(out_dir, tag),
+            make_gifs=False,
+            make_lineage=False,
+        )
+        if res.get("learning_curve"):
+            outputs[f"{task.upper()} 学習曲線"] = res["learning_curve"]
+        if res.get("decision_boundary"):
+            outputs[f"{task.upper()} 決定境界"] = res["decision_boundary"]
+        if res.get("topology"):
+            outputs[f"{task.upper()} トポロジ"] = res["topology"]
+    return outputs
+
 # ============================================================
 # 7) Toy datasets & CLI demo
 # ============================================================
@@ -1259,7 +1297,14 @@ def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefi
         regen_gif = f"{out_prefix}_regen.gif"
         export_regen_gif(neat.snapshots_genomes, neat.snapshots_scars, regen_gif, fps=12, pulse_period_frames=16, decay_horizon=10.0, fixed_layout=True)
         morph_gif = f"{out_prefix}_morph.gif"
-        export_morph_gif(neat.snapshots_genomes, neat.snapshots_scars, morph_gif, fps=12, morph_frames=12, decay_horizon=10.0)
+        export_morph_gif(
+            neat.snapshots_genomes,
+            neat.snapshots_scars,
+            path=morph_gif,
+            fps=12,
+            morph_frames=12,
+            decay_horizon=10.0,
+        )
     # Lineage (auto)
     lineage_path = None
     if make_lineage:
@@ -1277,28 +1322,6 @@ def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefi
         "lineage": lineage_path,
         "summary_decisions": summary_paths,
     }
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--env_id", type=str, default=None, help="Gym/Gymnasium environment id for RL mode")
-    ap.add_argument("--episodes", type=int, default=1)
-    ap.add_argument("--max_steps", type=int, default=2000)
-    ap.add_argument("--stochastic", action="store_true")
-    ap.add_argument("--temp", type=float, default=1.0)
-    ap.add_argument("--task", type=str, default="circles", choices=["circles","xor","spiral"])
-    ap.add_argument("--gens", type=int, default=30)
-    ap.add_argument("--pop", type=int, default=48)
-    ap.add_argument("--steps", type=int, default=40, help="backprop steps per individual evaluation")
-    ap.add_argument("--out_prefix", type=str, default="out/exp")
-    ap.add_argument("--no_gifs", action="store_true")
-    ap.add_argument("--no_lineage", action="store_true")
-    args = ap.parse_args()
-    paths = run_backprop_neat_experiment(args.task, args.gens, args.pop, args.steps, args.out_prefix, make_gifs=not args.no_gifs, make_lineage=not args.no_lineage)
-    for k,v in paths.items(): print(k, v)
-
-if __name__ == "__main__":
-    main()
-
 
 # === backend-agnostic Figure -> RGB helper ===
 def _fig_to_rgb(fig):
@@ -1406,8 +1429,23 @@ def export_regen_gif(
         node_scars = {}
         edge_scars = {}
         if snapshots_scars and t < len(snapshots_scars) and snapshots_scars[t]:
-            node_scars = dict(snapshots_scars[t].get("nodes", {}))
-            edge_scars = dict(snapshots_scars[t].get("edges", {}))
+            entry = snapshots_scars[t]
+            # 新形式: {"nodes": {...}, "edges": {...}}
+            if isinstance(entry, dict) and ("nodes" in entry or "edges" in entry):
+                raw_nodes = entry.get("nodes", {}) or {}
+                edge_scars = entry.get("edges", {}) or {}
+                try:
+                    node_scars = {
+                        nid: (val.age if hasattr(val, "age") else int(val))
+                        for nid, val in raw_nodes.items()
+                    }
+                except Exception:
+                    node_scars = {}
+            # 旧形式: {nid: Scar}
+            elif isinstance(entry, dict):
+                sample = next(iter(entry.values())) if entry else None
+                if hasattr(sample, "age"):
+                    node_scars = {nid: val.age for nid, val in entry.items()}
 
         fig, ax = _plt.subplots(figsize=(6.6, 4.8), dpi=dpi)
         ax.set_axis_off()
@@ -1461,19 +1499,47 @@ def export_regen_gif(
 
 def export_morph_gif(
     snapshots_genomes,
-    path,
+    snapshots_scars=None,
+    path=None,
+    *,
     fps=12,
     morph_frames=8,
     fixed_layout=True,
-    dpi=130
+    dpi=130,
+    decay_horizon=8.0,
 ):
     """
     Inter-generational morphological transition GIF.
-    Fades-out edges that disappear, keeps common edges, fades-in new edges.
+    Supports legacy calls with scar metadata as well as lightweight
+    visualisations that only rely on genomes.
     """
+    import os as _os
     import numpy as _np
     import imageio.v2 as _imageio
     import matplotlib.pyplot as _plt
+
+    # Normalise "path" / scars arguments for backward compatibility.
+    if path is None and isinstance(snapshots_scars, (str, bytes)):
+        path = snapshots_scars
+        snapshots_scars = None
+    elif path is None and hasattr(snapshots_scars, "__fspath__"):
+        path = _os.fspath(snapshots_scars)
+        snapshots_scars = None
+
+    if path is None:
+        raise ValueError("export_morph_gif: path must be provided")
+
+    if snapshots_scars is not None:
+        if len(snapshots_scars) != len(snapshots_genomes):
+            raise ValueError("export_morph_gif: scars_seq length must match genomes.")
+        return _export_morph_gif_with_scars(
+            snapshots_genomes,
+            snapshots_scars,
+            path,
+            fps=fps,
+            morph_frames=morph_frames,
+            decay_horizon=decay_horizon,
+        )
 
     if not snapshots_genomes or len(snapshots_genomes) < 2:
         raise ValueError("export_morph_gif: need >= 2 snapshots.")
@@ -1532,20 +1598,23 @@ def export_morph_gif(
             # gone edges fade out
             for (u, v) in sorted(gone):
                 p = pos0 if (u in pos0 and v in pos0) else pos1
-                if (u not in p) or (v not in p): continue
+                if (u not in p) or (v not in p):
+                    continue
                 x0, y0 = p[u]; x1, y1 = p[v]
                 ax.plot([x0, x1], [y0, y1], linestyle="dashed", linewidth=1.4, alpha=max(0.0, 1.0 - t))
 
             # kept edges stay
             for (u, v) in sorted(kept):
-                if (u not in pos0) or (v not in pos0): continue
+                if (u not in pos0) or (v not in pos0):
+                    continue
                 x0, y0 = pos0[u]; x1, y1 = pos0[v]
                 ax.plot([x0, x1], [y0, y1], linewidth=1.8, alpha=0.9)
 
             # born edges fade in
             for (u, v) in sorted(born):
                 p = pos1 if (u in pos1 and v in pos1) else pos0
-                if (u not in p) or (v not in p): continue
+                if (u not in p) or (v not in p):
+                    continue
                 x0, y0 = p[u]; x1, y1 = p[v]
                 ax.plot([x0, x1], [y0, y1], linewidth=2.2, alpha=max(0.0, t))
 
@@ -1554,12 +1623,16 @@ def export_morph_gif(
                      for nid in set(list(g0.nodes.keys()) + list(g1.nodes.keys()))}
             p = pos1 if fixed_layout else pos0
             for nid, (x, y) in p.items():
-                if nid not in types: continue
+                if nid not in types:
+                    continue
                 tname = types[nid]
                 sz = 50.0
-                if tname == "input":  sz = 35.0
-                if tname == "bias":   sz = 28.0
-                if tname == "output": sz = 60.0
+                if tname == "input":
+                    sz = 35.0
+                if tname == "bias":
+                    sz = 28.0
+                if tname == "output":
+                    sz = 60.0
                 ax.scatter([x], [y], s=sz, alpha=1.0, zorder=3, linewidths=0.8)
 
             img = _fig_to_rgb(fig)
@@ -1580,16 +1653,23 @@ def _softmax_np(x, axis=-1, temp=1.0):
     ex = np.exp(x)
     return ex / (np.sum(ex, axis=axis, keepdims=True) + 1e-9)
 
+def _import_gym():
+    try:
+        import gymnasium as gym  # type: ignore
+    except ImportError:  # pragma: no cover - fallback for legacy gym installs
+        import gym  # type: ignore
+    return gym
+
 def output_dim_from_space(space):
-    import gym
-    from gym.spaces import Discrete, MultiDiscrete, MultiBinary, Box
-    if isinstance(space, Discrete):
+    gym = _import_gym()
+    spaces = gym.spaces
+    if isinstance(space, spaces.Discrete):
         return int(space.n)
-    if isinstance(space, MultiDiscrete):
+    if isinstance(space, spaces.MultiDiscrete):
         return int(np.sum(space.nvec))
-    if isinstance(space, MultiBinary):
+    if isinstance(space, spaces.MultiBinary):
         return int(np.prod(space.n))
-    if isinstance(space, Box):
+    if isinstance(space, spaces.Box):
         return int(np.prod(space.shape))
     raise ValueError(f"Unsupported action space: {type(space)}")
 
@@ -1601,8 +1681,7 @@ def obs_dim_from_space(space):
     raise ValueError(f"Unsupported observation space: {type(space)}")
 
 def build_action_mapper(space, stochastic=False, temp=1.0):
-    import gym
-    from gym.spaces import Discrete, MultiDiscrete, MultiBinary, Box
+    gym = _import_gym()
 
     if isinstance(space, gym.spaces.Discrete):
         n = space.n
@@ -1664,7 +1743,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str = 'identity'):
-    import gym
+    gym = _import_gym()
     env = gym.make(env_id)
     obs_dim = obs_dim_from_space(env.observation_space)
     out_dim = output_dim_from_space(env.action_space)
@@ -1700,7 +1779,7 @@ def run_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_nor
 def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, episodes=1, obs_norm=None):
     """Return a fitness function for evolve() that evaluates average episodic reward."""
     def _fitness(genome):
-        import gym
+        gym = _import_gym()
         try: env = gym.make(env_id, render_mode="rgb_array")
         except TypeError: env = gym.make(env_id)
         mapper = build_action_mapper(env.action_space, stochastic=stochastic, temp=temp)
@@ -1710,3 +1789,218 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
         return total / max(1, int(episodes))
     return _fitness
 
+
+def run_gym_neat_experiment(
+    env_id: str,
+    gens: int = 20,
+    pop: int = 24,
+    episodes: int = 1,
+    max_steps: int = 500,
+    stochastic: bool = False,
+    temp: float = 1.0,
+    out_prefix: str = "out/rl",
+) -> Dict[str, Any]:
+    """Convenience wrapper that evolves NEAT agents on a Gym environment."""
+
+    neat, env = setup_neat_for_env(env_id, population=pop, output_activation="identity")
+    fit = gym_fitness_factory(
+        env_id,
+        stochastic=stochastic,
+        temp=temp,
+        max_steps=max_steps,
+        episodes=episodes,
+    )
+    best, hist = neat.evolve(fit, n_generations=gens, verbose=True)
+
+    os.makedirs(os.path.dirname(out_prefix) or ".", exist_ok=True)
+    rc_png = f"{out_prefix}_reward_curve.png"
+    xs = list(range(len(hist)))
+    ys_b = [b for (b, _a) in hist]
+    ys_a = [a for (_b, a) in hist]
+    plt.figure()
+    plt.plot(xs, ys_b, label="best")
+    plt.plot(xs, ys_a, label="avg")
+    plt.xlabel("generation")
+    plt.ylabel("episode reward")
+    plt.title(f"{env_id} | Average Episode Reward")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(rc_png, dpi=150)
+    plt.close()
+
+    try:
+        env.close()
+    except Exception:
+        pass
+
+    return {"best": best, "history": hist, "reward_curve": rc_png}
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    """Command-line interface entrypoint."""
+    _ensure_matplotlib_agg(force=True)
+
+    ap = argparse.ArgumentParser(description="Spiral-NEAT NumPy | built-in CLI")
+    ap.add_argument("--task", choices=["xor","circles","spiral"])
+    ap.add_argument("--gens", type=int, default=30)
+    ap.add_argument("--pop",  type=int, default=48)
+    ap.add_argument("--steps",type=int, default=40)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--rl-env", type=str)
+    ap.add_argument("--rl-gens", type=int, default=20)
+    ap.add_argument("--rl-pop",  type=int, default=24)
+    ap.add_argument("--rl-episodes", type=int, default=1)
+    ap.add_argument("--rl-max-steps", type=int, default=500)
+    ap.add_argument("--rl-stochastic", action="store_true")
+    ap.add_argument("--rl-temp", type=float, default=1.0)
+    ap.add_argument("--rl-gameplay-gif", action="store_true")
+    ap.add_argument("--out", default="out_monolith_cli")
+    ap.add_argument("--make-gifs", action="store_true")
+    ap.add_argument("--make-lineage", action="store_true")
+    ap.add_argument("--gallery", nargs="*", default=[])
+    ap.add_argument("--report", action="store_true")
+    args = ap.parse_args(None if argv is None else list(argv))
+
+    os.makedirs(args.out, exist_ok=True)
+    figs: Dict[str, Optional[str]] = {}
+
+    # supervised
+    if args.task:
+        np.random.seed(args.seed)
+        res = run_backprop_neat_experiment(
+            args.task, gens=args.gens, pop=args.pop, steps=args.steps,
+            out_prefix=os.path.join(args.out, args.task),
+            make_gifs=args.make_gifs, make_lineage=args.make_lineage
+        )
+        figs["図1 学習曲線＋複雑度"] = res.get("learning_curve")
+        figs["図2 最良トポロジ"] = res.get("topology")
+        regen_gif = res.get("regen_gif")
+        if regen_gif and os.path.exists(regen_gif):
+            with imageio.get_reader(regen_gif) as r:
+                idx = max(0, r.get_length()//2 - 1)
+                frame = r.get_data(idx)
+                fig3 = os.path.join(args.out, f"{args.task}_fig3_regen_frame.png")
+                imageio.imwrite(fig3, frame)
+                figs["図3 再生ダイジェスト代表フレーム"] = fig3
+        else:
+            figs["図3 決定境界"] = res.get("decision_boundary")
+
+        if args.gallery:
+            gal = export_task_gallery(
+                tasks=tuple(args.gallery),
+                gens=max(6, args.gens // 2),
+                pop=max(12, args.pop // 2),
+                steps=max(10, args.steps // 2),
+                out_dir=os.path.join(args.out, "gallery"),
+            )
+            for k, v in gal.items():
+                figs[f"ギャラリー {k}"] = v
+
+    # RL
+    if args.rl_env:
+        try:
+            gym = _import_gym()
+
+            env_probe = gym.make(args.rl_env)
+            try:
+                obs_dim = obs_dim_from_space(env_probe.observation_space)
+                action_space = env_probe.action_space
+                out_dim = output_dim_from_space(action_space)
+            finally:
+                try:
+                    env_probe.close()
+                except Exception:
+                    pass
+
+            neat = ReproPlanaNEATPlus(
+                num_inputs=obs_dim,
+                num_outputs=out_dim,
+                population_size=args.rl_pop,
+                output_activation="identity",
+            )
+            fit = gym_fitness_factory(
+                args.rl_env,
+                stochastic=args.rl_stochastic,
+                temp=args.rl_temp,
+                max_steps=args.rl_max_steps,
+                episodes=args.rl_episodes,
+            )
+            best, hist = neat.evolve(fit, n_generations=args.rl_gens, verbose=True)
+            rc_png = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_reward_curve.png")
+            xs = list(range(len(hist)))
+            ys_b = [b for (b, _a) in hist]
+            ys_a = [a for (_b, a) in hist]
+            plt.figure()
+            plt.plot(xs, ys_b, label="best")
+            plt.plot(xs, ys_a, label="avg")
+            plt.xlabel("generation")
+            plt.ylabel("episode reward")
+            plt.title(f"{args.rl_env} | Average Episode Reward")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(rc_png, dpi=150)
+            plt.close()
+            figs["RL 平均エピソード報酬"] = rc_png
+            if args.rl_gameplay_gif:
+                mapper = build_action_mapper(action_space, stochastic=args.rl_stochastic, temp=args.rl_temp)
+                gif = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_gameplay.gif")
+                try:
+                    env = gym.make(args.rl_env, render_mode="rgb_array")
+                except TypeError:
+                    env = gym.make(args.rl_env)
+                frames = []
+                reset_out = env.reset()
+                obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out) >= 1) else reset_out
+                done = False
+                steps = 0
+                while not done and steps < args.rl_max_steps:
+                    y = best.forward_one(np.asarray(obs, dtype=np.float32).ravel())
+                    act = mapper(y)
+                    step_out = env.step(act)
+                    if isinstance(step_out, tuple) and len(step_out) == 5:
+                        obs, reward, terminated, truncated, info = step_out
+                        done = bool(terminated or truncated)
+                    else:
+                        obs, reward, done, info = step_out
+                        done = bool(done)
+                    try:
+                        frame = env.render()
+                    except Exception:
+                        frame = None
+                    if frame is not None:
+                        frames.append(frame)
+                    steps += 1
+                try:
+                    env.close()
+                except Exception:
+                    pass
+                if frames:
+                    imageio.mimsave(gif, frames, duration=1 / 30)
+        except Exception as e:
+            print("[WARN] RL branch skipped:", e)
+
+    if args.report and figs:
+        # minimal self-contained HTML (base64 embed)
+        def _data_uri(p: str) -> str:
+            with open(p, "rb") as f:
+                import base64
+
+                return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+
+        html = os.path.join(args.out, "Sakana_NEAT_Report.html")
+        with open(html, "w", encoding="utf-8") as f:
+            f.write("<!DOCTYPE html><html lang='ja'><meta charset='utf-8'><title>Report</title><body>")
+            for k, p in figs.items():
+                if p and os.path.exists(p):
+                    f.write(
+                        f"<figure><img src='{_data_uri(p)}' style='max-width:100%'><figcaption><strong>{k}</strong></figcaption></figure>"
+                    )
+            f.write("</body></html>")
+        print("[REPORT]", html)
+
+    print("[OK] outputs in:", args.out)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
