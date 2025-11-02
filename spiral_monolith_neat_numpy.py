@@ -194,7 +194,13 @@ class Genome:
 
     def mutate_toggle_enable(self, rng: np.random.Generator, prob=0.01):
         for c in self.connections.values():
-            if rng.random() < prob: c.enabled = not c.enabled
+            if rng.random() >= prob:
+                continue
+            if c.enabled:
+                c.enabled = False
+            else:
+                if not self._creates_cycle(c.in_node, c.out_node):
+                    c.enabled = True
 
     def _choose_conn_for_node_add(self, rng: np.random.Generator, bias: str):
         enabled = [c for c in self.connections.values() if c.enabled]
@@ -2059,10 +2065,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str = 'identity'):
-    try:
-        import gymnasium as gym
-    except ImportError:
-        import gym
+    gym = _import_gym()
     env = gym.make(env_id)
     obs_dim = obs_dim_from_space(env.observation_space)
     out_dim = output_dim_from_space(env.action_space)
