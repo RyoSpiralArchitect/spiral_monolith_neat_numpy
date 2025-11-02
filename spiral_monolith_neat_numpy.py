@@ -1401,7 +1401,18 @@ def plot_learning_and_complexity(history: List[Tuple[float,float]], hidden_count
     if title: ax1.set_title(title)
     fig.tight_layout(); fig.savefig(out_path, dpi=200); plt.close(fig)
 
-def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int = 50):
+def plot_decision_boundary(
+    genome: Genome,
+    X,
+    y,
+    out_path: str,
+    steps: int = 50,
+    contour_cmap: str = "coolwarm",
+    point_cmap: Optional[str] = None,
+    point_size: float = 12.0,
+    point_alpha: float = 0.85,
+    add_colorbar: bool = False,
+):
     gg = genome.copy()
     try:
         train_with_backprop_numpy(gg, X, y, steps=steps, lr=5e-3, l2=1e-4)
@@ -1413,8 +1424,19 @@ def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int = 50)
     grid = np.stack([xx.ravel(), yy.ravel()], axis=1)
     P = predict_proba(gg, grid)[:,1].reshape(xx.shape)
     fig, ax = plt.subplots(figsize=(6,4))
-    cs = ax.contourf(xx, yy, P, levels=20, alpha=0.8)
-    ax.scatter(X[:,0], X[:,1], s=8, alpha=0.8)
+    cs = ax.contourf(xx, yy, P, levels=20, alpha=0.85, cmap=contour_cmap)
+    scatter_kwargs = {
+        "s": point_size,
+        "alpha": point_alpha,
+        "linewidths": 0.25,
+        "edgecolors": "black",
+    }
+    if point_cmap:
+        ax.scatter(X[:,0], X[:,1], c=y, cmap=point_cmap, **scatter_kwargs)
+    else:
+        ax.scatter(X[:,0], X[:,1], c=y, cmap="gray", **scatter_kwargs)
+    if add_colorbar:
+        fig.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
     ax.set_xlabel("x"); ax.set_ylabel("y")
     fig.tight_layout(); fig.savefig(out_path, dpi=220); plt.close(fig)
 
@@ -1424,15 +1446,42 @@ def export_decision_boundaries_all(genome: Genome, out_dir: str, steps: int = 50
     # Circles
     Xc, yc = make_circles(512, r=0.6, noise=0.05, seed=seed)
     path_c = os.path.join(out_dir, "decision_circles.png")
-    plot_decision_boundary(genome, Xc, yc, path_c, steps=steps)
+    plot_decision_boundary(
+        genome,
+        Xc,
+        yc,
+        path_c,
+        steps=steps,
+        contour_cmap="cividis",
+        point_cmap="cool",
+        point_size=22.0,
+    )
     # XOR
     Xx, yx = make_xor(512, noise=0.05, seed=seed)
     path_x = os.path.join(out_dir, "decision_xor.png")
-    plot_decision_boundary(genome, Xx, yx, path_x, steps=steps)
+    plot_decision_boundary(
+        genome,
+        Xx,
+        yx,
+        path_x,
+        steps=steps,
+        contour_cmap="Spectral",
+        point_cmap="Dark2",
+        point_size=18.0,
+    )
     # Spiral
     Xs, ys = make_spirals(512, noise=0.05, turns=1.5, seed=seed)
     path_s = os.path.join(out_dir, "decision_spiral.png")
-    plot_decision_boundary(genome, Xs, ys, path_s, steps=steps)
+    plot_decision_boundary(
+        genome,
+        Xs,
+        ys,
+        path_s,
+        steps=steps,
+        contour_cmap="magma",
+        point_cmap="plasma",
+        point_size=14.0,
+    )
     return {"circles": path_c, "xor": path_x, "spiral": path_s}
 
 
@@ -1448,7 +1497,7 @@ def export_task_gallery(
     os.makedirs(out_dir or ".", exist_ok=True)
     outputs: Dict[str, str] = {}
     import zlib
-    for task in tasks:
+    for idx, task in enumerate(tasks, start=1):
         tag = f"{task}_g{gens}_p{pop}_s{steps}"
         seed = zlib.crc32(f"{task}|{gens}|{pop}|{steps}".encode("utf-8")) & 0xFFFFFFFF
         res = run_backprop_neat_experiment(
@@ -1461,12 +1510,28 @@ def export_task_gallery(
             make_lineage=False,
             rng_seed=seed,
         )
-        if res.get("learning_curve"):
-            outputs[f"{task.upper()} 学習曲線"] = res["learning_curve"]
-        if res.get("decision_boundary"):
-            outputs[f"{task.upper()} 決定境界"] = res["decision_boundary"]
-        if res.get("topology"):
-            outputs[f"{task.upper()} トポロジ"] = res["topology"]
+        lc = res.get("learning_curve")
+        db = res.get("decision_boundary")
+        if lc and db and os.path.exists(lc) and os.path.exists(db):
+            combo = os.path.join(out_dir, f"{idx:02d}_{tag}_gallery.png")
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
+            for ax, path, title in zip(axes, (lc, db), ("学習曲線", "決定境界")):
+                img = _imread_image(path)
+                ax.imshow(img)
+                ax.set_title(f"{task.upper()} | {title}")
+                ax.axis("off")
+            fig.tight_layout()
+            fig.savefig(combo, dpi=220)
+            plt.close(fig)
+            outputs[f"{idx:02d} {task.upper()} 学習曲線＋決定境界"] = combo
+        else:
+            if lc:
+                outputs[f"{idx:02d} {task.upper()} 学習曲線"] = lc
+            if db:
+                outputs[f"{idx:02d} {task.upper()} 決定境界"] = db
+        topo = res.get("topology")
+        if topo:
+            outputs[f"{idx:02d} {task.upper()} トポロジ"] = topo
     return outputs
 
 # ============================================================
@@ -1523,7 +1588,13 @@ def run_backprop_neat_experiment(
     lc_path = f"{out_prefix}_learning_complexity.png"
     plot_learning_and_complexity(hist, neat.hidden_counts_history, neat.edge_counts_history, lc_path, title=f"{task.upper()} | Backprop NEAT", ma_window=7)
     db_path = f"{out_prefix}_decision_boundary.png"
-    plot_decision_boundary(best, Xtr, ytr, db_path, steps=steps)
+    style_map = {
+        "circles": dict(contour_cmap="cividis", point_cmap="cool", point_size=26.0),
+        "xor": dict(contour_cmap="Spectral", point_cmap="Dark2", point_size=20.0),
+        "spiral": dict(contour_cmap="magma", point_cmap="plasma", point_size=16.0),
+    }
+    style = style_map.get(task, {})
+    plot_decision_boundary(best, Xtr, ytr, db_path, steps=steps, **style)
     topo_path = f"{out_prefix}_topology.png"; scars = diff_scars(None, best, None, birth_gen=gens, regen_mode_for_new="split")
     draw_genome_png(best, scars, topo_path, title=f"Best Topology (Gen {gens})")
     # GIFs (auto)
@@ -2629,31 +2700,70 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return f"data:{mime};base64,{raw}", mime
 
         html = os.path.join(args.out, "Sakana_NEAT_Report.html")
+        entries = [(k, p) for k, p in figs.items() if p and os.path.exists(p)]
         with open(html, "w", encoding="utf-8") as f:
-            f.write("<!DOCTYPE html><html lang='ja'><meta charset='utf-8'><title>Report</title><body>")
-            for k, p in figs.items():
-                if p and os.path.exists(p):
-                    uri, mime = _data_uri(p)
-                    if mime == "image/gif":
-                        f.write(
-                            f"<figure><img src='{uri}' style='max-width:100%'>"
-                            f"<figcaption><strong>{k}</strong></figcaption></figure>"
-                        )
-                    elif mime.startswith("image/"):
-                        f.write(
-                            f"<figure><img src='{uri}' style='max-width:100%'><figcaption><strong>{k}</strong></figcaption></figure>"
-                        )
-                    elif mime.startswith("video/"):
-                        f.write(
-                            "<figure><video autoplay loop muted playsinline style='max-width:100%'>"
-                            f"<source src='{uri}' type='{mime}'></video>"
-                            f"<figcaption><strong>{k}</strong></figcaption></figure>"
-                        )
-                    else:
-                        f.write(
-                            f"<figure><a href='{uri}'>download {os.path.basename(p)}</a>"
-                            f"<figcaption><strong>{k}</strong></figcaption></figure>"
-                        )
+            from datetime import datetime
+
+            f.write("<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'><title>Report</title>")
+            f.write(
+                "<style>body{font-family:'Hiragino Sans','Noto Sans JP',sans-serif;background:#fafafa;color:#222;line-height:1.6;padding:2rem;}"
+                "header.cover{background:#fff;border:1px solid #ddd;border-radius:12px;padding:1.5rem;margin-bottom:2rem;box-shadow:0 8px 20px rgba(0,0,0,0.05);}"
+                "header.cover h1{margin-top:0;font-size:1.9rem;}"
+                "header.cover ul{margin:0;padding-left:1.2rem;}"
+                "section.legend{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:1.25rem;margin-bottom:2rem;}"
+                "section.legend ol{margin:0;padding-left:1.4rem;}"
+                "figure{background:#fff;border:1px solid #e8e8e8;border-radius:12px;padding:1rem;margin:0 0 2rem 0;box-shadow:0 12px 24px rgba(0,0,0,0.04);}"
+                "figure img,figure video{width:100%;height:auto;border-radius:8px;}"
+                "figcaption{margin-top:0.75rem;font-weight:600;}"
+                "</style></head><body>"
+            )
+
+            f.write("<header class='cover'>")
+            f.write("<h1>Spiral Monolith NEAT Report</h1>")
+            f.write(
+                f"<p>生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 主要タスク: {args.task.upper() if args.task else 'N/A'}</p>"
+            )
+            if args.gallery:
+                f.write("<p>ギャラリー: " + ", ".join(t.upper() for t in args.gallery) + "</p>")
+            f.write("<ul>")
+            f.write(f"<li>世代数: {args.gens}</li>")
+            f.write(f"<li>集団サイズ: {args.pop}</li>")
+            f.write(f"<li>Backprop steps: {args.steps}</li>")
+            if args.rl_env:
+                f.write(f"<li>RL 環境: {args.rl_env}</li>")
+            f.write("</ul>")
+            f.write("</header>")
+
+            if entries:
+                f.write("<section class='legend'><h2>図版リスト</h2><ol>")
+                for label, path in entries:
+                    f.write(
+                        f"<li><strong>{label}</strong><br><small>{os.path.basename(path)}</small></li>"
+                    )
+                f.write("</ol></section>")
+
+            for k, p in entries:
+                uri, mime = _data_uri(p)
+                if mime == "image/gif":
+                    f.write(
+                        f"<figure><img src='{uri}' style='max-width:100%'>"
+                        f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                    )
+                elif mime.startswith("image/"):
+                    f.write(
+                        f"<figure><img src='{uri}' style='max-width:100%'><figcaption><strong>{k}</strong></figcaption></figure>"
+                    )
+                elif mime.startswith("video/"):
+                    f.write(
+                        "<figure><video autoplay loop muted playsinline style='max-width:100%'>"
+                        f"<source src='{uri}' type='{mime}'></video>"
+                        f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                    )
+                else:
+                    f.write(
+                        f"<figure><a href='{uri}'>download {os.path.basename(p)}</a>"
+                        f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                    )
             f.write("</body></html>")
         print("[REPORT]", html)
 
