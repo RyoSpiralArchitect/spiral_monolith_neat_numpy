@@ -1260,9 +1260,10 @@ def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefi
         export_regen_gif(neat.snapshots_genomes, neat.snapshots_scars, regen_gif, fps=12, pulse_period_frames=16, decay_horizon=10.0, fixed_layout=True)
         morph_gif = f"{out_prefix}_morph.gif"
         export_morph_gif(
-            snapshots_genomes=neat.snapshots_genomes,
-            snapshots_scars=neat.snapshots_scars,
+            neat.snapshots_genomes,
+            neat.snapshots_scars,
             path=morph_gif,
+            fps=12,
             morph_frames=12,
             decay_horizon=10.0,
         )
@@ -1620,6 +1621,13 @@ def _softmax_np(x, axis=-1, temp=1.0):
     x = x - np.max(x, axis=axis, keepdims=True)
     ex = np.exp(x)
     return ex / (np.sum(ex, axis=axis, keepdims=True) + 1e-9)
+
+def _import_gym():
+    try:
+        import gymnasium as gym  # type: ignore
+    except ImportError:  # pragma: no cover - fallback for legacy gym installs
+        import gym  # type: ignore
+    return gym
 
 def output_dim_from_space(space):
     try:
