@@ -15,7 +15,7 @@
 
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
-import math, argparse, os
+import math, argparse, os, mimetypes
 import matplotlib
 
 
@@ -1837,7 +1837,7 @@ def export_scars_spiral_map(
     *,
     turns: Optional[float] = None,
     jitter: float = 0.012,
-    marker_size: float = 18.0,
+    marker_size: float = 26.0,
     dpi: int = 220,
     title: str = "Scars Spiral Map"
 ):
@@ -1919,6 +1919,8 @@ def export_scars_spiral_map(
     # --- 角度θと半径rへ写像し、モード別に点群を作る ---
     xs = {"split": [], "head": [], "tail": [], "other": []}
     ys = {"split": [], "head": [], "tail": [], "other": []}
+    heat_x: List[float] = []
+    heat_y: List[float] = []
 
     for g, items in events_by_gen.items():
         theta = theta_max * (g / max(1, G-1))
@@ -1931,7 +1933,10 @@ def export_scars_spiral_map(
             x = r * _np.cos(theta)
             y = r * _np.sin(theta)
             key = mode if mode in xs else "other"
-            xs[key].append(x); ys[key].append(y)
+            xs[key].append(x)
+            ys[key].append(y)
+            heat_x.append(x)
+            heat_y.append(y)
 
     # --- 描画 ---
     fig, ax = _plt.subplots(figsize=(6, 6), dpi=dpi, subplot_kw={"aspect": "equal"})
@@ -1940,11 +1945,39 @@ def export_scars_spiral_map(
     rr = r0 + (r1 - r0) * (ts / theta_max)
     ax.plot(rr * _np.cos(ts), rr * _np.sin(ts), linewidth=1.0, alpha=0.35, linestyle="-")
 
+    # ヒートマップ層（2Dビニング）
+    if heat_x and heat_y:
+        bins = 160
+        heat_grid, xedges, yedges = _np.histogram2d(
+            heat_x,
+            heat_y,
+            bins=bins,
+            range=[[-1.05, 1.05], [-1.05, 1.05]],
+        )
+        heat_grid = heat_grid.astype(float)
+        if heat_grid.max() > 0:
+            heat_grid /= heat_grid.max()
+            kernel = _np.array([[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]], dtype=float)
+            kernel /= kernel.sum()
+            padded = _np.pad(heat_grid, 1, mode="reflect")
+            smooth = _np.zeros_like(heat_grid)
+            for i in range(heat_grid.shape[0]):
+                for j in range(heat_grid.shape[1]):
+                    smooth[i, j] = _np.sum(padded[i : i + 3, j : j + 3] * kernel)
+            ax.imshow(
+                smooth.T,
+                extent=[-1.05, 1.05, -1.05, 1.05],
+                origin="lower",
+                cmap="inferno",
+                alpha=0.45,
+                interpolation="bilinear",
+            )
+
     markers = {"split": "o", "head": "s", "tail": "^", "other": "x"}
     labels  = {"split": "split", "head": "head", "tail": "tail", "other": "other"}
     for k in ("split", "head", "tail", "other"):
         if xs[k]:
-            ax.scatter(xs[k], ys[k], s=marker_size, alpha=0.35, marker=markers[k], linewidths=0.7, label=labels[k])
+            ax.scatter(xs[k], ys[k], s=marker_size, alpha=0.15, marker=markers[k], linewidths=0.7, label=labels[k])
 
     ax.set_xlim(-1.05, 1.05); ax.set_ylim(-1.05, 1.05)
     ax.set_axis_off()
@@ -2303,25 +2336,54 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                     pass
                 if frames:
                     imageio.mimsave(gif, frames, duration=1 / 30)
+                    figs["RL ゲームプレイ"] = gif
         except Exception as e:
             print("[WARN] RL branch skipped:", e)
 
     if args.report and figs:
         # minimal self-contained HTML (base64 embed)
-        def _data_uri(p: str) -> str:
+        def _data_uri(p: str) -> Tuple[str, str]:
             with open(p, "rb") as f:
                 import base64
 
-                return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+                raw = base64.b64encode(f.read()).decode("ascii")
+            mime, _ = mimetypes.guess_type(p)
+            if mime is None:
+                if p.lower().endswith(".gif"):
+                    mime = "image/gif"
+                elif p.lower().endswith((".mp4", ".webm")):
+                    mime = "video/mp4"
+                else:
+                    mime = "application/octet-stream"
+            return f"data:{mime};base64,{raw}", mime
 
         html = os.path.join(args.out, "Sakana_NEAT_Report.html")
         with open(html, "w", encoding="utf-8") as f:
             f.write("<!DOCTYPE html><html lang='ja'><meta charset='utf-8'><title>Report</title><body>")
             for k, p in figs.items():
                 if p and os.path.exists(p):
-                    f.write(
-                        f"<figure><img src='{_data_uri(p)}' style='max-width:100%'><figcaption><strong>{k}</strong></figcaption></figure>"
-                    )
+                    uri, mime = _data_uri(p)
+                    if mime == "image/gif":
+                        f.write(
+                            "<figure><video autoplay loop muted playsinline style='max-width:100%'>"
+                            f"<source src='{uri}' type='{mime}'></video>"
+                            f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                        )
+                    elif mime.startswith("image/"):
+                        f.write(
+                            f"<figure><img src='{uri}' style='max-width:100%'><figcaption><strong>{k}</strong></figcaption></figure>"
+                        )
+                    elif mime.startswith("video/"):
+                        f.write(
+                            "<figure><video autoplay loop muted playsinline style='max-width:100%'>"
+                            f"<source src='{uri}' type='{mime}'></video>"
+                            f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                        )
+                    else:
+                        f.write(
+                            f"<figure><a href='{uri}'>download {os.path.basename(p)}</a>"
+                            f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                        )
             f.write("</body></html>")
         print("[REPORT]", html)
 
