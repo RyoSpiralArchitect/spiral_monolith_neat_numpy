@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
 import math, argparse, os
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
 import imageio.v2 as imageio
@@ -1296,3 +1298,415 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# === backend-agnostic Figure -> RGB helper ===
+def _fig_to_rgb(fig):
+    """
+    Convert a matplotlib Figure to an RGB uint8 ndarray (H, W, 3), robust across backends.
+    Tries Agg (tostring_rgb), then MacOSX (tostring_argb), then in-memory PNG fallback.
+    """
+    fig.canvas.draw()
+    try:
+        w, h = fig.canvas.get_width_height()
+    except Exception:
+        w, h = map(int, fig.get_size_inches() * fig.dpi)
+
+    # Agg: direct RGB
+    if hasattr(fig.canvas, "tostring_rgb"):
+        import numpy as _np
+        buf = _np.frombuffer(fig.canvas.tostring_rgb(), dtype=_np.uint8)
+        return buf.reshape(h, w, 3)
+
+    # MacOSX: ARGB -> RGB
+    if hasattr(fig.canvas, "tostring_argb"):
+        import numpy as _np
+        buf = _np.frombuffer(fig.canvas.tostring_argb(), dtype=_np.uint8).reshape(h, w, 4)
+        return buf[:, :, 1:4].copy()
+
+    # Fallback: save to PNG in-memory and read back
+    import io, imageio.v2 as _imageio
+    bio = io.BytesIO()
+    fig.savefig(bio, format="png", dpi=fig.dpi, bbox_inches="tight", pad_inches=0.0)
+    bio.seek(0)
+    img = _imageio.imread(bio)
+    if img.ndim == 3 and img.shape[2] >= 3:
+        img = img[:, :, :3]
+    return img
+
+
+
+def export_regen_gif(
+    snapshots_genomes,
+    snapshots_scars,
+    path,
+    fps=12,
+    pulse_period_frames=16,
+    decay_horizon=10.0,
+    fixed_layout=True,
+    dpi=130
+):
+    """
+    Render a regeneration digest GIF from per-generation snapshots.
+    Encodes differences without color semantics: linestyle/linewidth/alpha only.
+    """
+    import numpy as _np
+    import imageio.v2 as _imageio
+    import matplotlib.pyplot as _plt
+
+    if not snapshots_genomes:
+        raise ValueError("export_regen_gif: snapshots_genomes is empty.")
+
+    def _node_groups_and_depths(_g):
+        depth = _g.node_depths()
+        groups = {"input": [], "bias": [], "hidden": [], "output": []}
+        for nid, n in _g.nodes.items():
+            groups.get(n.type, groups["hidden"]).append(nid)
+        for k in groups:
+            groups[k].sort()
+        max_d = max(depth.values()) if depth else 1
+        return groups, depth, max_d
+
+    def _compute_positions(_g):
+        groups, depth, max_d = _node_groups_and_depths(_g)
+        pos = {}
+        bands = [("input", 0.85, 1.00), ("bias", 0.70, 0.82),
+                 ("hidden", 0.20, 0.68), ("output", 0.02, 0.18)]
+        for (gname, y0, y1) in bands:
+            arr = groups[gname]
+            n = max(1, len(arr))
+            ys = _np.linspace(y1, y0, n)
+            for i, nid in enumerate(arr):
+                t = depth.get(nid, 0)
+                if gname in ("input", "bias"):
+                    x = 0.04
+                elif gname == "output":
+                    x = 0.96
+                else:
+                    x = 0.10 + 0.80 * (t / max(1, max_d))
+                pos[nid] = (x, ys[i])
+        return pos
+
+    def _pulse_amp(age, frame_idx):
+        base = max(0.1, 1.0 - float(age) / max(1e-6, decay_horizon))
+        phase = 2.0 * _np.pi * (frame_idx % max(1, pulse_period_frames)) / max(1, pulse_period_frames)
+        return float(base * (0.5 + 0.5 * _np.sin(phase)))
+
+    frames = []
+    prev_edges = None
+    pos_fixed = _compute_positions(snapshots_genomes[0]) if fixed_layout else None
+
+    for t, g in enumerate(snapshots_genomes):
+        pos = pos_fixed if fixed_layout else _compute_positions(g)
+        cur_edges = set((c.in_node, c.out_node) for c in g.enabled_connections())
+        added = cur_edges - (prev_edges or set())
+        removed = (prev_edges or set()) - cur_edges
+        common = cur_edges & (prev_edges or set()) if prev_edges is not None else cur_edges
+
+        node_scars = {}
+        edge_scars = {}
+        if snapshots_scars and t < len(snapshots_scars) and snapshots_scars[t]:
+            node_scars = dict(snapshots_scars[t].get("nodes", {}))
+            edge_scars = dict(snapshots_scars[t].get("edges", {}))
+
+        fig, ax = _plt.subplots(figsize=(6.6, 4.8), dpi=dpi)
+        ax.set_axis_off()
+        ax.set_xlim(0.0, 1.0); ax.set_ylim(0.0, 1.0)
+
+        # removed edges (dashed, low alpha)
+        for (u, v) in sorted(removed):
+            if (u not in pos) or (v not in pos): continue
+            x0, y0 = pos[u]; x1, y1 = pos[v]
+            ax.plot([x0, x1], [y0, y1], linestyle="dashed", linewidth=1.0, alpha=0.25)
+
+        # common edges (normal)
+        for (u, v) in sorted(common):
+            if (u not in pos) or (v not in pos): continue
+            x0, y0 = pos[u]; x1, y1 = pos[v]
+            lw = 1.6
+            if (u, v) in edge_scars: lw += 0.6 * _pulse_amp(edge_scars[(u, v)], t)
+            ax.plot([x0, x1], [y0, y1], linewidth=lw, alpha=0.9)
+
+        # added edges (thick)
+        for (u, v) in sorted(added):
+            if (u not in pos) or (v not in pos): continue
+            x0, y0 = pos[u]; x1, y1 = pos[v]
+            ax.plot([x0, x1], [y0, y1], linewidth=2.2, alpha=0.95)
+
+        # nodes (size by role; scars as pulsating outline)
+        types = {nid: g.nodes[nid].type for nid in g.nodes}
+        for nid, (x, y) in pos.items():
+            if nid not in types: continue
+            tname = types[nid]
+            sz = 50.0
+            if tname == "input":  sz = 35.0
+            if tname == "bias":   sz = 28.0
+            if tname == "output": sz = 60.0
+            ax.scatter([x], [y], s=sz, alpha=1.0, zorder=3, linewidths=0.8)
+            age = node_scars.get(nid, None)
+            if age is not None:
+                amp = _pulse_amp(age, t)
+                circ = _plt.Circle((x, y), 0.018 + 0.012 * amp, fill=False, linewidth=1.0 + 2.0 * amp, alpha=0.6)
+                ax.add_patch(circ)
+
+        img = _fig_to_rgb(fig)
+        frames.append(img)
+        _plt.close(fig)
+        prev_edges = cur_edges
+
+    _imageio.mimsave(path, frames, duration=1.0 / max(1, fps))
+    return path
+
+
+
+def export_morph_gif(
+    snapshots_genomes,
+    path,
+    fps=12,
+    morph_frames=8,
+    fixed_layout=True,
+    dpi=130
+):
+    """
+    Inter-generational morphological transition GIF.
+    Fades-out edges that disappear, keeps common edges, fades-in new edges.
+    """
+    import numpy as _np
+    import imageio.v2 as _imageio
+    import matplotlib.pyplot as _plt
+
+    if not snapshots_genomes or len(snapshots_genomes) < 2:
+        raise ValueError("export_morph_gif: need >= 2 snapshots.")
+
+    def _node_groups_and_depths(_g):
+        depth = _g.node_depths()
+        groups = {"input": [], "bias": [], "hidden": [], "output": []}
+        for nid, n in _g.nodes.items():
+            groups.get(n.type, groups["hidden"]).append(nid)
+        for k in groups:
+            groups[k].sort()
+        max_d = max(depth.values()) if depth else 1
+        return groups, depth, max_d
+
+    def _compute_positions(_g):
+        groups, depth, max_d = _node_groups_and_depths(_g)
+        pos = {}
+        bands = [("input", 0.85, 1.00), ("bias", 0.70, 0.82),
+                 ("hidden", 0.20, 0.68), ("output", 0.02, 0.18)]
+        for (gname, y0, y1) in bands:
+            arr = groups[gname]
+            n = max(1, len(arr))
+            ys = _np.linspace(y1, y0, n)
+            for i, nid in enumerate(arr):
+                t = depth.get(nid, 0)
+                if gname in ("input", "bias"):
+                    x = 0.04
+                elif gname == "output":
+                    x = 0.96
+                else:
+                    x = 0.10 + 0.80 * (t / max(1, max_d))
+                pos[nid] = (x, ys[i])
+        return pos
+
+    pos_fixed = _compute_positions(snapshots_genomes[0]) if fixed_layout else None
+
+    frames = []
+    for i in range(len(snapshots_genomes) - 1):
+        g0 = snapshots_genomes[i]
+        g1 = snapshots_genomes[i + 1]
+        pos0 = pos_fixed if fixed_layout else _compute_positions(g0)
+        pos1 = pos_fixed if fixed_layout else _compute_positions(g1)
+
+        E0 = set((c.in_node, c.out_node) for c in g0.enabled_connections())
+        E1 = set((c.in_node, c.out_node) for c in g1.enabled_connections())
+        kept = E0 & E1
+        gone = E0 - E1
+        born = E1 - E0
+
+        for k in range(max(1, morph_frames)):
+            t = 0.0 if morph_frames <= 1 else k / float(morph_frames - 1)
+
+            fig, ax = _plt.subplots(figsize=(6.6, 4.8), dpi=dpi)
+            ax.set_axis_off(); ax.set_xlim(0.0, 1.0); ax.set_ylim(0.0, 1.0)
+
+            # gone edges fade out
+            for (u, v) in sorted(gone):
+                p = pos0 if (u in pos0 and v in pos0) else pos1
+                if (u not in p) or (v not in p): continue
+                x0, y0 = p[u]; x1, y1 = p[v]
+                ax.plot([x0, x1], [y0, y1], linestyle="dashed", linewidth=1.4, alpha=max(0.0, 1.0 - t))
+
+            # kept edges stay
+            for (u, v) in sorted(kept):
+                if (u not in pos0) or (v not in pos0): continue
+                x0, y0 = pos0[u]; x1, y1 = pos0[v]
+                ax.plot([x0, x1], [y0, y1], linewidth=1.8, alpha=0.9)
+
+            # born edges fade in
+            for (u, v) in sorted(born):
+                p = pos1 if (u in pos1 and v in pos1) else pos0
+                if (u not in p) or (v not in p): continue
+                x0, y0 = p[u]; x1, y1 = p[v]
+                ax.plot([x0, x1], [y0, y1], linewidth=2.2, alpha=max(0.0, t))
+
+            # nodes
+            types = {nid: (g1.nodes[nid].type if nid in g1.nodes else g0.nodes.get(nid, None).type)
+                     for nid in set(list(g0.nodes.keys()) + list(g1.nodes.keys()))}
+            p = pos1 if fixed_layout else pos0
+            for nid, (x, y) in p.items():
+                if nid not in types: continue
+                tname = types[nid]
+                sz = 50.0
+                if tname == "input":  sz = 35.0
+                if tname == "bias":   sz = 28.0
+                if tname == "output": sz = 60.0
+                ax.scatter([x], [y], s=sz, alpha=1.0, zorder=3, linewidths=0.8)
+
+            img = _fig_to_rgb(fig)
+            frames.append(img)
+            _plt.close(fig)
+
+    _imageio.mimsave(path, frames, duration=1.0 / max(1, fps))
+    return path
+
+
+
+# ============================================================
+# 7') Gym action heads (Discrete / MultiDiscrete / MultiBinary / Box)
+# ============================================================
+def _softmax_np(x, axis=-1, temp=1.0):
+    x = x / max(1e-8, float(temp))
+    x = x - np.max(x, axis=axis, keepdims=True)
+    ex = np.exp(x)
+    return ex / (np.sum(ex, axis=axis, keepdims=True) + 1e-9)
+
+def output_dim_from_space(space):
+    import gym
+    from gym.spaces import Discrete, MultiDiscrete, MultiBinary, Box
+    if isinstance(space, Discrete):
+        return int(space.n)
+    if isinstance(space, MultiDiscrete):
+        return int(np.sum(space.nvec))
+    if isinstance(space, MultiBinary):
+        return int(np.prod(space.n))
+    if isinstance(space, Box):
+        return int(np.prod(space.shape))
+    raise ValueError(f"Unsupported action space: {type(space)}")
+
+def obs_dim_from_space(space):
+    if hasattr(space, "shape") and space.shape is not None:
+        return int(np.prod(space.shape))
+    if hasattr(space, "n"):
+        return int(space.n)
+    raise ValueError(f"Unsupported observation space: {type(space)}")
+
+def build_action_mapper(space, stochastic=False, temp=1.0):
+    import gym
+    from gym.spaces import Discrete, MultiDiscrete, MultiBinary, Box
+
+    if isinstance(space, gym.spaces.Discrete):
+        n = space.n
+        def f(y):
+            if stochastic:
+                p = _softmax_np(y[:n], temp=temp)
+                return int(np.random.choice(n, p=p))
+            return int(np.argmax(y[:n]))
+        return f
+
+    if isinstance(space, gym.spaces.MultiDiscrete):
+        nvec = np.array(space.nvec, dtype=int)
+        def f(y):
+            out = []
+            start = 0
+            for k in nvec:
+                seg = y[start:start+k]
+                if stochastic:
+                    p = _softmax_np(seg, temp=temp)
+                    a = int(np.random.choice(k, p=p))
+                else:
+                    a = int(np.argmax(seg))
+                out.append(a)
+                start += k
+            return np.array(out, dtype=space.dtype)
+        return f
+
+    if isinstance(space, gym.spaces.MultiBinary):
+        d = int(np.prod(space.n))
+        def f(y):
+            z = y[:d]
+            if stochastic:
+                p = 1.0/(1.0 + np.exp(-z))
+                a = (np.random.rand(d) < p).astype(space.dtype)
+            else:
+                a = (z > 0.0).astype(space.dtype)
+            return a.reshape(space.n)
+        return f
+
+    if isinstance(space, gym.spaces.Box):
+        shape = space.shape
+        low  = np.asarray(space.low,  dtype=np.float64)
+        high = np.asarray(space.high, dtype=np.float64)
+        d = int(np.prod(shape))
+        finite = np.isfinite(low) & np.isfinite(high)
+        def f(y):
+            z = np.tanh(y[:d])
+            out = z.copy()
+            if finite.all():
+                mid = 0.5*(high + low)
+                amp = 0.5*(high - low)
+                out = mid + amp * z
+            out = out.reshape(shape)
+            out = np.where(np.isfinite(low), np.maximum(out, low), out)
+            out = np.where(np.isfinite(high), np.minimum(out, high), out)
+            return out.astype(space.dtype)
+        return f
+
+    raise ValueError(f"Unsupported action space: {type(space)}")
+
+def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str = 'identity'):
+    import gym
+    env = gym.make(env_id)
+    obs_dim = obs_dim_from_space(env.observation_space)
+    out_dim = output_dim_from_space(env.action_space)
+    neat = ReproPlanaNEATPlus(num_inputs=obs_dim, num_outputs=out_dim, population_size=population, output_activation=output_activation)
+    return neat, env
+
+def run_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_norm=None):
+    """Rollout one episode with a Genome and an action mapper."""
+    total, steps, done = 0.0, 0, False
+    reset_out = env.reset()
+    obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out)>=1) else reset_out
+    while not done:
+        if render:
+            try: env.render()
+            except Exception: pass
+        x = obs if obs_norm is None else obs_norm(obs)
+        y = genome.forward_one(np.asarray(x, dtype=np.float32).ravel())
+        act = mapper(y)
+        step_out = env.step(act)
+        if isinstance(step_out, tuple) and len(step_out) == 5:
+            obs, reward, terminated, truncated, info = step_out
+            done = bool(terminated or truncated)
+        else:
+            obs, reward, done, info = step_out
+            done = bool(done)
+        total += float(reward); steps += 1
+        if (max_steps is not None) and (steps >= int(max_steps)):
+            break
+    try: env.close()
+    except Exception: pass
+    return total
+
+def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, episodes=1, obs_norm=None):
+    """Return a fitness function for evolve() that evaluates average episodic reward."""
+    def _fitness(genome):
+        import gym
+        try: env = gym.make(env_id, render_mode="rgb_array")
+        except TypeError: env = gym.make(env_id)
+        mapper = build_action_mapper(env.action_space, stochastic=stochastic, temp=temp)
+        total = 0.0
+        for _ in range(int(episodes)):
+            total += run_policy_in_env(genome, env, mapper, max_steps=max_steps, render=False, obs_norm=obs_norm)
+        return total / max(1, int(episodes))
+    return _fitness
+
