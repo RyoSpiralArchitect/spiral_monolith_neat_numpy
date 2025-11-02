@@ -1,0 +1,1298 @@
+
+# spiral_monolith_neat_numpy.py
+# Monolithic, NumPy-only NEAT + Backprop + Visualization toolkit.
+# - Feed-forward only (strict DAG). No frameworks beyond NumPy/matplotlib/imageio.
+# - "Part 1" NEAT (with optional planarian-like regeneration) + "Part 2" Backprop NEAT.
+# - Clean, single-file design for reproducible demos and paper-ready figures.
+#
+# Additions in this build:
+#   * Auto-export of regen/morph GIFs from evolution snapshots
+#   * Learning curve with moving average + rolling-std "CI" (line styles only)
+#   * Decision boundaries for Circles/XOR/Spiral as separate PNGs
+#   * Lineage diagram renderer (no fixed colors; shape/linestyle/linewidth encoding)
+#
+# Author: SpiralReality (Ryō) + GPT-5 Pro co-engineering
+
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
+import math, argparse, os
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle, FancyArrowPatch
+import imageio.v2 as imageio
+
+# ============================================================
+# 1) Genes & Genome (strict DAG)
+# ============================================================
+
+__all__ = [
+    "NodeGene","ConnectionGene","InnovationTracker","Genome",
+    "compatibility_distance","EvalMode","ReproPlanaNEATPlus",
+    "compile_genome","forward_batch","train_with_backprop_numpy","predict","predict_proba",
+    "fitness_backprop_classifier","make_circles","make_xor","make_spirals",
+    "draw_genome_png","export_regen_gif","export_morph_gif","export_double_exposure",
+    "plot_learning_and_complexity","plot_decision_boundary",
+    "export_decision_boundaries_all","render_lineage"
+, "output_dim_from_space","build_action_mapper","run_policy_in_env","run_gym_neat_experiment"]
+
+@dataclass
+class NodeGene:
+    id: int
+    type: str                 # 'input' | 'hidden' | 'output' | 'bias'
+    activation: str = 'tanh'  # 'tanh' | 'sigmoid' | 'relu' | 'identity'
+
+@dataclass
+class ConnectionGene:
+    in_node: int
+    out_node: int
+    weight: float
+    enabled: bool
+    innovation: int
+
+class InnovationTracker:
+    def __init__(self, next_node_id: int, next_conn_innov: int = 0):
+        self.next_node_id = next_node_id
+        self.next_conn_innov = next_conn_innov
+        self.conn_innovations: Dict[Tuple[int,int], int] = {}
+        self.node_innovations: Dict[Tuple[int,int], int] = {}
+
+    def get_conn_innovation(self, in_node: int, out_node: int) -> int:
+        key = (in_node, out_node)
+        if key not in self.conn_innovations:
+            self.conn_innovations[key] = self.next_conn_innov
+            self.next_conn_innov += 1
+        return self.conn_innovations[key]
+
+    def get_or_create_split_node(self, in_node: int, out_node: int) -> int:
+        key = (in_node, out_node)
+        if key in self.node_innovations:
+            return self.node_innovations[key]
+        nid = self.new_node_id()
+        self.node_innovations[key] = nid
+        return nid
+
+    def new_node_id(self) -> int:
+        nid = self.next_node_id
+        self.next_node_id += 1
+        return nid
+
+class Genome:
+    def __init__(self, nodes: Dict[int, 'NodeGene'], connections: Dict[int, 'ConnectionGene'],
+                 sex: Optional[str] = None, regen: bool = False, regen_mode: Optional[str] = None,
+                 embryo_bias: Optional[str] = None, gid: Optional[int] = None, birth_gen: int = 0,
+                 hybrid_scale: float = 1.0, parents: Optional[Tuple[Optional[int], Optional[int]]] = None):
+        self.nodes = nodes
+        self.connections = connections
+        self.sex = sex or ('female' if np.random.random() < 0.5 else 'male')
+        self.regen = bool(regen)
+        self.regen_mode = regen_mode or np.random.choice(['head','tail','split'])
+        self.embryo_bias = embryo_bias or np.random.choice(['neutral','inputward','outputward'], p=[0.5,0.25,0.25])
+        self.id = gid if gid is not None else int(np.random.randint(1,1e9))
+        self.birth_gen = int(birth_gen)
+        self.hybrid_scale = float(hybrid_scale)
+        self.parents = parents if parents is not None else (None, None)
+        # Optional capacity limits
+        self.max_hidden_nodes: Optional[int] = None
+        self.max_edges: Optional[int] = None
+
+    def copy(self):
+        nodes = {nid: NodeGene(n.id, n.type, n.activation) for nid, n in self.nodes.items()}
+        conns = {innov: ConnectionGene(c.in_node, c.out_node, c.weight, c.enabled, c.innovation)
+                 for innov, c in self.connections.items()}
+        g = Genome(nodes, conns, self.sex, self.regen, self.regen_mode, self.embryo_bias,
+                   self.id, self.birth_gen, self.hybrid_scale, self.parents)
+        g.max_hidden_nodes = self.max_hidden_nodes
+        g.max_edges = self.max_edges
+        return g
+
+    # ----- Graph helpers -----
+    def enabled_connections(self):
+        return [c for c in self.connections.values() if c.enabled]
+
+    def adjacency(self):
+        adj = {}
+        for c in self.enabled_connections():
+            adj.setdefault(c.in_node, set()).add(c.out_node)
+        return adj
+
+    def has_connection(self, in_id, out_id):
+        for c in self.connections.values():
+            if c.in_node == in_id and c.out_node == out_id:
+                return True
+        return False
+
+    def topological_order(self):
+        in_edges_count = {nid:0 for nid in self.nodes}
+        for c in self.enabled_connections():
+            in_edges_count[c.out_node] += 1
+        queue = [nid for nid in self.nodes if in_edges_count[nid]==0]
+        order = []
+        adj = self.adjacency()
+        while queue:
+            nid = queue.pop(0)
+            order.append(nid)
+            for m in adj.get(nid, []):
+                in_edges_count[m] -= 1
+                if in_edges_count[m]==0:
+                    queue.append(m)
+        if len(order) != len(self.nodes):
+            raise RuntimeError("Cycle detected: feed-forward constraint violated.")
+        return order
+
+    def _creates_cycle(self, in_node, out_node):
+        adj = self.adjacency()
+        stack = [out_node]; visited=set()
+        while stack:
+            v = stack.pop()
+            if v == in_node: return True
+            if v in visited: continue
+            visited.add(v)
+            for w in adj.get(v, []):
+                stack.append(w)
+        return False
+
+    def node_depths(self):
+        order = self.topological_order()
+        inputs = [nid for nid,n in self.nodes.items() if n.type in ('input','bias')]
+        depth = {nid:(0 if nid in inputs else -1) for nid in order}
+        adj_in = {}
+        for c in self.enabled_connections():
+            adj_in.setdefault(c.out_node, []).append(c.in_node)
+        changed=True
+        while changed:
+            changed=False
+            for nid in order:
+                if depth[nid] >= 0: continue
+                parents = adj_in.get(nid, [])
+                if parents and all((p in depth and depth[p] >= 0) for p in parents):
+                    depth[nid] = max(depth[p] for p in parents) + 1
+                    changed=True
+        for nid in order:
+            if depth[nid] < 0: depth[nid]=0
+        return depth
+
+    # ----- Mutations -----
+    def mutate_weights(self, rng: np.random.Generator, perturb_chance=0.9, sigma=0.8, reset_range=2.0):
+        for c in self.connections.values():
+            if rng.random() < perturb_chance: c.weight += float(rng.normal(0, sigma))
+            else: c.weight = float(rng.uniform(-reset_range, reset_range))
+
+    def mutate_toggle_enable(self, rng: np.random.Generator, prob=0.01):
+        for c in self.connections.values():
+            if rng.random() < prob: c.enabled = not c.enabled
+
+    def _choose_conn_for_node_add(self, rng: np.random.Generator, bias: str):
+        enabled = [c for c in self.connections.values() if c.enabled]
+        if not enabled: return None
+        if bias == 'neutral': return enabled[int(rng.integers(len(enabled)))]
+        depth = self.node_depths()
+        scores = []
+        for c in enabled:
+            din = depth.get(c.in_node, 0)
+            dout = depth.get(c.out_node, din+1)
+            s = 1.0/(1.0+din) if bias=='inputward' else 1.0 + dout
+            scores.append(max(1e-3, float(s)))
+        scores = np.array(scores, float); probs = scores/scores.sum()
+        idx = int(rng.choice(len(enabled), p=probs))
+        return enabled[idx]
+
+    def mutate_add_connection(self, rng: np.random.Generator, innov: 'InnovationTracker', tries=30):
+        if self.max_edges is not None:
+            if sum(1 for c in self.connections.values() if c.enabled) >= int(self.max_edges):
+                return False
+        node_ids = list(self.nodes.keys())
+        for _ in range(tries):
+            in_id = int(rng.choice(node_ids)); out_id = int(rng.choice(node_ids))
+            in_node = self.nodes[in_id]; out_node = self.nodes[out_id]
+            if in_id == out_id: continue
+            if in_node.type == 'output': continue
+            if out_node.type in ('input','bias'): continue
+            if self.has_connection(in_id, out_id): continue
+            if self._creates_cycle(in_id, out_id): continue
+            w = float(rng.uniform(-2.0, 2.0))
+            inn = innov.get_conn_innovation(in_id, out_id)
+            self.connections[inn] = ConnectionGene(in_id, out_id, w, True, inn)
+            return True
+        return False
+
+    def mutate_add_node(self, rng: np.random.Generator, innov: 'InnovationTracker'):
+        if self.max_hidden_nodes is not None:
+            if sum(1 for n in self.nodes.values() if n.type=='hidden') >= int(self.max_hidden_nodes):
+                return False
+        chosen = self._choose_conn_for_node_add(rng, self.embryo_bias)
+        if chosen is None: return False
+        c = chosen
+        if not c.enabled: return False
+        c.enabled = False
+        new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
+        if new_nid not in self.nodes:
+            self.nodes[new_nid] = NodeGene(new_nid, 'hidden', 'tanh')
+        inn1 = innov.get_conn_innovation(c.in_node, new_nid)
+        inn2 = innov.get_conn_innovation(new_nid, c.out_node)
+        self.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
+        self.connections[inn2] = ConnectionGene(new_nid, c.out_node, c.weight, True, inn2)
+        return True
+
+    # ----- Inference -----
+    def evaluate(self, X: np.ndarray) -> np.ndarray:
+        order = self.topological_order()
+        incoming = {nid:[] for nid in order}
+        for c in self.enabled_connections():
+            incoming[c.out_node].append((c.in_node, c.weight))
+        input_ids = [nid for nid,n in self.nodes.items() if n.type=='input']
+        output_ids = [nid for nid,n in self.nodes.items() if n.type=='output']
+        bias_ids = [nid for nid,n in self.nodes.items() if n.type=='bias']
+        assert len(bias_ids)==1
+        bias_id = bias_ids[0]
+        n_samples = X.shape[0]
+        values = {nid: np.zeros(n_samples) for nid in order}
+        in_sorted = sorted(input_ids); assert X.shape[1] == len(in_sorted)
+        for i,nid in enumerate(in_sorted): values[nid] = X[:,i]
+        values[bias_id] = np.ones(n_samples)
+        for nid in order:
+            node = self.nodes[nid]
+            if node.type in ('input','bias'): continue
+            s = np.zeros(n_samples)
+            for src,w in incoming[nid]: s += values[src]*w
+            if node.activation == 'tanh': act = np.tanh(s)
+            elif node.activation == 'sigmoid': act = 1/(1+np.exp(-s))
+            elif node.activation == 'relu': act = np.maximum(0.0, s)
+            elif node.activation == 'identity': act = s
+            else: act = np.tanh(s)
+            values[nid] = act
+        out_sorted = sorted(output_ids)
+        Y = np.stack([values[nid] for nid in out_sorted], axis=1)
+        return Y
+
+    def forward_one(self, x: np.ndarray) -> np.ndarray:
+        order = self.topological_order()
+        incoming = {nid:[] for nid in order}
+        for c in self.enabled_connections():
+            incoming[c.out_node].append((c.in_node, c.weight))
+        input_ids  = sorted([nid for nid,n in self.nodes.items() if n.type=='input'])
+        output_ids = sorted([nid for nid,n in self.nodes.items() if n.type=='output'])
+        bias_id    = next(nid for nid,n in self.nodes.items() if n.type=='bias')
+        vals = {nid: 0.0 for nid in order}
+        for i, nid in enumerate(input_ids): vals[nid] = float(x[i])
+        vals[bias_id] = 1.0
+        for nid in order:
+            node = self.nodes[nid]
+            if node.type in ('input','bias'): continue
+            s = 0.0
+            for src, w in incoming[nid]: s += vals[src] * w
+            if node.activation == 'tanh': y = math.tanh(s)
+            elif node.activation == 'sigmoid': y = 1.0/(1.0+math.exp(-s))
+            elif node.activation == 'relu': y = s if s>0 else 0.0
+            elif node.activation == 'identity': y = s
+            else: y = math.tanh(s)
+            vals[nid] = y
+        return np.array([vals[nid] for nid in output_ids], dtype=np.float32)
+
+def compatibility_distance(g1: Genome, g2: Genome, c1=1.0, c2=1.0, c3=0.4):
+    innovs1 = sorted(g1.connections.keys()); innovs2 = sorted(g2.connections.keys())
+    i=j=0; E=D=0; W_diffs=[]
+    max_innov1 = innovs1[-1] if innovs1 else -1
+    max_innov2 = innovs2[-1] if innovs2 else -1
+    while i < len(innovs1) and j < len(innovs2):
+        in1 = innovs1[i]; in2 = innovs2[j]
+        if in1 == in2:
+            W_diffs.append(abs(g1.connections[in1].weight - g2.connections[in2].weight)); i+=1; j+=1
+        elif in1 < in2:
+            if in1 > max_innov2: E += 1
+            else: D += 1
+            i += 1
+        else:
+            if in2 > max_innov1: E += 1
+            else: D += 1
+            j += 1
+    E += (len(innovs1)-i) + (len(innovs2)-j)
+    N = max(len(innovs1), len(innovs2)); N = 1 if N < 20 else N
+    W = (sum(W_diffs)/len(W_diffs)) if W_diffs else 0.0
+    return c1*E/N + c2*D/N + c3*W
+
+# ============================================================
+# 2) Regeneration operators (planarian-inspired; optional)
+# ============================================================
+
+def _regenerate_head(g: Genome, rng: np.random.Generator, innov: InnovationTracker, intensity=0.5):
+    inputs = [nid for nid,n in g.nodes.items() if n.type in ('input','bias')]
+    candidates = [c for c in g.enabled_connections() if c.in_node in inputs]
+    if not candidates: return g
+    rng.shuffle(candidates)
+    frac = min(0.8, 0.15 + 0.7*float(intensity))
+    k = int(len(candidates)*frac)
+    for c in candidates[:k]: c.enabled=False
+    chosen = rng.choice(candidates)
+    new_id = innov.new_node_id()
+    g.nodes[new_id] = NodeGene(new_id, 'hidden', 'tanh')
+    inn1 = innov.get_conn_innovation(chosen.in_node, new_id)
+    inn2 = innov.get_conn_innovation(new_id, chosen.out_node)
+    g.connections[inn1] = ConnectionGene(chosen.in_node, new_id, 1.0, True, inn1)
+    g.connections[inn2] = ConnectionGene(new_id, chosen.out_node, chosen.weight, True, inn2)
+    return g
+
+def _regenerate_tail(g: Genome, rng: np.random.Generator, innov: InnovationTracker, intensity=0.5):
+    outputs = [nid for nid,n in g.nodes.items() if n.type=='output']
+    sinks = [c for c in g.enabled_connections() if c.out_node in outputs]
+    if not sinks: return g
+    rng.shuffle(sinks)
+    k = max(1, int(len(sinks)*(0.2+0.6*float(intensity))))
+    hidden = [nid for nid,n in g.nodes.items() if n.type=='hidden']
+    for c in sinks[:k]:
+        c.weight = float(rng.uniform(-2,2))
+        if hidden and rng.random() < (0.3+0.5*float(intensity)):
+            new_src = int(rng.choice(hidden))
+            if not g.has_connection(new_src, c.out_node) and not g._creates_cycle(new_src, c.out_node):
+                inn = innov.get_conn_innovation(new_src, c.out_node)
+                g.connections[inn] = ConnectionGene(new_src, c.out_node, float(rng.uniform(-2,2)), True, inn)
+    return g
+
+def _regenerate_split(g: Genome, rng: np.random.Generator, innov: InnovationTracker, intensity=0.5):
+    hidden = [nid for nid,n in g.nodes.items() if n.type=='hidden']
+    if not hidden:
+        enabled = [c for c in g.connections.values() if c.enabled]
+        if not enabled: return g
+        c = enabled[int(rng.integers(len(enabled)))]
+        c.enabled=False
+        new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
+        if new_nid not in g.nodes:
+            g.nodes[new_nid] = NodeGene(new_nid, 'hidden', 'tanh')
+        inn1 = innov.get_conn_innovation(c.in_node, new_nid)
+        inn2 = innov.get_conn_innovation(new_nid, c.out_node)
+        g.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
+        g.connections[inn2] = ConnectionGene(new_nid, c.out_node, c.weight, True, inn2)
+        return g
+    target = int(rng.choice(hidden))
+    dup_id = innov.new_node_id()
+    g.nodes[dup_id] = NodeGene(dup_id, 'hidden', 'tanh')
+    incomings = [c for c in g.enabled_connections() if c.out_node == target]
+    for cin in incomings:
+        inn = innov.get_conn_innovation(cin.in_node, dup_id)
+        g.connections[inn] = ConnectionGene(cin.in_node, dup_id, cin.weight + float(rng.normal(0,0.1)), True, inn)
+    outgoings = [c for c in g.enabled_connections() if c.in_node == target]
+    move_p = min(0.9, 0.3 + 0.6*float(intensity))
+    for cout in outgoings:
+        if rng.random() < move_p:
+            cout.enabled = False
+            inn = innov.get_conn_innovation(dup_id, cout.out_node)
+            g.connections[inn] = ConnectionGene(dup_id, cout.out_node, cout.weight + float(rng.normal(0,0.1)), True, inn)
+    return g
+
+def platyregenerate(genome: Genome, rng: np.random.Generator, innov: InnovationTracker, intensity=0.5) -> Genome:
+    g = genome.copy()
+    mode = g.regen_mode or 'split'
+    if mode == 'head': g = _regenerate_head(g, rng, innov, intensity)
+    elif mode == 'tail': g = _regenerate_tail(g, rng, innov, intensity)
+    else: g = _regenerate_split(g, rng, innov, intensity)
+    return g
+
+# ============================================================
+# 3) EvalMode & ReproPlanaNEATPlus
+# ============================================================
+
+@dataclass
+class EvalMode:
+    vanilla: bool = True                      # True -> pure NEAT fitness (no sex/regen bonuses)
+    enable_regen_reproduction: bool = False   # allow asexual_regen in reproduction
+    complexity_alpha: float = 0.01
+    node_penalty: float = 1.0
+    edge_penalty: float = 0.5
+    species_low: int = 3
+    species_high: int = 8
+
+class ReproPlanaNEATPlus:
+    def __init__(self, num_inputs, num_outputs, population_size=150, rng=None, output_activation='sigmoid'):
+        self.num_inputs = num_inputs; self.num_outputs = num_outputs; self.pop_size = population_size
+        self.rng = rng if rng is not None else np.random.default_rng()
+        self.mode = EvalMode(vanilla=True, enable_regen_reproduction=False)
+        self.max_hidden_nodes = 128; self.max_edges = 1024
+
+        # Base genome
+        nodes = {}
+        for i in range(num_inputs): nodes[i] = NodeGene(i,'input','identity')
+        for j in range(num_outputs): nodes[num_inputs + j] = NodeGene(num_inputs + j, 'output', output_activation)
+        bias_id = num_inputs + num_outputs; nodes[bias_id] = NodeGene(bias_id, 'bias', 'identity')
+        next_node_id = bias_id + 1
+        self.innov = InnovationTracker(next_node_id=next_node_id, next_conn_innov=0)
+        base_connections = {}
+        for in_id in list(range(num_inputs)) + [bias_id]:
+            for out_id in range(num_inputs, num_inputs+num_outputs):
+                inn = self.innov.get_conn_innovation(in_id, out_id)
+                w = float(self.rng.uniform(-2,2))
+                base_connections[inn] = ConnectionGene(in_id, out_id, w, True, inn)
+        base_genome = Genome(nodes, base_connections)
+        base_genome.max_hidden_nodes = self.max_hidden_nodes; base_genome.max_edges = self.max_edges
+
+        # Population
+        self.population = []; self.next_gid = 1
+        for _ in range(population_size):
+            g = base_genome.copy()
+            g.max_hidden_nodes = self.max_hidden_nodes; g.max_edges = self.max_edges
+            g.sex = 'female' if self.rng.random() < 0.5 else 'male'
+            g.regen = bool(self.rng.random() < 0.5)
+            g.regen_mode = self.rng.choice(['head','tail','split'])
+            g.embryo_bias = self.rng.choice(['neutral','inputward','outputward'], p=[0.5,0.25,0.25])
+            g.id = self.next_gid; self.next_gid += 1; g.birth_gen = 0
+            self.population.append(g)
+
+        # Params
+        self.generation = 0
+        self.compatibility_threshold = 3.0
+        self.c1=self.c2=1.0; self.c3=0.4
+        self.elitism = 1; self.survival_rate = 0.2
+        self.mutate_add_conn_prob = 0.05; self.mutate_add_node_prob = 0.03
+        self.mutate_weight_prob = 0.8; self.mutate_toggle_prob = 0.01
+        self.weight_perturb_chance = 0.9; self.weight_sigma = 0.8; self.weight_reset_range = 2.0
+        self.regen_mode_mut_rate = 0.05; self.embryo_bias_mut_rate = 0.03
+        self.regen_rate = 0.15; self.allow_selfing = True
+        self.sex_fitness_scale = {'female':1.0, 'male':0.9}; self.regen_bonus = 0.2
+        self.env = {'difficulty':0.0, 'noise_std':0.0}
+        self.mix_asexual_base = 0.10; self.mix_asexual_gain = 0.40
+        self.injury_intensity_base = 0.25; self.injury_intensity_gain = 0.65
+        self.pollen_flow_rate = 0.10
+        self.heterosis_center = 3.0; self.heterosis_width=1.8; self.heterosis_gain=0.15
+        self.distance_cutoff=6.0; self.penalty_far=0.20
+
+        # Logs & snapshots
+        self.event_log=[]; self.hidden_counts_history=[]; self.edge_counts_history=[]
+        self.best_ids=[]; self.lineage_edges=[]; self.env_history=[]
+        self.snapshots_genomes: List[Genome] = []
+        self.snapshots_scars: List[Dict[int,'Scar']] = []
+        self.node_registry: Dict[int, Dict[str, Any]] = {}
+
+        # registry for lineage node styling
+        for g in self.population:
+            self.node_registry[g.id] = {'sex': g.sex, 'regen': g.regen, 'birth_gen': g.birth_gen}
+
+    def _heterosis_scale(self, mother: Genome, father: Genome) -> float:
+        d = compatibility_distance(mother, father, self.c1, self.c2, self.c3)
+        peak = 1.0 + self.heterosis_gain * np.exp(-0.5*((d - self.heterosis_center)/self.heterosis_width)**2)
+        if d > self.distance_cutoff:
+            penalty = max(0.0, self.penalty_far * (d - self.distance_cutoff)/self.distance_cutoff)
+            peak *= (1.0 - min(0.9, penalty))
+        return float(peak)
+
+    def _regen_intensity(self) -> float:
+        return float(min(1.0, max(0.0, self.injury_intensity_base + self.injury_intensity_gain * self.env['difficulty'])))
+
+    def _mix_asexual_ratio(self) -> float:
+        return float(min(0.95, max(0.0, self.mix_asexual_base + self.mix_asexual_gain * self.env['difficulty'])))
+
+    class Species:
+        def __init__(self, representative: 'Genome'):
+            self.representative = representative.copy(); self.members=[]; self.best_fitness=-1e9; self.last_improved=0
+        def add(self, genome: 'Genome', fitness: float): self.members.append((genome, fitness))
+        def sort(self): self.members.sort(key=lambda gf: gf[1], reverse=True)
+
+    def speciate(self, fitnesses: List[float]) -> List['Species']:
+        species=[] 
+        for genome, fit in zip(self.population, fitnesses):
+            placed=False
+            for sp in species:
+                delta = compatibility_distance(genome, sp.representative, self.c1, self.c2, self.c3)
+                if delta < self.compatibility_threshold:
+                    sp.add(genome, fit); placed=True; break
+            if not placed:
+                sp = ReproPlanaNEATPlus.Species(genome); sp.add(genome, fit); species.append(sp)
+        for sp in species: sp.sort()
+        return species
+
+    def _adapt_compat_threshold(self, num_species: int):
+        if num_species < self.mode.species_low:
+            self.compatibility_threshold *= 0.95
+        elif num_species > self.mode.species_high:
+            self.compatibility_threshold *= 1.05
+
+    def _mutate(self, genome: Genome):
+        if self.rng.random() < self.mutate_toggle_prob: genome.mutate_toggle_enable(self.rng, prob=self.mutate_toggle_prob)
+        if self.rng.random() < self.mutate_add_node_prob: genome.mutate_add_node(self.rng, self.innov)
+        if self.rng.random() < self.mutate_add_conn_prob: genome.mutate_add_connection(self.rng, self.innov)
+        if self.rng.random() < self.mutate_weight_prob: genome.mutate_weights(self.rng, self.weight_perturb_chance, self.weight_sigma, self.weight_reset_range)
+        if self.rng.random() < self.regen_mode_mut_rate:
+            if self.env['difficulty'] > 0.6: genome.regen_mode = self.rng.choice(['split','head','tail'], p=[0.6,0.25,0.15])
+            else: genome.regen_mode = self.rng.choice(['split','head','tail'])
+        if self.rng.random() < self.embryo_bias_mut_rate:
+            genome.embryo_bias = self.rng.choice(['neutral','inputward','outputward'])
+
+    def _crossover_maternal_biased(self, mother: Genome, father: Genome, species_members):
+        fit_dict = {g:f for g,f in species_members}
+        f_m = fit_dict.get(mother, 0.0); f_f = fit_dict.get(father, 0.0)
+        if f_f > f_m: mother, father = father, mother
+        child_nodes={}; child_conns={}
+        for nid,n in mother.nodes.items():
+            if n.type in ('input','output','bias'): child_nodes[nid] = NodeGene(n.id, n.type, n.activation)
+        all_innovs = sorted(set(mother.connections.keys()).union(father.connections.keys()))
+        for inn in all_innovs:
+            if inn in mother.connections and inn in father.connections:
+                cm = mother.connections[inn]; cf = father.connections[inn]
+                pick = cm if self.rng.random() < 0.7 else cf
+                enabled = True
+                if (not cm.enabled) or (not cf.enabled): enabled = not (self.rng.random() < 0.75)
+                child_conns[inn] = ConnectionGene(pick.in_node, pick.out_node, pick.weight, enabled, inn)
+            elif inn in mother.connections:
+                g = mother.connections[inn]; child_conns[inn] = ConnectionGene(g.in_node, g.out_node, g.weight, g.enabled, inn)
+            if inn in child_conns:
+                g = child_conns[inn]
+                for nid in (g.in_node, g.out_node):
+                    if nid not in child_nodes:
+                        n = mother.nodes.get(nid) or father.nodes.get(nid)
+                        child_nodes[nid] = NodeGene(n.id, n.type, n.activation)
+        child = Genome(child_nodes, child_conns)
+        child.max_hidden_nodes = self.max_hidden_nodes; child.max_edges = self.max_edges
+        child.sex = 'female' if self.rng.random() < 0.5 else 'male'
+        p = 0.7 if (mother.regen or father.regen) else 0.2
+        child.regen = bool(self.rng.random() < p)
+        child.regen_mode = self.rng.choice(['head','tail','split'])
+        child.embryo_bias = mother.embryo_bias if self.rng.random() < 0.7 else father.embryo_bias
+        return child
+
+    def _make_offspring(self, species, offspring_counts, sidx, species_pool):
+        sp = species[sidx]; new_pop=[]; events={'sexual_within':0,'sexual_cross':0,'asexual_regen':0,'asexual_clone':0}
+        sp.sort()
+        elites=[g for g,_ in sp.members[:min(self.elitism, offspring_counts[sidx])]]
+        for e in elites:
+            child=e.copy(); child.id=self.next_gid; self.next_gid+=1; child.parents=(e.id,e.id); child.birth_gen=self.generation+1
+            new_pop.append(child); events['asexual_clone']+=1; 
+            self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
+        remaining = offspring_counts[sidx]-len(elites)
+        k = max(2, int(math.ceil(self.survival_rate * len(sp.members))))
+        females=[g for g,_ in sp.members[:k] if g.sex=='female']; males=[g for g,_ in sp.members[:k] if g.sex=='male']; pool=[g for g,_ in sp.members[:k]]
+        if (not females) or (not males):
+            females = [g for g,_ in sp.members if g.sex=='female'] or females
+            males   = [g for g,_ in sp.members if g.sex=='male'] or males
+        mix_ratio=self._mix_asexual_ratio()
+        while remaining>0:
+            mode=None
+            if self.rng.random()<mix_ratio:
+                parent=pool[int(self.rng.integers(len(pool)))]
+                if parent.regen and self.mode.enable_regen_reproduction:
+                    child = platyregenerate(parent, self.rng, self.innov, intensity=self._regen_intensity()); mode='asexual_regen'
+                else:
+                    child=parent.copy(); mode='asexual_clone'
+                mother_id=parent.id; father_id=None
+            else:
+                if females and males and self.rng.random()>self.pollen_flow_rate:
+                    mother=females[int(self.rng.integers(len(females)))]; father=males[int(self.rng.integers(len(males)))]; mode='sexual_within'; sp_for_fit=sp.members
+                else:
+                    if len(species_pool)>1:
+                        mother=pool[int(self.rng.integers(len(pool)))]
+                        other=species_pool[(sidx+1)%len(species_pool)]
+                        other_pool=[g for g,_ in other.members]; males_other=[g for g,_ in other.members if g.sex=='male']
+                        father = males_other[int(self.rng.integers(len(males_other)))] if males_other else other_pool[int(self.rng.integers(len(other_pool)))]
+                        mode='sexual_cross'; sp_for_fit = sp.members + other.members
+                    else:
+                        if females and males:
+                            mother=females[int(self.rng.integers(len(females)))]; father=males[int(self.rng.integers(len(males)))]; mode='sexual_within'; sp_for_fit=sp.members
+                        else:
+                            parent=pool[int(self.rng.integers(len(pool)))]
+                            if self.allow_selfing:
+                                mother=parent; father=parent; mode='sexual_within'; sp_for_fit=sp.members
+                            else:
+                                child=parent.copy(); mode='asexual_clone'
+                                mother_id=parent.id; father_id=None
+                                child.id=self.next_gid; self.next_gid+=1; child.parents=(mother_id,father_id); child.birth_gen=self.generation+1
+                                self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
+                                self._mutate(child); new_pop.append(child); events[mode]+=1; remaining-=1; continue
+                child=self._crossover_maternal_biased(mother,father,sp_for_fit); child.hybrid_scale=self._heterosis_scale(mother,father); mother_id=mother.id; father_id=father.id
+            child.id=self.next_gid; self.next_gid+=1; child.parents=(mother_id,father_id); child.birth_gen=self.generation+1
+            self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
+            self._mutate(child); new_pop.append(child); events[mode]+=1; remaining-=1
+        return new_pop, events
+
+    def reproduce(self, species, fitnesses):
+        total_adjusted=0.0; species_adjusted=[]
+        for sp in species:
+            adj=sum(f for _,f in sp.members)/len(sp.members); species_adjusted.append(adj); total_adjusted+=adj
+        if total_adjusted<=0:
+            offspring_counts=[self.pop_size//len(species)]*len(species)
+            for i in range(self.pop_size - sum(offspring_counts)): offspring_counts[i%len(offspring_counts)]+=1
+        else:
+            shares=[adj/total_adjusted for adj in species_adjusted]; offspring_counts=[int(round(s*self.pop_size)) for s in shares]
+            diff=self.pop_size - sum(offspring_counts); idxs=np.argsort(shares)[::-1]; i=0
+            while diff!=0:
+                idx=int(idxs[i%len(idxs)]); offspring_counts[idx]+=1 if diff>0 else -1; diff += -1 if diff>0 else 1; i+=1
+        new_pop=[]; gen_events={'sexual_within':0,'sexual_cross':0,'asexual_regen':0,'asexual_clone':0}
+        for sidx,sp in enumerate(species):
+            offspring,events=self._make_offspring(species,offspring_counts,sidx,species)
+            for k,v in events.items(): gen_events[k]+=v
+            new_pop.extend(offspring)
+        if len(new_pop)<self.pop_size:
+            bests=[g for sp in species for g,_ in sp.members]
+            while len(new_pop)<self.pop_size:
+                parent=bests[int(self.rng.integers(len(bests)))]; child=parent.copy()
+                child.id=self.next_gid; self.next_gid+=1; child.parents=(parent.id,None); child.birth_gen=self.generation+1
+                self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
+                self._mutate(child); new_pop.append(child); gen_events['asexual_clone']+=1
+        elif len(new_pop)>self.pop_size:
+            new_pop=new_pop[:self.pop_size]
+        self.population=new_pop; self.event_log.append(gen_events)
+        for g in new_pop: self.lineage_edges.append((g.parents[0], g.parents[1], g.id, g.birth_gen, 'birth'))
+
+    def _complexity_penalty(self, g: Genome) -> float:
+        n_hidden = sum(1 for n in g.nodes.values() if n.type=='hidden')
+        n_edges  = sum(1 for c in g.connections.values() if c.enabled)
+        m = self.mode
+        return m.complexity_alpha * (m.node_penalty*n_hidden + m.edge_penalty*n_edges)
+
+    def evolve(self, fitness_fn: Callable[[Genome], float], n_generations=100, target_fitness=None, verbose=True, env_schedule=None):
+        history=[]; best_ever=None; best_ever_fit=-1e9
+        from math import isnan
+        scars=None; prev_best=None
+        for gen in range(n_generations):
+            self.generation=gen
+            prev=history[-1] if history else (None,None)
+            if env_schedule is not None:
+                env=env_schedule(gen, {'gen':gen,'prev_best':prev[0] if prev else None, 'prev_avg':prev[1] if prev else None})
+                if env is not None: self.env.update(env)
+            self.env_history.append({'gen':gen, **self.env})
+            raw=[fitness_fn(g) for g in self.population]
+            fitnesses=[]
+            for g,f in zip(self.population, raw):
+                f2 = f
+                if not self.mode.vanilla:
+                    f2 *= self.sex_fitness_scale.get(g.sex, 1.0) * (getattr(g,'hybrid_scale',1.0))
+                    if g.regen: f2 += self.regen_bonus
+                f2 -= self._complexity_penalty(g)
+                fitnesses.append(float(f2))
+            best_idx=int(np.argmax(fitnesses)); best_fit=float(fitnesses[best_idx]); avg_fit=float(np.mean(fitnesses))
+            # snapshots for GIFs
+            curr_best = self.population[best_idx].copy()
+            scars = diff_scars(prev_best, curr_best, scars, birth_gen=gen, regen_mode_for_new=getattr(curr_best,'regen_mode','split'))
+            self.snapshots_genomes.append(curr_best); self.snapshots_scars.append(scars)
+            prev_best = curr_best
+
+            history.append((best_fit, avg_fit)); self.best_ids.append(self.population[best_idx].id)
+            # complexity traces
+            self.hidden_counts_history.append([sum(1 for n in g.nodes.values() if n.type=='hidden') for g in self.population])
+            self.edge_counts_history.append([sum(1 for c in g.connections.values() if c.enabled) for g in self.population])
+            if verbose:
+                ev=self.event_log[-1] if self.event_log else {'sexual_within':0,'sexual_cross':0,'asexual_regen':0}
+                print(f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | diff {self.env['difficulty']:.2f} | sexual {ev.get('sexual_within',0)+ev.get('sexual_cross',0)} | regen {ev.get('asexual_regen',0)}")
+            if best_fit > best_ever_fit: best_ever_fit = best_fit; best_ever = self.population[best_idx].copy()
+            if target_fitness is not None and best_fit >= target_fitness: break
+            species=self.speciate(fitnesses)
+            self._adapt_compat_threshold(len(species))
+            self.reproduce(species, fitnesses)
+        # Final best
+        best=None; bestf=-1e9
+        for g in self.population:
+            f = fitness_fn(g)
+            if not self.mode.vanilla:
+                f *= self.sex_fitness_scale.get(g.sex, 1.0) * (getattr(g,'hybrid_scale',1.0))
+                if g.regen: f += self.regen_bonus
+            f -= self._complexity_penalty(g)
+            if f > bestf: bestf=f; best=g
+        return best or best_ever, history
+
+# ============================================================
+# 4) Backprop NEAT (NumPy only)
+# ============================================================
+
+def act_forward(name, x):
+    if name == 'tanh':     return np.tanh(x)
+    if name == 'sigmoid':  return 1.0/(1.0+np.exp(-x))
+    if name == 'relu':     return np.maximum(0.0, x)
+    if name == 'identity': return x
+    return np.tanh(x)
+
+def act_deriv(name, x):
+    if name == 'tanh':
+        y = np.tanh(x); return 1.0 - y*y
+    if name == 'sigmoid':
+        s = 1.0/(1.0+np.exp(-x)); return s*(1.0 - s)
+    if name == 'relu':
+        return (x > 0.0).astype(x.dtype)
+    if name == 'identity':
+        return np.ones_like(x)
+    y = np.tanh(x); return 1.0 - y*y
+
+def compile_genome(g: Genome):
+    order = g.topological_order()
+    idx_of = {nid:i for i, nid in enumerate(order)}
+    types = [g.nodes[n].type for n in order]
+    acts  = [g.nodes[n].activation for n in order]
+    in_ids   = [nid for nid in order if g.nodes[nid].type=='input']
+    bias_ids = [nid for nid in order if g.nodes[nid].type=='bias']
+    out_ids  = [nid for nid in order if g.nodes[nid].type=='output']
+    edges = [c for c in g.enabled_connections()]
+    src = np.array([idx_of[c.in_node]  for c in edges], dtype=np.int32)
+    dst = np.array([idx_of[c.out_node] for c in edges], dtype=np.int32)
+    w   = np.array([c.weight for c in edges], dtype=np.float64)
+    eid = [c.innovation for c in edges]
+    n = len(order)
+    in_edges  = [[] for _ in range(n)]
+    out_edges = [[] for _ in range(n)]
+    for e,(s,d) in enumerate(zip(src, dst)):
+        in_edges[d].append(e)
+        out_edges[s].append(e)
+    return {
+        'order': order, 'idx_of': idx_of, 'types': types, 'acts': acts,
+        'inputs': [idx_of[i] for i in sorted(in_ids)],
+        'biases': [idx_of[i] for i in bias_ids],
+        'outputs':[idx_of[i] for i in sorted(out_ids)],
+        'src': src, 'dst': dst, 'w': w, 'eid': eid,
+        'in_edges': in_edges, 'out_edges': out_edges
+    }
+
+def forward_batch(comp, X, w=None):
+    if w is None: w = comp['w']
+    B = X.shape[0]; n = len(comp['order'])
+    A = np.zeros((B, n), dtype=np.float64)
+    Z = np.zeros((B, n), dtype=np.float64)
+    in_idx = comp['inputs']
+    assert X.shape[1] == len(in_idx), "X dim != number of input nodes"
+    for k, nid in enumerate(in_idx): A[:, nid] = X[:, k]
+    for b in comp['biases']: A[:, b] = 1.0
+    for j in range(n):
+        if comp['types'][j] in ('input','bias'): continue
+        z = np.zeros(B, dtype=np.float64)
+        for e in comp['in_edges'][j]: z += A[:, comp['src'][e]] * w[e]
+        Z[:, j] = z; A[:, j] = act_forward(comp['acts'][j], z)
+    return A, Z
+
+def _softmax(logits):
+    x = logits - logits.max(axis=1, keepdims=True)
+    ex = np.exp(x)
+    return ex / (ex.sum(axis=1, keepdims=True) + 1e-9)
+
+def loss_and_output_delta(comp, Z, y, l2, w):
+    out_idx = comp['outputs']; B = Z.shape[0]
+    if len(out_idx) == 1:
+        z = Z[:, out_idx[0:1]]; p = 1.0/(1.0 + np.exp(-z))
+        yv = y.reshape(B,1).astype(np.float64)
+        loss = (np.log1p(np.exp(-np.abs(z))) + np.maximum(z,0) - yv*z).mean()
+        delta_out = (p - yv); probs = p
+    else:
+        logits = Z[:, out_idx]; probs = _softmax(logits)
+        y_one = np.eye(len(out_idx), dtype=np.float64)[y] if y.ndim==1 else y.astype(np.float64)
+        loss = -(y_one * np.log(probs + 1e-9)).sum(axis=1).mean()
+        delta_out = (probs - y_one)
+    loss = float(loss + 0.5 * l2 * np.sum(w*w))
+    return loss, delta_out, probs
+
+def backprop_step(comp, X, y, w, lr=1e-2, l2=1e-4):
+    A, Z = forward_batch(comp, X, w)
+    loss, delta_out, _ = loss_and_output_delta(comp, Z, y, l2, w)
+    B = X.shape[0]; n = len(comp['order'])
+    grad_w = np.zeros_like(w); delta_z = np.zeros((B, n), dtype=np.float64); delta_a = np.zeros((B, n), dtype=np.float64)
+    for j, oi in enumerate(comp['outputs']): delta_z[:, oi] = delta_out[:, j:j+1].reshape(B)
+    for j in reversed(range(n)):
+        t = comp['types'][j]
+        if t == 'output': dz = delta_z[:, j]
+        elif t in ('input','bias'): continue
+        else:
+            dz = delta_a[:, j] * act_deriv(comp['acts'][j], Z[:, j]); delta_z[:, j] = dz
+        for e in comp['in_edges'][j]:
+            s = comp['src'][e]
+            grad_w[e] += np.dot(A[:, s], dz)
+            delta_a[:, s] += dz * w[e]
+    grad_w = grad_w / B + l2 * w
+    w_new = w - lr * grad_w
+    return w_new, float(loss)
+
+def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=1e-2, l2=1e-4):
+    comp = compile_genome(genome); w = comp['w'].copy(); history=[]
+    for _ in range(steps):
+        w, L = backprop_step(comp, X, y, w, lr=lr, l2=l2); history.append(L)
+    for e_idx, inn in enumerate(comp['eid']): genome.connections[inn].weight = float(w[e_idx])
+    return history
+
+def predict_proba(genome: Genome, X):
+    comp = compile_genome(genome); _, Z = forward_batch(comp, X, comp['w']); out = comp['outputs']
+    if len(out) == 1:
+        z = Z[:, out[0:1]]; p = 1.0/(1.0 + np.exp(-z)); return np.concatenate([1.0-p, p], axis=1)
+    else:
+        logits = Z[:, out]; return _softmax(logits)
+
+def predict(genome: Genome, X):
+    P = predict_proba(genome, X); return np.argmax(P, axis=1).astype(np.int32)
+
+def complexity_penalty(genome: Genome, alpha_nodes=1e-3, alpha_edges=5e-4):
+    hidden = sum(1 for n in genome.nodes.values() if n.type=='hidden')
+    edges  = len(genome.enabled_connections())
+    return alpha_nodes*hidden + alpha_edges*edges
+
+def fitness_backprop_classifier(genome: Genome, Xtr, ytr, Xva, yva,
+                                steps=40, lr=5e-3, l2=1e-4,
+                                alpha_nodes=1e-3, alpha_edges=5e-4):
+    gg = genome.copy()
+    train_with_backprop_numpy(gg, Xtr, ytr, steps=steps, lr=lr, l2=l2)
+    pred = predict(gg, Xva)
+    acc = (pred == (yva if yva.ndim==1 else np.argmax(yva,1))).mean()
+    pen = complexity_penalty(gg, alpha_nodes=alpha_nodes, alpha_edges=alpha_edges)
+    return float(acc - pen)
+
+# ============================================================
+# 5) Visualization utilities
+# ============================================================
+
+@dataclass
+class Scar:
+    birth_gen: int
+    mode: str = "split"   # 'head'|'tail'|'split'|...
+    age: int = 0
+
+def layout_by_depth(genome: Genome, x_gap: float = 1.5, y_gap: float = 1.0) -> Dict[int, Tuple[float, float]]:
+    depth = genome.node_depths()
+    buckets: Dict[int, List[int]] = {}
+    for nid, d in depth.items(): buckets.setdefault(d, []).append(nid)
+    type_rank = {'input':0, 'bias':1, 'hidden':2, 'output':3}
+    for d in buckets: buckets[d].sort(key=lambda nid: (type_rank.get(genome.nodes[nid].type,9), nid))
+    pos = {}
+    for i, d in enumerate(sorted(buckets.keys())):
+        nodes = buckets[d]; y0 = -(len(nodes)-1)/2.0
+        for j, nid in enumerate(nodes): pos[nid] = (i * x_gap, (y0 + j) * y_gap)
+    return pos
+
+def layout_by_depth_union(genomes: List[Genome], x_gap: float = 1.5, y_gap: float = 1.0) -> Dict[int, Tuple[float, float]]:
+    depths_per: Dict[int, List[int]] = {}; type_by: Dict[int, str] = {}
+    for g in genomes:
+        d = g.node_depths()
+        for nid, dep in d.items():
+            depths_per.setdefault(nid, []).append(dep)
+            if nid not in type_by: type_by[nid] = g.nodes[nid].type
+    depth_final = {nid: max(ds) for nid, ds in depths_per.items()}
+    buckets: Dict[int, List[int]] = {}
+    for nid, dep in depth_final.items(): buckets.setdefault(dep, []).append(nid)
+    type_rank = {'input':0, 'bias':1, 'hidden':2, 'output':3}
+    for d in buckets: buckets[d].sort(key=lambda nid: (type_rank.get(type_by.get(nid,'hidden'),9), nid))
+    pos = {}
+    for i, d in enumerate(sorted(buckets.keys())):
+        nodes = buckets[d]; y0 = -(len(nodes)-1)/2.0
+        for j, nid in enumerate(nodes): pos[nid] = (i * x_gap, (y0 + j) * y_gap)
+    return pos
+
+def _edge_key(c) -> Tuple[int,int]:
+    return (c.in_node, c.out_node)
+
+def edge_sets(prev_genome: Optional[Genome], curr_genome: Genome) -> Tuple[Set[Tuple[int,int]], Set[Tuple[int,int]], Set[Tuple[int,int]]]:
+    prev = set(_edge_key(c) for c in (prev_genome.enabled_connections() if prev_genome else []))
+    curr = set(_edge_key(c) for c in (curr_genome.enabled_connections() if curr_genome else []))
+    return prev & curr, curr - prev, prev - curr
+
+def _draw_edges(ax, genome: Genome, pos, lw=1.0, alpha=0.8):
+    for c in genome.enabled_connections():
+        i, o = c.in_node, c.out_node
+        if i not in pos or o not in pos: continue
+        p1 = pos[i]; p2 = pos[o]
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], linewidth=lw, alpha=alpha)
+
+def _draw_edges_with_diff(ax, prev_genome: Optional[Genome], curr_genome: Genome, pos,
+                          lw_base=1.0, lw_added=2.0, lw_removed=1.2,
+                          alpha_base=0.7, alpha_added=1.0, alpha_removed=0.6,
+                          linestyle_removed=(0,(3,3))):
+    common, added, removed = edge_sets(prev_genome, curr_genome)
+    for c in curr_genome.enabled_connections():
+        e = _edge_key(c)
+        if e in added: continue
+        i, o = c.in_node, c.out_node
+        if i not in pos or o not in pos: continue
+        p1 = pos[i]; p2 = pos[o]
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], linewidth=lw_base, alpha=alpha_base)
+    for c in curr_genome.enabled_connections():
+        e = _edge_key(c)
+        if e not in added: continue
+        i, o = c.in_node, c.out_node
+        if i not in pos or o not in pos: continue
+        p1 = pos[i]; p2 = pos[o]
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], linewidth=lw_added, alpha=alpha_added)
+    if prev_genome is not None:
+        for c in prev_genome.enabled_connections():
+            e = _edge_key(c)
+            if e not in removed: continue
+            i, o = c.in_node, c.out_node
+            if i not in pos or o not in pos: continue
+            p1 = pos[i]; p2 = pos[o]
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], linewidth=lw_removed, alpha=alpha_removed, linestyle=linestyle_removed)
+
+def _mode_lw_factor(mode: str) -> float:
+    if mode == "head": return 1.2
+    if mode == "tail": return 1.0
+    if mode == "split": return 1.4
+    return 1.0
+
+def _draw_nodes(ax, genome: Genome, pos, scars: Optional[Dict[int, 'Scar']] = None,
+                pulse_t: float = 0.0, decay_horizon: float = 8.0,
+                radius: float = 0.10, annotate_type=True, show_mode_mark=True):
+    for nid, nd in genome.nodes.items():
+        if nid not in pos: continue
+        x, y = pos[nid]
+        circ = Circle((x, y), radius=radius, fill=True, alpha=0.9, linewidth=0.0)
+        ax.add_patch(circ)
+        outline_lw = 1.0; outline_alpha = 0.9; mode_char=None
+        if scars and (nid in scars):
+            age = scars[nid].age; mode_char = scars[nid].mode[:1].upper() if scars[nid].mode else None
+            amp = max(0.1, 1.0 - (age / float(decay_horizon))) if (decay_horizon and decay_horizon>0) else 1.0
+            pulse = 1.0 + 0.25 * math.sin(2*math.pi * pulse_t) * amp
+            outline_lw = 2.0 * pulse * _mode_lw_factor(scars[nid].mode)
+            circ2 = Circle((x, y), radius=radius*(1.0+0.15*pulse), fill=False, linewidth=outline_lw, alpha=outline_alpha)
+            ax.add_patch(circ2)
+            ax.text(x, y + radius*1.6, f"{age}", ha="center", va="bottom", fontsize=8, alpha=0.9)
+        else:
+            circ2 = Circle((x, y), radius=radius, fill=False, linewidth=outline_lw, alpha=outline_alpha)
+            ax.add_patch(circ2)
+        if annotate_type: ax.text(x, y - radius*1.6, f"{nd.type[0]}", ha="center", va="top", fontsize=7, alpha=0.8)
+        if show_mode_mark and mode_char is not None: ax.text(x + radius*1.2, y, mode_char, ha="left", va="center", fontsize=8, alpha=0.9)
+
+def diff_scars(prev_genome: Optional[Genome], curr_genome: Genome, prev_scars: Optional[Dict[int, 'Scar']], birth_gen: int,
+               regen_mode_for_new: str = "split") -> Dict[int, 'Scar']:
+    scars = {} if prev_scars is None else {k: Scar(v.birth_gen, v.mode, v.age+1) for k, v in prev_scars.items()}
+    prev_ids = set(prev_genome.nodes.keys()) if prev_genome is not None else set()
+    curr_ids = set(curr_genome.nodes.keys())
+    new_nodes = list(curr_ids - prev_ids)
+    for nid in new_nodes: scars[nid] = Scar(birth_gen=birth_gen, mode=regen_mode_for_new, age=0)
+    for nid in list(scars.keys()):
+        if nid not in curr_ids: scars.pop(nid, None)
+    return scars
+
+def draw_genome_png(genome: Genome, scars: Optional[Dict[int, 'Scar']], path: str, title: Optional[str] = None,
+                    prev_genome: Optional[Genome]=None, decay_horizon: float = 8.0):
+    pos = layout_by_depth(genome)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    if prev_genome is not None: _draw_edges_with_diff(ax, prev_genome, genome, pos)
+    else: _draw_edges(ax, genome, pos, lw=1.0, alpha=0.8)
+    _draw_nodes(ax, genome, pos, scars=scars, pulse_t=0.0, decay_horizon=decay_horizon, radius=0.12, annotate_type=True, show_mode_mark=True)
+    if title: ax.set_title(title)
+    ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout(); fig.savefig(path, dpi=200); plt.close(fig)
+
+def export_regen_gif(genomes: List[Genome], scars_seq: List[Dict[int, 'Scar']], out_path: str,
+                     fps: int = 12, pulse_period_frames: int = 24, decay_horizon: float = 8.0,
+                     fixed_layout: bool = False):
+    assert len(genomes) == len(scars_seq)
+    pos_fixed = layout_by_depth_union(genomes) if fixed_layout else None
+    frames = []; subframes = pulse_period_frames; prev=None
+    for i, (g, scars) in enumerate(zip(genomes, scars_seq)):
+        pos = pos_fixed if fixed_layout else layout_by_depth(g)
+        for s in range(subframes):
+            t = (s / subframes)
+            fig, ax = plt.subplots(figsize=(6, 4))
+            _draw_edges_with_diff(ax, prev, g, pos)
+            _draw_nodes(ax, g, pos, scars=scars, pulse_t=t, decay_horizon=decay_horizon, radius=0.12, annotate_type=True, show_mode_mark=True)
+            ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout()
+            fig.canvas.draw(); w, h = fig.canvas.get_width_height()
+            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3); frames.append(img); plt.close(fig)
+        prev = g
+    imageio.mimsave(out_path, frames, fps=fps)
+
+def export_morph_gif(genomes: List[Genome], scars_seq: List[Dict[int, 'Scar']], out_path: str,
+                     fps: int = 12, morph_frames: int = 12, decay_horizon: float = 8.0):
+    assert len(genomes) == len(scars_seq)
+    pos = layout_by_depth_union(genomes)
+    frames = []
+    for i in range(len(genomes)-1):
+        g0, g1 = genomes[i], genomes[i+1]; s0, s1 = scars_seq[i], scars_seq[i+1]
+        for m in range(morph_frames):
+            t = (m+1)/float(morph_frames)
+            fig, ax = plt.subplots(figsize=(6, 4))
+            for c in g0.enabled_connections():
+                i0, o0 = c.in_node, c.out_node
+                if i0 not in pos or o0 not in pos: continue
+                p1 = pos[i0]; p2 = pos[o0]; ax.plot([p1[0], p2[0]], [p1[1], p2[1]], linewidth=1.2, alpha=max(0.0, 1.0 - t))
+            for c in g1.enabled_connections():
+                i1, o1 = c.in_node, c.out_node
+                if i1 not in pos or o1 not in pos: continue
+                p1 = pos[i1]; p2 = pos[o1]; ax.plot([p1[0], p2[0]], [p1[1], p2[1]], linewidth=1.5, alpha=min(1.0, t))
+            _draw_nodes(ax, g0, pos, scars=s0, pulse_t=1.0-t, decay_horizon=decay_horizon, radius=0.12, annotate_type=False, show_mode_mark=True)
+            _draw_nodes(ax, g1, pos, scars=s1, pulse_t=t, decay_horizon=decay_horizon, radius=0.12, annotate_type=False, show_mode_mark=True)
+            ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout()
+            fig.canvas.draw(); w, h = fig.canvas.get_width_height()
+            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3); frames.append(img); plt.close(fig)
+    imageio.mimsave(out_path, frames, fps=fps)
+
+def export_double_exposure(genome: Genome, lineage_edges: List[Tuple[Optional[int], Optional[int], int, int, str]],
+                           current_gen: int, out_path: str, title: Optional[str] = None):
+    gens = {}
+    for (m, f, child, gen, kind) in lineage_edges:
+        if gen > current_gen: continue
+        gens.setdefault(gen, []).append(child)
+    for gen in gens: gens[gen] = sorted(gens[gen])
+    id_row = {}
+    for gen in sorted(gens.keys()):
+        for idx, cid in enumerate(gens[gen]): id_row[cid] = idx
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for (m, f, child, gen, kind) in lineage_edges:
+        if gen > current_gen: continue
+        x2 = gen; y2 = id_row.get(child, 0)
+        if m is not None:
+            x1 = gen-1; y1 = id_row.get(m, y2); ax.plot([x1, x2], [y1, y2], linewidth=1.0, alpha=0.25)
+        if f is not None:
+            x1 = gen-1; y1 = id_row.get(f, y2); ax.plot([x1, x2], [y1, y2], linewidth=1.0, alpha=0.25)
+    ax.set_xlabel("Generation"); ax.set_ylabel("Lineage Row")
+    pos = layout_by_depth(genome)
+    for c in genome.enabled_connections():
+        i, o = c.in_node, c.out_node
+        if i not in pos or o not in pos: continue
+        p1 = pos[i]; p2 = pos[o]; ax.plot([p1[0], p2[0]], [p1[1], p2[1]], linewidth=1.5, alpha=0.9)
+    for nid in genome.nodes:
+        if nid not in pos: continue
+        x, y = pos[nid]; circ = Circle((x, y), radius=0.10, fill=True, alpha=0.9, linewidth=0.0); ax.add_patch(circ)
+        circ2 = Circle((x, y), radius=0.10, fill=False, linewidth=1.5, alpha=0.9); ax.add_patch(circ2)
+    if title: ax.set_title(title)
+    fig.tight_layout(); fig.savefig(out_path, dpi=220); plt.close(fig)
+
+# -----------------------------
+# Lineage (no hard color choices; uses shape/linestyle/linewidth)
+# -----------------------------
+
+def _infer_generations(lineage_edges: Iterable[Tuple[Optional[int], Optional[int], int, int, str]]):
+    gen: Dict[int, int] = {}
+    edges = list(lineage_edges)
+    for _, _, child, g, _ in edges:
+        gen[child] = int(g)
+    changed = True
+    while changed:
+        changed = False
+        for m, f, c, g, _ in edges:
+            if c not in gen: 
+                continue
+            for p in (m, f):
+                if p is None: continue
+                target = gen[c] - 1
+                if (p not in gen) or (gen[p] > target):
+                    gen[p] = target
+                    changed = True
+    if gen:
+        shift = -min(gen.values())
+        if shift > 0:
+            for k in list(gen.keys()):
+                gen[k] += shift
+    return gen
+
+def _fallback_lineage_layout(nodes: List[int], gen_map: Dict[int,int]):
+    layers: Dict[int, List[int]] = {}
+    for n in nodes:
+        layers.setdefault(int(gen_map.get(n, 0)), []).append(n)
+    for k in layers: layers[k] = sorted(layers[k])
+    pos = {}
+    max_gen = max(layers.keys()) if layers else 0
+    for g in range(max_gen + 1):
+        row = layers.get(g, []); n = len(row) or 1
+        xs = np.linspace(0.1, 0.9, n)
+        y = 1.0 - (g / max(1, max_gen + 0.5))
+        for x, nid in zip(xs, row): pos[nid] = (x, y)
+    for n in nodes:
+        if n not in pos: pos[n] = (0.5, 0.5)
+    return pos
+
+def render_lineage(neat, path="lineage.png", title="Lineage", max_edges: Optional[int]=2500,
+                   highlight: Optional[Iterable[int]]=None, dpi=200):
+    edges = getattr(neat, "lineage_edges", None)
+    if not edges:
+        raise ValueError("neat.lineage_edges is empty. Run evolve() first.")
+    use_edges = edges[-max_edges:] if (max_edges and len(edges) > max_edges) else edges
+    nodes = set()
+    for m,f,c,g,tag in use_edges:
+        for nid in (m,f,c):
+            if nid is not None: nodes.add(nid)
+    gen_map = _infer_generations(use_edges)
+    pos = _fallback_lineage_layout(sorted(nodes), gen_map)
+    # draw
+    fig, ax = plt.subplots(figsize=(10,7))
+    ax.set_axis_off(); ax.set_title(title, loc='left', fontsize=12)
+    # edges with styles
+    for (m,f,c,g,tag) in use_edges:
+        kind = tag if tag and tag!='birth' else ('asexual' if (m is None or f is None) else ('selfing' if m==f else 'sexual'))
+        style = 'solid' if kind=='sexual' else ('dashdot' if kind=='selfing' else ('dashed' if kind=='asexual' else 'dotted'))
+        width = 1.8 if kind in ('sexual','asexual') else 1.4
+        for p in (m,f):
+            if p is None: continue
+            if p not in pos or c not in pos: continue
+            x1,y1 = pos[p]; x2,y2 = pos[c]
+            arr = FancyArrowPatch((x1,y1),(x2,y2), arrowstyle='-|>', mutation_scale=8, lw=width, linestyle=style, alpha=0.9)
+            ax.add_patch(arr)
+    # nodes (shape encodes sex; size encodes regen)
+    reg = getattr(neat, "node_registry", {})
+    xs_f=[]; ys_f=[]; ss_f=[]; xs_m=[]; ys_m=[]; ss_m=[]; xs_u=[]; ys_u=[]; ss_u=[]
+    for nid,(x,y) in pos.items():
+        info = reg.get(nid, {}); sex = info.get('sex', None); regen = bool(info.get('regen', False))
+        size = 80*(1.3 if regen else 1.0)
+        if sex=='female': xs_f.append(x); ys_f.append(y); ss_f.append(size)
+        elif sex=='male': xs_m.append(x); ys_m.append(y); ss_m.append(size)
+        else: xs_u.append(x); ys_u.append(y); ss_u.append(size)
+    if xs_f: ax.scatter(xs_f, ys_f, s=ss_f, marker='o', alpha=0.95)
+    if xs_m: ax.scatter(xs_m, ys_m, s=ss_m, marker='s', alpha=0.95)
+    if xs_u: ax.scatter(xs_u, ys_u, s=ss_u, marker='^', alpha=0.95)
+    # highlight ring
+    hi = set(highlight or [])
+    if hi:
+        hx=[]; hy=[]
+        for nid in hi:
+            if nid in pos: 
+                x,y=pos[nid]; hx.append(x); hy.append(y)
+        if hx: ax.scatter(hx, hy, s=300, facecolors='none', edgecolors='black', linewidths=2.4, alpha=0.9)
+    # labels
+    if len(nodes) <= 1200:
+        for nid,(x,y) in pos.items():
+            ax.text(x, y+0.02, str(nid), fontsize=6, ha='center', va='bottom', alpha=0.9)
+    fig.tight_layout(); fig.savefig(path, dpi=dpi); plt.close(fig)
+
+# ============================================================
+# 6) Plot templates
+# ============================================================
+
+def _moving_stats(arr: List[float], window: int):
+    arr = np.asarray(arr, dtype=np.float64)
+    if window <= 1 or window > len(arr): 
+        return arr, np.zeros_like(arr)
+    ma = np.convolve(arr, np.ones(window)/window, mode='valid')
+    pad = len(arr) - len(ma)
+    ma = np.concatenate([np.full(pad, np.nan), ma])
+    # rolling std
+    rs = []
+    for i in range(len(arr)):
+        j0 = max(0, i-window+1); jj = arr[j0:i+1]
+        rs.append(np.std(jj) if len(jj)>1 else 0.0)
+    return ma, np.asarray(rs)
+
+def plot_learning_and_complexity(history: List[Tuple[float,float]], hidden_counts_history: List[List[int]], edge_counts_history: List[List[int]], out_path: str, title: str, ma_window: int = 7):
+    best = [b for b,_ in history]; avg = [a for _,a in history]
+    best_ma, best_std = _moving_stats(best, ma_window)
+    avg_ma,  avg_std  = _moving_stats(avg,  ma_window)
+    mean_hidden = [float(np.mean(h)) for h in hidden_counts_history]
+    mean_edges  = [float(np.mean(e)) for e in edge_counts_history]
+    gens = np.arange(len(history))
+    fig, ax1 = plt.subplots(figsize=(6,4))
+    # raw
+    ax1.plot(gens, best, linewidth=1.0, alpha=0.7, linestyle=':')
+    ax1.plot(gens, avg,  linewidth=1.0, alpha=0.7, linestyle=':')
+    # moving average
+    ax1.plot(gens, best_ma, linewidth=1.6, alpha=0.95, label="best (MA)")
+    ax1.plot(gens, avg_ma,  linewidth=1.4, alpha=0.95, label="avg (MA)")
+    # "CI" as rolling std bounds (lines only)
+    ax1.plot(gens, avg_ma-avg_std, linewidth=0.9, alpha=0.8, linestyle='--')
+    ax1.plot(gens, avg_ma+avg_std, linewidth=0.9, alpha=0.8, linestyle='--')
+    ax1.set_xlabel("Generation"); ax1.set_ylabel("Fitness")
+    # secondary y for complexity
+    ax2 = ax1.twinx()
+    ax2.plot(gens, mean_hidden, linewidth=1.2, alpha=0.75, linestyle='-')
+    ax2.plot(gens, mean_edges,  linewidth=1.2, alpha=0.75, linestyle='-.')
+    ax2.set_ylabel("Complexity")
+    if title: ax1.set_title(title)
+    fig.tight_layout(); fig.savefig(out_path, dpi=200); plt.close(fig)
+
+def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int = 50):
+    gg = genome.copy()
+    try:
+        train_with_backprop_numpy(gg, X, y, steps=steps, lr=5e-3, l2=1e-4)
+    except Exception:
+        pass
+    x_min, x_max = X[:,0].min()-0.2, X[:,0].max()+0.2
+    y_min, y_max = X[:,1].min()-0.2, X[:,1].max()+0.2
+    xx, yy = np.meshgrid(np.linspace(x_min, x_max, 200), np.linspace(y_min, y_max, 200))
+    grid = np.stack([xx.ravel(), yy.ravel()], axis=1)
+    P = predict_proba(gg, grid)[:,1].reshape(xx.shape)
+    fig, ax = plt.subplots(figsize=(6,4))
+    cs = ax.contourf(xx, yy, P, levels=20, alpha=0.8)
+    ax.scatter(X[:,0], X[:,1], s=8, alpha=0.8)
+    ax.set_xlabel("x"); ax.set_ylabel("y")
+    fig.tight_layout(); fig.savefig(out_path, dpi=220); plt.close(fig)
+
+# Utility: export decision boundaries for all 3 toy tasks (separate PNG files)
+def export_decision_boundaries_all(genome: Genome, out_dir: str, steps: int = 50, seed: int = 0):
+    os.makedirs(out_dir or ".", exist_ok=True)
+    # Circles
+    Xc, yc = make_circles(512, r=0.6, noise=0.05, seed=seed)
+    path_c = os.path.join(out_dir, "decision_circles.png")
+    plot_decision_boundary(genome, Xc, yc, path_c, steps=steps)
+    # XOR
+    Xx, yx = make_xor(512, noise=0.05, seed=seed)
+    path_x = os.path.join(out_dir, "decision_xor.png")
+    plot_decision_boundary(genome, Xx, yx, path_x, steps=steps)
+    # Spiral
+    Xs, ys = make_spirals(512, noise=0.05, turns=1.5, seed=seed)
+    path_s = os.path.join(out_dir, "decision_spiral.png")
+    plot_decision_boundary(genome, Xs, ys, path_s, steps=steps)
+    return {"circles": path_c, "xor": path_x, "spiral": path_s}
+
+# ============================================================
+# 7) Toy datasets & CLI demo
+# ============================================================
+
+def make_circles(n=512, r=0.5, noise=0.1, seed=0):
+    rng = np.random.default_rng(seed)
+    X = rng.uniform(-1, 1, size=(n, 2))
+    y = (np.sqrt((X**2).sum(axis=1)) > r).astype(np.int32)
+    X += rng.normal(0, noise, size=X.shape)
+    return X, y
+
+def make_xor(n=512, noise=0.1, seed=0):
+    rng = np.random.default_rng(seed)
+    X = rng.uniform(-1, 1, size=(n, 2))
+    y = ((X[:,0] * X[:,1]) > 0).astype(np.int32)
+    X += rng.normal(0, noise, size=X.shape)
+    return X, y
+
+def make_spirals(n=512, noise=0.1, turns=1.5, seed=0):
+    rng = np.random.default_rng(seed); n2 = n//2
+    t = np.linspace(0.0, turns*2*np.pi, n2); r = np.linspace(0.05, 1.0, n2)
+    x1 = r*np.cos(t); y1 = r*np.sin(t); x2 = r*np.cos(t+np.pi); y2 = r*np.sin(t+np.pi)
+    X = np.vstack([np.stack([x1,y1],1), np.stack([x2,y2],1)])
+    X += rng.normal(0, noise, size=X.shape)
+    y = np.concatenate([np.zeros(n2, dtype=np.int32), np.ones(n2, dtype=np.int32)])
+    return X, y
+
+def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True):
+    # dataset
+    if task=="xor": Xtr,ytr = make_xor(512, noise=0.05, seed=0); Xva,yva = make_xor(256, noise=0.05, seed=1)
+    elif task=="spiral": Xtr,ytr = make_spirals(512, noise=0.05, turns=1.5, seed=0); Xva,yva = make_spirals(256, noise=0.05, turns=1.5, seed=1)
+    else: Xtr,ytr = make_circles(512, r=0.6, noise=0.05, seed=0); Xva,yva = make_circles(256, r=0.6, noise=0.05, seed=1)
+    # NEAT
+    neat = ReproPlanaNEATPlus(num_inputs=2, num_outputs=1, population_size=pop, output_activation='identity')
+    neat.mode = EvalMode(vanilla=True, enable_regen_reproduction=False, complexity_alpha=0.01, node_penalty=1.0, edge_penalty=0.5)
+    def fit(g):
+        return fitness_backprop_classifier(g, Xtr, ytr, Xva, yva, steps=steps, lr=5e-3, l2=1e-4, alpha_nodes=1e-3, alpha_edges=5e-4)
+    best, hist = neat.evolve(fit, n_generations=gens, verbose=True)
+    # Outputs
+    out_dir = os.path.dirname(out_prefix) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    lc_path = f"{out_prefix}_learning_complexity.png"
+    plot_learning_and_complexity(hist, neat.hidden_counts_history, neat.edge_counts_history, lc_path, title=f"{task.upper()} | Backprop NEAT", ma_window=7)
+    db_path = f"{out_prefix}_decision_boundary.png"
+    plot_decision_boundary(best, Xtr, ytr, db_path, steps=steps)
+    topo_path = f"{out_prefix}_topology.png"; scars = diff_scars(None, best, None, birth_gen=gens, regen_mode_for_new="split")
+    draw_genome_png(best, scars, topo_path, title=f"Best Topology (Gen {gens})")
+    # GIFs (auto)
+    regen_gif = None; morph_gif = None
+    if make_gifs and len(neat.snapshots_genomes) >= 2:
+        regen_gif = f"{out_prefix}_regen.gif"
+        export_regen_gif(neat.snapshots_genomes, neat.snapshots_scars, regen_gif, fps=12, pulse_period_frames=16, decay_horizon=10.0, fixed_layout=True)
+        morph_gif = f"{out_prefix}_morph.gif"
+        export_morph_gif(neat.snapshots_genomes, neat.snapshots_scars, morph_gif, fps=12, morph_frames=12, decay_horizon=10.0)
+    # Lineage (auto)
+    lineage_path = None
+    if make_lineage:
+        lineage_path = f"{out_prefix}_lineage.png"
+        render_lineage(neat, path=lineage_path, title=f"{task.upper()} Lineage", max_edges=5000, highlight=neat.best_ids[-10:], dpi=220)
+    # Summary decision boundaries for all tasks (separate files)
+    summary_dir = f"{out_prefix}_decisions"
+    summary_paths = export_decision_boundaries_all(best, summary_dir, steps=steps, seed=0)
+    return {
+        "learning_curve": lc_path,
+        "decision_boundary": db_path,
+        "topology": topo_path,
+        "regen_gif": regen_gif,
+        "morph_gif": morph_gif,
+        "lineage": lineage_path,
+        "summary_decisions": summary_paths,
+    }
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--env_id", type=str, default=None, help="Gym/Gymnasium environment id for RL mode")
+    ap.add_argument("--episodes", type=int, default=1)
+    ap.add_argument("--max_steps", type=int, default=2000)
+    ap.add_argument("--stochastic", action="store_true")
+    ap.add_argument("--temp", type=float, default=1.0)
+    ap.add_argument("--task", type=str, default="circles", choices=["circles","xor","spiral"])
+    ap.add_argument("--gens", type=int, default=30)
+    ap.add_argument("--pop", type=int, default=48)
+    ap.add_argument("--steps", type=int, default=40, help="backprop steps per individual evaluation")
+    ap.add_argument("--out_prefix", type=str, default="out/exp")
+    ap.add_argument("--no_gifs", action="store_true")
+    ap.add_argument("--no_lineage", action="store_true")
+    args = ap.parse_args()
+    paths = run_backprop_neat_experiment(args.task, args.gens, args.pop, args.steps, args.out_prefix, make_gifs=not args.no_gifs, make_lineage=not args.no_lineage)
+    for k,v in paths.items(): print(k, v)
+
+if __name__ == "__main__":
+    main()
