@@ -445,7 +445,7 @@ class ReproPlanaNEATPlus:
             g.sex = 'female' if self.rng.random() < 0.5 else 'male'
             g.regen = bool(self.rng.random() < 0.5)
             g.regen_mode = self.rng.choice(['head','tail','split'])
-            g.embryo_bias = self.rng.choice(['neutral','inputward','outputward'], p=[0.5,0.25,0.25])
+            g.embryo_bias = 'inputward'
             g.id = self.next_gid; self.next_gid += 1; g.birth_gen = 0
             self.population.append(g)
 
@@ -454,7 +454,7 @@ class ReproPlanaNEATPlus:
         self.compatibility_threshold = 3.0
         self.c1=self.c2=1.0; self.c3=0.4
         self.elitism = 1; self.survival_rate = 0.2
-        self.mutate_add_conn_prob = 0.05; self.mutate_add_node_prob = 0.03
+        self.mutate_add_conn_prob = 0.10; self.mutate_add_node_prob = 0.10
         self.mutate_weight_prob = 0.8; self.mutate_toggle_prob = 0.01
         self.weight_perturb_chance = 0.9; self.weight_sigma = 0.8; self.weight_reset_range = 2.0
         self.regen_mode_mut_rate = 0.05; self.embryo_bias_mut_rate = 0.03
@@ -984,7 +984,11 @@ def export_regen_gif(genomes: List[Genome], scars_seq: List[Dict[int, 'Scar']], 
             _draw_nodes(ax, g, pos, scars=scars, pulse_t=t, decay_horizon=decay_horizon, radius=0.12, annotate_type=True, show_mode_mark=True)
             ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout()
             fig.canvas.draw(); w, h = fig.canvas.get_width_height()
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3); frames.append(img); plt.close(fig)
+            buf = fig.canvas.tostring_rgb() if hasattr(fig.canvas, "tostring_rgb") else fig.canvas.buffer_rgba()
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            if arr.size == (w * h * 4): arr = arr.reshape(h, w, 4)[..., :3]
+            else: arr = arr.reshape(h, w, 3)
+            frames.append(arr); plt.close(fig)
         prev = g
     imageio.mimsave(out_path, frames, fps=fps)
 
@@ -1010,7 +1014,11 @@ def _export_morph_gif_with_scars(genomes: List[Genome], scars_seq: List[Dict[int
             _draw_nodes(ax, g1, pos, scars=s1, pulse_t=t, decay_horizon=decay_horizon, radius=0.12, annotate_type=False, show_mode_mark=True)
             ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout()
             fig.canvas.draw(); w, h = fig.canvas.get_width_height()
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3); frames.append(img); plt.close(fig)
+            buf = fig.canvas.tostring_rgb() if hasattr(fig.canvas, "tostring_rgb") else fig.canvas.buffer_rgba()
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            if arr.size == (w * h * 4): arr = arr.reshape(h, w, 4)[..., :3]
+            else: arr = arr.reshape(h, w, 3)
+            frames.append(arr); plt.close(fig)
     imageio.mimsave(out_path, frames, fps=fps)
 
 def export_double_exposure(genome: Genome, lineage_edges: List[Tuple[Optional[int], Optional[int], int, int, str]],
@@ -1245,14 +1253,14 @@ def make_spirals(n=512, noise=0.1, turns=1.5, seed=0):
     y = np.concatenate([np.zeros(n2, dtype=np.int32), np.ones(n2, dtype=np.int32)])
     return X, y
 
-def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True):
+def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True):
     # dataset
     if task=="xor": Xtr,ytr = make_xor(512, noise=0.05, seed=0); Xva,yva = make_xor(256, noise=0.05, seed=1)
     elif task=="spiral": Xtr,ytr = make_spirals(512, noise=0.05, turns=1.5, seed=0); Xva,yva = make_spirals(256, noise=0.05, turns=1.5, seed=1)
     else: Xtr,ytr = make_circles(512, r=0.6, noise=0.05, seed=0); Xva,yva = make_circles(256, r=0.6, noise=0.05, seed=1)
     # NEAT
     neat = ReproPlanaNEATPlus(num_inputs=2, num_outputs=1, population_size=pop, output_activation='identity')
-    neat.mode = EvalMode(vanilla=True, enable_regen_reproduction=False, complexity_alpha=0.01, node_penalty=1.0, edge_penalty=0.5)
+    neat.mode = EvalMode(vanilla=True, enable_regen_reproduction=True, complexity_alpha=0.003, node_penalty=0.7, edge_penalty=0.3)
     def fit(g):
         return fitness_backprop_classifier(g, Xtr, ytr, Xva, yva, steps=steps, lr=5e-3, l2=1e-4, alpha_nodes=1e-3, alpha_edges=5e-4)
     best, hist = neat.evolve(fit, n_generations=gens, verbose=True)
@@ -1768,9 +1776,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     ap = argparse.ArgumentParser(description="Spiral-NEAT NumPy | built-in CLI")
     ap.add_argument("--task", choices=["xor","circles","spiral"])
-    ap.add_argument("--gens", type=int, default=30)
-    ap.add_argument("--pop",  type=int, default=48)
-    ap.add_argument("--steps",type=int, default=40)
+    ap.add_argument("--gens", type=int, default=60)
+    ap.add_argument("--pop",  type=int, default=64)
+    ap.add_argument("--steps",type=int, default=80)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--rl-env", type=str)
     ap.add_argument("--rl-gens", type=int, default=20)
