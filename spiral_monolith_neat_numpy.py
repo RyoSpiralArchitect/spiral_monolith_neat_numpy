@@ -1260,10 +1260,9 @@ def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefi
         export_regen_gif(neat.snapshots_genomes, neat.snapshots_scars, regen_gif, fps=12, pulse_period_frames=16, decay_horizon=10.0, fixed_layout=True)
         morph_gif = f"{out_prefix}_morph.gif"
         export_morph_gif(
-            neat.snapshots_genomes,
-            neat.snapshots_scars,
+            snapshots_genomes=neat.snapshots_genomes,
+            snapshots_scars=neat.snapshots_scars,
             path=morph_gif,
-            fps=12,
             morph_frames=12,
             decay_horizon=10.0,
         )
@@ -1623,15 +1622,18 @@ def _softmax_np(x, axis=-1, temp=1.0):
     return ex / (np.sum(ex, axis=axis, keepdims=True) + 1e-9)
 
 def output_dim_from_space(space):
-    import gym
-    from gym.spaces import Discrete, MultiDiscrete, MultiBinary, Box
-    if isinstance(space, Discrete):
+    try:
+        import gymnasium as _gym
+    except ImportError:
+        import gym as _gym
+    spaces = _gym.spaces
+    if isinstance(space, spaces.Discrete):
         return int(space.n)
-    if isinstance(space, MultiDiscrete):
+    if isinstance(space, spaces.MultiDiscrete):
         return int(np.sum(space.nvec))
-    if isinstance(space, MultiBinary):
+    if isinstance(space, spaces.MultiBinary):
         return int(np.prod(space.n))
-    if isinstance(space, Box):
+    if isinstance(space, spaces.Box):
         return int(np.prod(space.shape))
     raise ValueError(f"Unsupported action space: {type(space)}")
 
@@ -1643,10 +1645,13 @@ def obs_dim_from_space(space):
     raise ValueError(f"Unsupported observation space: {type(space)}")
 
 def build_action_mapper(space, stochastic=False, temp=1.0):
-    import gym
-    from gym.spaces import Discrete, MultiDiscrete, MultiBinary, Box
+    try:
+        import gymnasium as _gym
+    except ImportError:
+        import gym as _gym
+    spaces = _gym.spaces
 
-    if isinstance(space, gym.spaces.Discrete):
+    if isinstance(space, spaces.Discrete):
         n = space.n
         def f(y):
             if stochastic:
@@ -1655,7 +1660,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
             return int(np.argmax(y[:n]))
         return f
 
-    if isinstance(space, gym.spaces.MultiDiscrete):
+    if isinstance(space, spaces.MultiDiscrete):
         nvec = np.array(space.nvec, dtype=int)
         def f(y):
             out = []
@@ -1672,7 +1677,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
             return np.array(out, dtype=space.dtype)
         return f
 
-    if isinstance(space, gym.spaces.MultiBinary):
+    if isinstance(space, spaces.MultiBinary):
         d = int(np.prod(space.n))
         def f(y):
             z = y[:d]
@@ -1684,7 +1689,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
             return a.reshape(space.n)
         return f
 
-    if isinstance(space, gym.spaces.Box):
+    if isinstance(space, spaces.Box):
         shape = space.shape
         low  = np.asarray(space.low,  dtype=np.float64)
         high = np.asarray(space.high, dtype=np.float64)
@@ -1706,7 +1711,10 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str = 'identity'):
-    import gym
+    try:
+        import gymnasium as gym
+    except ImportError:
+        import gym
     env = gym.make(env_id)
     obs_dim = obs_dim_from_space(env.observation_space)
     out_dim = output_dim_from_space(env.action_space)
@@ -1742,7 +1750,10 @@ def run_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_nor
 def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, episodes=1, obs_norm=None):
     """Return a fitness function for evolve() that evaluates average episodic reward."""
     def _fitness(genome):
-        import gym
+        try:
+            import gymnasium as gym
+        except ImportError:
+            import gym
         try: env = gym.make(env_id, render_mode="rgb_array")
         except TypeError: env = gym.make(env_id)
         mapper = build_action_mapper(env.action_space, stochastic=stochastic, temp=temp)
@@ -1810,7 +1821,11 @@ if __name__ == "__main__":
     # RL
     if args.rl_env:
         try:
-            import gym, matplotlib.pyplot as plt
+            try:
+                import gymnasium as gym
+            except ImportError:
+                import gym
+            import matplotlib.pyplot as plt
             obs_dim = obs_dim_from_space(gym.make(args.rl_env).observation_space)
             out_dim = output_dim_from_space(gym.make(args.rl_env).action_space)
             neat = ReproPlanaNEATPlus(num_inputs=obs_dim, num_outputs=out_dim,
