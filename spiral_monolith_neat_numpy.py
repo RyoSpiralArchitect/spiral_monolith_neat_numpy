@@ -15,10 +15,22 @@
 
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
-import math, argparse, os
-import numpy as np
+import math, argparse, os, mimetypes
 import matplotlib
-matplotlib.use("Agg")
+
+
+def _ensure_matplotlib_agg(force: bool = False):
+    """Select Agg backend even if pyplot was already imported elsewhere."""
+    try:
+        matplotlib.use("Agg", force=force)
+    except TypeError:  # pragma: no cover - older matplotlib doesn't support force
+        matplotlib.use("Agg")
+    return matplotlib
+
+
+_ensure_matplotlib_agg()
+
+import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
 import imageio.v2 as imageio
@@ -34,8 +46,9 @@ __all__ = [
     "fitness_backprop_classifier","make_circles","make_xor","make_spirals",
     "draw_genome_png","export_regen_gif","export_morph_gif","export_double_exposure",
     "plot_learning_and_complexity","plot_decision_boundary",
-    "export_decision_boundaries_all","render_lineage"
-, "output_dim_from_space","build_action_mapper","run_policy_in_env","run_gym_neat_experiment"]
+    "export_decision_boundaries_all","render_lineage","export_scars_spiral_map",
+    "output_dim_from_space","build_action_mapper","run_policy_in_env","run_gym_neat_experiment",
+]
 
 @dataclass
 class NodeGene:
@@ -181,7 +194,13 @@ class Genome:
 
     def mutate_toggle_enable(self, rng: np.random.Generator, prob=0.01):
         for c in self.connections.values():
-            if rng.random() < prob: c.enabled = not c.enabled
+            if rng.random() >= prob:
+                continue
+            if c.enabled:
+                c.enabled = False
+            else:
+                if not self._creates_cycle(c.in_node, c.out_node):
+                    c.enabled = True
 
     def _choose_conn_for_node_add(self, rng: np.random.Generator, bias: str):
         enabled = [c for c in self.connections.values() if c.enabled]
@@ -675,16 +694,10 @@ class ReproPlanaNEATPlus:
             species=self.speciate(fitnesses)
             self._adapt_compat_threshold(len(species))
             self.reproduce(species, fitnesses)
-        # Final best
-        best=None; bestf=-1e9
-        for g in self.population:
-            f = fitness_fn(g)
-            if not self.mode.vanilla:
-                f *= self.sex_fitness_scale.get(g.sex, 1.0) * (getattr(g,'hybrid_scale',1.0))
-                if g.regen: f += self.regen_bonus
-            f -= self._complexity_penalty(g)
-            if f > bestf: bestf=f; best=g
-        return best or best_ever, history
+        # Champion across all generations
+        if best_ever is None and self.population:
+            best_ever = self.population[0].copy()
+        return best_ever, history
 
 # ============================================================
 # 4) Backprop NEAT (NumPy only)
@@ -957,49 +970,216 @@ def draw_genome_png(genome: Genome, scars: Optional[Dict[int, 'Scar']], path: st
     if title: ax.set_title(title)
     ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout(); fig.savefig(path, dpi=200); plt.close(fig)
 
-def export_regen_gif(genomes: List[Genome], scars_seq: List[Dict[int, 'Scar']], out_path: str,
-                     fps: int = 12, pulse_period_frames: int = 24, decay_horizon: float = 8.0,
-                     fixed_layout: bool = False):
-    assert len(genomes) == len(scars_seq)
-    pos_fixed = layout_by_depth_union(genomes) if fixed_layout else None
-    frames = []; subframes = pulse_period_frames; prev=None
-    for i, (g, scars) in enumerate(zip(genomes, scars_seq)):
-        pos = pos_fixed if fixed_layout else layout_by_depth(g)
-        for s in range(subframes):
-            t = (s / subframes)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            _draw_edges_with_diff(ax, prev, g, pos)
-            _draw_nodes(ax, g, pos, scars=scars, pulse_t=t, decay_horizon=decay_horizon, radius=0.12, annotate_type=True, show_mode_mark=True)
-            ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout()
-            fig.canvas.draw(); w, h = fig.canvas.get_width_height()
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3); frames.append(img); plt.close(fig)
-        prev = g
-    imageio.mimsave(out_path, frames, fps=fps)
+def _normalize_scar_snapshot(entry: Optional[Dict[Any, Any]]) -> Tuple[Dict[int, int], Dict[Tuple[int, int], int]]:
+    """Convert a scar snapshot into numeric node/edge age dictionaries."""
+    node_scars: Dict[int, int] = {}
+    edge_scars: Dict[Tuple[int, int], int] = {}
 
-def export_morph_gif(genomes: List[Genome], scars_seq: List[Dict[int, 'Scar']], out_path: str,
-                     fps: int = 12, morph_frames: int = 12, decay_horizon: float = 8.0):
-    assert len(genomes) == len(scars_seq)
-    pos = layout_by_depth_union(genomes)
+    if not entry:
+        return node_scars, edge_scars
+
+    def _coerce_age(val: Any) -> Optional[int]:
+        if hasattr(val, "age"):
+            try:
+                return int(getattr(val, "age"))
+            except Exception:
+                return None
+        if isinstance(val, dict) and "age" in val:
+            try:
+                return int(val.get("age"))
+            except Exception:
+                return None
+        if isinstance(val, (int, float)):
+            return int(val)
+        return None
+
+    if isinstance(entry, dict) and ("nodes" in entry or "edges" in entry):
+        raw_nodes = entry.get("nodes", {}) or {}
+        for nid, val in raw_nodes.items():
+            age = _coerce_age(val)
+            if age is not None:
+                try:
+                    node_scars[int(nid)] = age
+                except Exception:
+                    continue
+        raw_edges = entry.get("edges", {}) or {}
+        for key, val in raw_edges.items():
+            age = _coerce_age(val)
+            if age is None:
+                continue
+            if isinstance(key, (tuple, list)) and len(key) == 2:
+                try:
+                    edge_scars[(int(key[0]), int(key[1]))] = age
+                except Exception:
+                    continue
+            else:
+                continue
+        return node_scars, edge_scars
+
+    if isinstance(entry, dict):
+        for nid, val in entry.items():
+            age = _coerce_age(val)
+            if age is not None:
+                try:
+                    node_scars[int(nid)] = age
+                except Exception:
+                    continue
+    return node_scars, edge_scars
+
+
+def _export_morph_gif_with_scars(
+    snapshots_genomes,
+    snapshots_scars,
+    path,
+    *,
+    fps=12,
+    morph_frames=12,
+    decay_horizon=10.0,
+    fixed_layout=True,
+    dpi=130,
+    pulse_period_frames=16,
+):
+    """Scar-aware morph GIF helper shared by export_morph_gif."""
+
+    import numpy as _np
+    import imageio.v2 as _imageio
+    import matplotlib.pyplot as _plt
+
+    if not snapshots_genomes or len(snapshots_genomes) < 2:
+        raise ValueError("_export_morph_gif_with_scars: need >= 2 snapshots.")
+    if len(snapshots_genomes) != len(snapshots_scars):
+        raise ValueError("_export_morph_gif_with_scars: scars_seq length mismatch.")
+
+    pos_union = layout_by_depth_union(snapshots_genomes) if fixed_layout else None
+    if pos_union:
+        xs = [p[0] for p in pos_union.values()]
+        ys = [p[1] for p in pos_union.values()]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        span_x = max(1e-6, max_x - min_x)
+        span_y = max(1e-6, max_y - min_y)
+        pos_union = {
+            nid: (
+                0.05 + 0.90 * ((x - min_x) / span_x),
+                0.05 + 0.90 * ((y - min_y) / span_y),
+            )
+            for nid, (x, y) in pos_union.items()
+        }
+
+    def _node_groups_and_depths(_g):
+        depth = _g.node_depths()
+        groups = {"input": [], "bias": [], "hidden": [], "output": []}
+        for nid, n in _g.nodes.items():
+            groups.get(n.type, groups["hidden"]).append(nid)
+        for key in groups:
+            groups[key].sort()
+        max_d = max(depth.values()) if depth else 1
+        return groups, depth, max_d
+
+    def _compute_positions(_g):
+        groups, depth, max_d = _node_groups_and_depths(_g)
+        pos = {}
+        bands = [("input", 0.85, 1.00), ("bias", 0.70, 0.82), ("hidden", 0.20, 0.68), ("output", 0.02, 0.18)]
+        for (gname, y0, y1) in bands:
+            arr = groups[gname]
+            n = max(1, len(arr))
+            ys = _np.linspace(y1, y0, n)
+            for idx, nid in enumerate(arr):
+                depth_val = depth.get(nid, 0)
+                if gname in ("input", "bias"):
+                    x = 0.04
+                elif gname == "output":
+                    x = 0.96
+                else:
+                    x = 0.10 + 0.80 * (depth_val / max(1, max_d))
+                pos[nid] = (x, ys[idx])
+        return pos
+
+    def _pulse_amp(age: int, frame_idx: int) -> float:
+        base = max(0.1, 1.0 - float(age) / max(1e-6, decay_horizon))
+        phase = 2.0 * _np.pi * (frame_idx % max(1, pulse_period_frames)) / max(1, pulse_period_frames)
+        return float(base * (0.5 + 0.5 * _np.sin(phase)))
+
     frames = []
-    for i in range(len(genomes)-1):
-        g0, g1 = genomes[i], genomes[i+1]; s0, s1 = scars_seq[i], scars_seq[i+1]
-        for m in range(morph_frames):
-            t = (m+1)/float(morph_frames)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            for c in g0.enabled_connections():
-                i0, o0 = c.in_node, c.out_node
-                if i0 not in pos or o0 not in pos: continue
-                p1 = pos[i0]; p2 = pos[o0]; ax.plot([p1[0], p2[0]], [p1[1], p2[1]], linewidth=1.2, alpha=max(0.0, 1.0 - t))
-            for c in g1.enabled_connections():
-                i1, o1 = c.in_node, c.out_node
-                if i1 not in pos or o1 not in pos: continue
-                p1 = pos[i1]; p2 = pos[o1]; ax.plot([p1[0], p2[0]], [p1[1], p2[1]], linewidth=1.5, alpha=min(1.0, t))
-            _draw_nodes(ax, g0, pos, scars=s0, pulse_t=1.0-t, decay_horizon=decay_horizon, radius=0.12, annotate_type=False, show_mode_mark=True)
-            _draw_nodes(ax, g1, pos, scars=s1, pulse_t=t, decay_horizon=decay_horizon, radius=0.12, annotate_type=False, show_mode_mark=True)
-            ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout()
-            fig.canvas.draw(); w, h = fig.canvas.get_width_height()
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3); frames.append(img); plt.close(fig)
-    imageio.mimsave(out_path, frames, fps=fps)
+    total_steps = max(1, morph_frames)
+    for i in range(len(snapshots_genomes) - 1):
+        g0 = snapshots_genomes[i]
+        g1 = snapshots_genomes[i + 1]
+        node_scars0, edge_scars0 = _normalize_scar_snapshot(snapshots_scars[i])
+        node_scars1, edge_scars1 = _normalize_scar_snapshot(snapshots_scars[i + 1])
+
+        pos0 = pos_union if pos_union is not None else _compute_positions(g0)
+        pos1 = pos_union if pos_union is not None else _compute_positions(g1)
+        nodes_union = sorted(set(list(pos0.keys()) + list(pos1.keys())))
+
+        edges0 = set((c.in_node, c.out_node) for c in g0.enabled_connections())
+        edges1 = set((c.in_node, c.out_node) for c in g1.enabled_connections())
+
+        for k in range(total_steps):
+            t = 0.0 if total_steps <= 1 else k / float(total_steps - 1)
+            frame_index = i * total_steps + k
+
+            fig, ax = _plt.subplots(figsize=(6.6, 4.8), dpi=dpi)
+            ax.set_axis_off()
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.0)
+
+            # Fade edges from g0 -> g1
+            for (u, v) in sorted(edges0):
+                if (u not in pos0) or (v not in pos0):
+                    continue
+                x0, y0 = pos0[u]
+                x1, y1 = pos0[v]
+                width = 1.6
+                if (u, v) in edge_scars0:
+                    width += 0.6 * _pulse_amp(edge_scars0[(u, v)], frame_index)
+                ax.plot([x0, x1], [y0, y1], linewidth=width, alpha=max(0.0, 1.0 - t))
+
+            for (u, v) in sorted(edges1):
+                if (u not in pos1) or (v not in pos1):
+                    continue
+                x0, y0 = pos1[u]
+                x1, y1 = pos1[v]
+                width = 1.8
+                if (u, v) in edge_scars1:
+                    width += 0.6 * _pulse_amp(edge_scars1[(u, v)], frame_index)
+                ax.plot([x0, x1], [y0, y1], linewidth=width, alpha=max(0.0, t))
+
+            for nid in nodes_union:
+                pos_lookup = pos1 if nid in pos1 else pos0
+                if nid not in pos_lookup:
+                    continue
+                x, y = pos_lookup[nid]
+                tname = None
+                if nid in g1.nodes:
+                    tname = g1.nodes[nid].type
+                elif nid in g0.nodes:
+                    tname = g0.nodes[nid].type
+                size = 50.0
+                if tname == "input":
+                    size = 35.0
+                elif tname == "bias":
+                    size = 28.0
+                elif tname == "output":
+                    size = 60.0
+                alpha0 = 1.0 if (nid in g0.nodes and nid in g1.nodes) else (1.0 - t if nid in g0.nodes else t)
+                ax.scatter([x], [y], s=size, alpha=max(0.2, min(1.0, alpha0)), linewidths=0.8, zorder=3)
+
+                amp = 0.0
+                if nid in node_scars0:
+                    amp += (1.0 - t) * _pulse_amp(node_scars0[nid], frame_index)
+                if nid in node_scars1:
+                    amp += t * _pulse_amp(node_scars1[nid], frame_index)
+                if amp > 0.0:
+                    circ = _plt.Circle((x, y), 0.018 + 0.012 * amp, fill=False, linewidth=1.0 + 2.0 * amp, alpha=0.55)
+                    ax.add_patch(circ)
+
+            img = _fig_to_rgb(fig)
+            frames.append(img)
+            _plt.close(fig)
+
+    _imageio.mimsave(path, frames, duration=1.0 / max(1, fps))
+    return path
 
 def export_double_exposure(genome: Genome, lineage_edges: List[Tuple[Optional[int], Optional[int], int, int, str]],
                            current_gen: int, out_path: str, title: Optional[str] = None):
@@ -1206,6 +1386,40 @@ def export_decision_boundaries_all(genome: Genome, out_dir: str, steps: int = 50
     plot_decision_boundary(genome, Xs, ys, path_s, steps=steps)
     return {"circles": path_c, "xor": path_x, "spiral": path_s}
 
+
+def export_task_gallery(
+    tasks: Tuple[str, ...],
+    gens: int,
+    pop: int,
+    steps: int,
+    out_dir: str,
+) -> Dict[str, str]:
+    """Run a batch of miniature experiments and collect figure paths."""
+
+    os.makedirs(out_dir or ".", exist_ok=True)
+    outputs: Dict[str, str] = {}
+    import zlib
+    for task in tasks:
+        tag = f"{task}_g{gens}_p{pop}_s{steps}"
+        seed = zlib.crc32(f"{task}|{gens}|{pop}|{steps}".encode("utf-8")) & 0xFFFFFFFF
+        res = run_backprop_neat_experiment(
+            task,
+            gens=gens,
+            pop=pop,
+            steps=steps,
+            out_prefix=os.path.join(out_dir, tag),
+            make_gifs=False,
+            make_lineage=False,
+            rng_seed=seed,
+        )
+        if res.get("learning_curve"):
+            outputs[f"{task.upper()} 学習曲線"] = res["learning_curve"]
+        if res.get("decision_boundary"):
+            outputs[f"{task.upper()} 決定境界"] = res["decision_boundary"]
+        if res.get("topology"):
+            outputs[f"{task.upper()} トポロジ"] = res["topology"]
+    return outputs
+
 # ============================================================
 # 7) Toy datasets & CLI demo
 # ============================================================
@@ -1233,13 +1447,23 @@ def make_spirals(n=512, noise=0.1, turns=1.5, seed=0):
     y = np.concatenate([np.zeros(n2, dtype=np.int32), np.ones(n2, dtype=np.int32)])
     return X, y
 
-def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True):
+def run_backprop_neat_experiment(
+    task: str,
+    gens=30,
+    pop=48,
+    steps=40,
+    out_prefix="out/exp",
+    make_gifs: bool = True,
+    make_lineage: bool = True,
+    rng_seed: Optional[int] = None,
+):
     # dataset
     if task=="xor": Xtr,ytr = make_xor(512, noise=0.05, seed=0); Xva,yva = make_xor(256, noise=0.05, seed=1)
     elif task=="spiral": Xtr,ytr = make_spirals(512, noise=0.05, turns=1.5, seed=0); Xva,yva = make_spirals(256, noise=0.05, turns=1.5, seed=1)
     else: Xtr,ytr = make_circles(512, r=0.6, noise=0.05, seed=0); Xva,yva = make_circles(256, r=0.6, noise=0.05, seed=1)
     # NEAT
-    neat = ReproPlanaNEATPlus(num_inputs=2, num_outputs=1, population_size=pop, output_activation='identity')
+    rng = np.random.default_rng(rng_seed)
+    neat = ReproPlanaNEATPlus(num_inputs=2, num_outputs=1, population_size=pop, output_activation='identity', rng=rng)
     neat.mode = EvalMode(vanilla=True, enable_regen_reproduction=False, complexity_alpha=0.01, node_penalty=1.0, edge_penalty=0.5)
     def fit(g):
         return fitness_backprop_classifier(g, Xtr, ytr, Xva, yva, steps=steps, lr=5e-3, l2=1e-4, alpha_nodes=1e-3, alpha_edges=5e-4)
@@ -1259,7 +1483,28 @@ def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefi
         regen_gif = f"{out_prefix}_regen.gif"
         export_regen_gif(neat.snapshots_genomes, neat.snapshots_scars, regen_gif, fps=12, pulse_period_frames=16, decay_horizon=10.0, fixed_layout=True)
         morph_gif = f"{out_prefix}_morph.gif"
-        export_morph_gif(neat.snapshots_genomes, neat.snapshots_scars, morph_gif, fps=12, morph_frames=12, decay_horizon=10.0)
+        export_morph_gif(
+            neat.snapshots_genomes,
+            neat.snapshots_scars,
+            path=morph_gif,
+            fps=12,
+            morph_frames=12,
+            decay_horizon=10.0,
+        )
+
+    # 螺旋再生ヒートマップ
+    scars_spiral = None
+    if len(neat.snapshots_genomes) >= 2:
+        scars_spiral = f"{out_prefix}_scars_spiral.png"
+        export_scars_spiral_map(
+            neat.snapshots_genomes,
+            neat.snapshots_scars,
+            scars_spiral,
+            turns=None,
+            jitter=0.014,
+            marker_size=20,
+            dpi=220,
+        )
     # Lineage (auto)
     lineage_path = None
     if make_lineage:
@@ -1275,30 +1520,9 @@ def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefi
         "regen_gif": regen_gif,
         "morph_gif": morph_gif,
         "lineage": lineage_path,
+        "scars_spiral": scars_spiral,
         "summary_decisions": summary_paths,
     }
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--env_id", type=str, default=None, help="Gym/Gymnasium environment id for RL mode")
-    ap.add_argument("--episodes", type=int, default=1)
-    ap.add_argument("--max_steps", type=int, default=2000)
-    ap.add_argument("--stochastic", action="store_true")
-    ap.add_argument("--temp", type=float, default=1.0)
-    ap.add_argument("--task", type=str, default="circles", choices=["circles","xor","spiral"])
-    ap.add_argument("--gens", type=int, default=30)
-    ap.add_argument("--pop", type=int, default=48)
-    ap.add_argument("--steps", type=int, default=40, help="backprop steps per individual evaluation")
-    ap.add_argument("--out_prefix", type=str, default="out/exp")
-    ap.add_argument("--no_gifs", action="store_true")
-    ap.add_argument("--no_lineage", action="store_true")
-    args = ap.parse_args()
-    paths = run_backprop_neat_experiment(args.task, args.gens, args.pop, args.steps, args.out_prefix, make_gifs=not args.no_gifs, make_lineage=not args.no_lineage)
-    for k,v in paths.items(): print(k, v)
-
-if __name__ == "__main__":
-    main()
-
 
 # === backend-agnostic Figure -> RGB helper ===
 def _fig_to_rgb(fig):
@@ -1403,11 +1627,9 @@ def export_regen_gif(
         removed = (prev_edges or set()) - cur_edges
         common = cur_edges & (prev_edges or set()) if prev_edges is not None else cur_edges
 
-        node_scars = {}
-        edge_scars = {}
-        if snapshots_scars and t < len(snapshots_scars) and snapshots_scars[t]:
-            node_scars = dict(snapshots_scars[t].get("nodes", {}))
-            edge_scars = dict(snapshots_scars[t].get("edges", {}))
+        node_scars, edge_scars = {}, {}
+        if snapshots_scars and t < len(snapshots_scars):
+            node_scars, edge_scars = _normalize_scar_snapshot(snapshots_scars[t])
 
         fig, ax = _plt.subplots(figsize=(6.6, 4.8), dpi=dpi)
         ax.set_axis_off()
@@ -1461,19 +1683,49 @@ def export_regen_gif(
 
 def export_morph_gif(
     snapshots_genomes,
-    path,
+    snapshots_scars=None,
+    path=None,
+    *,
     fps=12,
     morph_frames=8,
     fixed_layout=True,
-    dpi=130
+    dpi=130,
+    decay_horizon=8.0,
 ):
     """
     Inter-generational morphological transition GIF.
-    Fades-out edges that disappear, keeps common edges, fades-in new edges.
+    Supports legacy calls with scar metadata as well as lightweight
+    visualisations that only rely on genomes.
     """
+    import os as _os
     import numpy as _np
     import imageio.v2 as _imageio
     import matplotlib.pyplot as _plt
+
+    # Normalise "path" / scars arguments for backward compatibility.
+    if path is None and isinstance(snapshots_scars, (str, bytes)):
+        path = snapshots_scars
+        snapshots_scars = None
+    elif path is None and hasattr(snapshots_scars, "__fspath__"):
+        path = _os.fspath(snapshots_scars)
+        snapshots_scars = None
+
+    if path is None:
+        raise ValueError("export_morph_gif: path must be provided")
+
+    if snapshots_scars is not None:
+        if len(snapshots_scars) != len(snapshots_genomes):
+            raise ValueError("export_morph_gif: scars_seq length must match genomes.")
+        return _export_morph_gif_with_scars(
+            snapshots_genomes,
+            snapshots_scars,
+            path,
+            fps=fps,
+            morph_frames=morph_frames,
+            decay_horizon=decay_horizon,
+            fixed_layout=fixed_layout,
+            dpi=dpi,
+        )
 
     if not snapshots_genomes or len(snapshots_genomes) < 2:
         raise ValueError("export_morph_gif: need >= 2 snapshots.")
@@ -1532,20 +1784,23 @@ def export_morph_gif(
             # gone edges fade out
             for (u, v) in sorted(gone):
                 p = pos0 if (u in pos0 and v in pos0) else pos1
-                if (u not in p) or (v not in p): continue
+                if (u not in p) or (v not in p):
+                    continue
                 x0, y0 = p[u]; x1, y1 = p[v]
                 ax.plot([x0, x1], [y0, y1], linestyle="dashed", linewidth=1.4, alpha=max(0.0, 1.0 - t))
 
             # kept edges stay
             for (u, v) in sorted(kept):
-                if (u not in pos0) or (v not in pos0): continue
+                if (u not in pos0) or (v not in pos0):
+                    continue
                 x0, y0 = pos0[u]; x1, y1 = pos0[v]
                 ax.plot([x0, x1], [y0, y1], linewidth=1.8, alpha=0.9)
 
             # born edges fade in
             for (u, v) in sorted(born):
                 p = pos1 if (u in pos1 and v in pos1) else pos0
-                if (u not in p) or (v not in p): continue
+                if (u not in p) or (v not in p):
+                    continue
                 x0, y0 = p[u]; x1, y1 = p[v]
                 ax.plot([x0, x1], [y0, y1], linewidth=2.2, alpha=max(0.0, t))
 
@@ -1554,12 +1809,16 @@ def export_morph_gif(
                      for nid in set(list(g0.nodes.keys()) + list(g1.nodes.keys()))}
             p = pos1 if fixed_layout else pos0
             for nid, (x, y) in p.items():
-                if nid not in types: continue
+                if nid not in types:
+                    continue
                 tname = types[nid]
                 sz = 50.0
-                if tname == "input":  sz = 35.0
-                if tname == "bias":   sz = 28.0
-                if tname == "output": sz = 60.0
+                if tname == "input":
+                    sz = 35.0
+                if tname == "bias":
+                    sz = 28.0
+                if tname == "output":
+                    sz = 60.0
                 ax.scatter([x], [y], s=sz, alpha=1.0, zorder=3, linewidths=0.8)
 
             img = _fig_to_rgb(fig)
@@ -1568,6 +1827,168 @@ def export_morph_gif(
 
     _imageio.mimsave(path, frames, duration=1.0 / max(1, fps))
     return path
+
+
+
+def export_scars_spiral_map(
+    snapshots_genomes: List[Genome],
+    snapshots_scars: List[Dict[int, 'Scar']],
+    out_path: str,
+    *,
+    turns: Optional[float] = None,
+    jitter: float = 0.012,
+    marker_size: float = 26.0,
+    dpi: int = 220,
+    title: str = "Scars Spiral Map"
+):
+    """
+    再生痕(=新規ノード誕生)を、世代→角度θ・進行度→半径r のアルキメデス螺旋へ投影して可視化する。
+
+    座標系:
+      θ_g = (2π * turns) * g/(G-1)
+      r_g = r0 + (r1 - r0) * (θ_g / (2π * turns))   （中心から外周へ等間隔で広がる）
+
+    入力フォーマットは diff_scars の既存形式（Dict[node_id -> Scar]）に対応。
+    互換性のため、scarsが無い場合はノード集合差分から「新生ノード」を推定する。
+    """
+    if not snapshots_genomes:
+        raise ValueError("export_scars_spiral_map: snapshots_genomes is empty.")
+
+    import numpy as _np
+    import matplotlib.pyplot as _plt
+
+    G = len(snapshots_genomes)
+    if G <= 1:
+        raise ValueError("export_scars_spiral_map: need >= 2 snapshots.")
+
+    # 螺旋パラメータ
+    if turns is None:
+        # ランが長いほど少し多めに回す（2〜8回転の範囲）
+        turns = float(max(2.0, min(8.0, G / 10.0)))
+    theta_max = 2.0 * _np.pi * turns
+    r0, r1 = 0.12, 0.96  # 中心〜外周の正規化半径
+
+    # --- 世代ごとの「新生ノード」イベントを抽出 ---
+    events_by_gen: Dict[int, List[Tuple[int, str]]] = {}
+    for g in range(G):
+        new_nodes: List[Tuple[int, str]] = []
+
+        scars_g = snapshots_scars[g] if (snapshots_scars and g < len(snapshots_scars)) else None
+        if isinstance(scars_g, dict) and scars_g:
+            if "nodes" in scars_g or "edges" in scars_g:
+                raw_nodes = scars_g.get("nodes", {}) or {}
+                for nid, sc in raw_nodes.items():
+                    age = getattr(sc, "age", None)
+                    if age is None and isinstance(sc, dict):
+                        age = sc.get("age", None)
+                    if age is None and isinstance(sc, (int, float)):
+                        age = int(sc)
+                    birth = getattr(sc, "birth_gen", g)
+                    if isinstance(sc, dict):
+                        birth = sc.get("birth_gen", birth)
+                    if age == 0 and birth == g:
+                        mode = getattr(sc, "mode", None)
+                        if isinstance(sc, dict):
+                            mode = sc.get("mode", mode)
+                        new_nodes.append((int(nid), mode or "split"))
+            else:
+                # 既存の diff_scars 形式: Dict[nid -> Scar]
+                for nid, sc in scars_g.items():
+                    # その世代で age==0 かつ birth_gen==g のものを「新生」とみなす
+                    age = getattr(sc, "age", None)
+                    birth = getattr(sc, "birth_gen", g)
+                    mode = getattr(sc, "mode", None)
+                    if isinstance(sc, dict):
+                        age = sc.get("age", age)
+                        birth = sc.get("birth_gen", birth)
+                        mode = sc.get("mode", mode)
+                    if age == 0 and birth == g:
+                        new_nodes.append((int(nid), mode or "split"))
+        else:
+            # フォールバック: ノード集合差分から推定（互換目的）
+            if g > 0:
+                prev_ids = set(snapshots_genomes[g-1].nodes.keys())
+                curr_ids = set(snapshots_genomes[g].nodes.keys())
+                born = curr_ids - prev_ids
+                mode = getattr(snapshots_genomes[g], "regen_mode", "split")
+                new_nodes.extend((int(nid), mode) for nid in born)
+
+        if new_nodes:
+            events_by_gen[g] = new_nodes
+
+    # --- 角度θと半径rへ写像し、モード別に点群を作る ---
+    xs = {"split": [], "head": [], "tail": [], "other": []}
+    ys = {"split": [], "head": [], "tail": [], "other": []}
+    heat_x: List[float] = []
+    heat_y: List[float] = []
+
+    for g, items in events_by_gen.items():
+        theta = theta_max * (g / max(1, G-1))
+        base_r = r0 + (r1 - r0) * (theta / theta_max)
+
+        n = len(items)
+        offs = _np.linspace(-0.5, 0.5, n) if n > 1 else [0.0]  # 同一世代で少しだけ半径方向にズラす
+        for (offset, (nid, mode)) in zip(offs, items):
+            r = base_r + float(offset) * jitter
+            x = r * _np.cos(theta)
+            y = r * _np.sin(theta)
+            key = mode if mode in xs else "other"
+            xs[key].append(x)
+            ys[key].append(y)
+            heat_x.append(x)
+            heat_y.append(y)
+
+    # --- 描画 ---
+    fig, ax = _plt.subplots(figsize=(6, 6), dpi=dpi, subplot_kw={"aspect": "equal"})
+    # 螺旋のセンターライン
+    ts = _np.linspace(0.0, theta_max, 1200)
+    rr = r0 + (r1 - r0) * (ts / theta_max)
+    ax.plot(rr * _np.cos(ts), rr * _np.sin(ts), linewidth=1.0, alpha=0.35, linestyle="-")
+
+    # ヒートマップ層（2Dビニング）
+    if heat_x and heat_y:
+        bins = 160
+        heat_grid, xedges, yedges = _np.histogram2d(
+            heat_x,
+            heat_y,
+            bins=bins,
+            range=[[-1.05, 1.05], [-1.05, 1.05]],
+        )
+        heat_grid = heat_grid.astype(float)
+        if heat_grid.max() > 0:
+            heat_grid /= heat_grid.max()
+            kernel = _np.array([[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]], dtype=float)
+            kernel /= kernel.sum()
+            padded = _np.pad(heat_grid, 1, mode="reflect")
+            smooth = _np.zeros_like(heat_grid)
+            for i in range(heat_grid.shape[0]):
+                for j in range(heat_grid.shape[1]):
+                    smooth[i, j] = _np.sum(padded[i : i + 3, j : j + 3] * kernel)
+            ax.imshow(
+                smooth.T,
+                extent=[-1.05, 1.05, -1.05, 1.05],
+                origin="lower",
+                cmap="inferno",
+                alpha=0.45,
+                interpolation="bilinear",
+            )
+
+    markers = {"split": "o", "head": "s", "tail": "^", "other": "x"}
+    labels  = {"split": "split", "head": "head", "tail": "tail", "other": "other"}
+    for k in ("split", "head", "tail", "other"):
+        if xs[k]:
+            ax.scatter(xs[k], ys[k], s=marker_size, alpha=0.15, marker=markers[k], linewidths=0.7, label=labels[k])
+
+    ax.set_xlim(-1.05, 1.05); ax.set_ylim(-1.05, 1.05)
+    ax.set_axis_off()
+    ax.set_title(title, fontsize=12, loc="left")
+    if any(xs[k] for k in xs):
+        ax.legend(loc="upper left", frameon=False, fontsize=9, handlelength=1.0)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    _plt.close(fig)
+    return out_path
 
 
 
@@ -1580,16 +2001,23 @@ def _softmax_np(x, axis=-1, temp=1.0):
     ex = np.exp(x)
     return ex / (np.sum(ex, axis=axis, keepdims=True) + 1e-9)
 
+def _import_gym():
+    try:
+        import gymnasium as gym  # type: ignore
+    except ImportError:  # pragma: no cover - fallback for legacy gym installs
+        import gym  # type: ignore
+    return gym
+
 def output_dim_from_space(space):
-    import gym
-    from gym.spaces import Discrete, MultiDiscrete, MultiBinary, Box
-    if isinstance(space, Discrete):
+    gym = _import_gym()
+    spaces = gym.spaces
+    if isinstance(space, spaces.Discrete):
         return int(space.n)
-    if isinstance(space, MultiDiscrete):
+    if isinstance(space, spaces.MultiDiscrete):
         return int(np.sum(space.nvec))
-    if isinstance(space, MultiBinary):
+    if isinstance(space, spaces.MultiBinary):
         return int(np.prod(space.n))
-    if isinstance(space, Box):
+    if isinstance(space, spaces.Box):
         return int(np.prod(space.shape))
     raise ValueError(f"Unsupported action space: {type(space)}")
 
@@ -1601,8 +2029,7 @@ def obs_dim_from_space(space):
     raise ValueError(f"Unsupported observation space: {type(space)}")
 
 def build_action_mapper(space, stochastic=False, temp=1.0):
-    import gym
-    from gym.spaces import Discrete, MultiDiscrete, MultiBinary, Box
+    gym = _import_gym()
 
     if isinstance(space, gym.spaces.Discrete):
         n = space.n
@@ -1664,7 +2091,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str = 'identity'):
-    import gym
+    gym = _import_gym()
     env = gym.make(env_id)
     obs_dim = obs_dim_from_space(env.observation_space)
     out_dim = output_dim_from_space(env.action_space)
@@ -1700,7 +2127,7 @@ def run_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_nor
 def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, episodes=1, obs_norm=None):
     """Return a fitness function for evolve() that evaluates average episodic reward."""
     def _fitness(genome):
-        import gym
+        gym = _import_gym()
         try: env = gym.make(env_id, render_mode="rgb_array")
         except TypeError: env = gym.make(env_id)
         mapper = build_action_mapper(env.action_space, stochastic=stochastic, temp=temp)
@@ -1710,3 +2137,249 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
         return total / max(1, int(episodes))
     return _fitness
 
+
+def run_gym_neat_experiment(
+    env_id: str,
+    gens: int = 20,
+    pop: int = 24,
+    episodes: int = 1,
+    max_steps: int = 500,
+    stochastic: bool = False,
+    temp: float = 1.0,
+    out_prefix: str = "out/rl",
+) -> Dict[str, Any]:
+    """Convenience wrapper that evolves NEAT agents on a Gym environment."""
+
+    neat, env = setup_neat_for_env(env_id, population=pop, output_activation="identity")
+    fit = gym_fitness_factory(
+        env_id,
+        stochastic=stochastic,
+        temp=temp,
+        max_steps=max_steps,
+        episodes=episodes,
+    )
+    best, hist = neat.evolve(fit, n_generations=gens, verbose=True)
+
+    os.makedirs(os.path.dirname(out_prefix) or ".", exist_ok=True)
+    rc_png = f"{out_prefix}_reward_curve.png"
+    xs = list(range(len(hist)))
+    ys_b = [b for (b, _a) in hist]
+    ys_a = [a for (_b, a) in hist]
+    plt.figure()
+    plt.plot(xs, ys_b, label="best")
+    plt.plot(xs, ys_a, label="avg")
+    plt.xlabel("generation")
+    plt.ylabel("episode reward")
+    plt.title(f"{env_id} | Average Episode Reward")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(rc_png, dpi=150)
+    plt.close()
+
+    try:
+        env.close()
+    except Exception:
+        pass
+
+    return {"best": best, "history": hist, "reward_curve": rc_png}
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    """Command-line interface entrypoint."""
+    _ensure_matplotlib_agg(force=True)
+
+    ap = argparse.ArgumentParser(description="Spiral-NEAT NumPy | built-in CLI")
+    ap.add_argument("--task", choices=["xor","circles","spiral"])
+    ap.add_argument("--gens", type=int, default=30)
+    ap.add_argument("--pop",  type=int, default=48)
+    ap.add_argument("--steps",type=int, default=40)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--rl-env", type=str)
+    ap.add_argument("--rl-gens", type=int, default=20)
+    ap.add_argument("--rl-pop",  type=int, default=24)
+    ap.add_argument("--rl-episodes", type=int, default=1)
+    ap.add_argument("--rl-max-steps", type=int, default=500)
+    ap.add_argument("--rl-stochastic", action="store_true")
+    ap.add_argument("--rl-temp", type=float, default=1.0)
+    ap.add_argument("--rl-gameplay-gif", action="store_true")
+    ap.add_argument("--out", default="out_monolith_cli")
+    ap.add_argument("--make-gifs", action="store_true")
+    ap.add_argument("--make-lineage", action="store_true")
+    ap.add_argument("--gallery", nargs="*", default=[])
+    ap.add_argument("--report", action="store_true")
+    args = ap.parse_args(None if argv is None else list(argv))
+
+    os.makedirs(args.out, exist_ok=True)
+    figs: Dict[str, Optional[str]] = {}
+
+    # supervised
+    if args.task:
+        np.random.seed(args.seed)
+        res = run_backprop_neat_experiment(
+            args.task, gens=args.gens, pop=args.pop, steps=args.steps,
+            out_prefix=os.path.join(args.out, args.task),
+            make_gifs=args.make_gifs, make_lineage=args.make_lineage,
+            rng_seed=args.seed,
+        )
+        figs["図1 学習曲線＋複雑度"] = res.get("learning_curve")
+        figs["図2 最良トポロジ"] = res.get("topology")
+        regen_gif = res.get("regen_gif")
+        if regen_gif and os.path.exists(regen_gif):
+            with imageio.get_reader(regen_gif) as r:
+                idx = max(0, r.get_length()//2 - 1)
+                frame = r.get_data(idx)
+                fig3 = os.path.join(args.out, f"{args.task}_fig3_regen_frame.png")
+                imageio.imwrite(fig3, frame)
+                figs["図3 再生ダイジェスト代表フレーム"] = fig3
+        else:
+            figs["図3 決定境界"] = res.get("decision_boundary")
+        figs["図4 螺旋再生ヒートマップ"] = res.get("scars_spiral")
+
+        if args.gallery:
+            gal = export_task_gallery(
+                tasks=tuple(args.gallery),
+                gens=max(6, args.gens // 2),
+                pop=max(12, args.pop // 2),
+                steps=max(10, args.steps // 2),
+                out_dir=os.path.join(args.out, "gallery"),
+            )
+            for k, v in gal.items():
+                figs[f"ギャラリー {k}"] = v
+
+    # RL
+    if args.rl_env:
+        try:
+            gym = _import_gym()
+
+            env_probe = gym.make(args.rl_env)
+            try:
+                obs_dim = obs_dim_from_space(env_probe.observation_space)
+                action_space = env_probe.action_space
+                out_dim = output_dim_from_space(action_space)
+            finally:
+                try:
+                    env_probe.close()
+                except Exception:
+                    pass
+
+            neat = ReproPlanaNEATPlus(
+                num_inputs=obs_dim,
+                num_outputs=out_dim,
+                population_size=args.rl_pop,
+                output_activation="identity",
+            )
+            fit = gym_fitness_factory(
+                args.rl_env,
+                stochastic=args.rl_stochastic,
+                temp=args.rl_temp,
+                max_steps=args.rl_max_steps,
+                episodes=args.rl_episodes,
+            )
+            best, hist = neat.evolve(fit, n_generations=args.rl_gens, verbose=True)
+            rc_png = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_reward_curve.png")
+            xs = list(range(len(hist)))
+            ys_b = [b for (b, _a) in hist]
+            ys_a = [a for (_b, a) in hist]
+            plt.figure()
+            plt.plot(xs, ys_b, label="best")
+            plt.plot(xs, ys_a, label="avg")
+            plt.xlabel("generation")
+            plt.ylabel("episode reward")
+            plt.title(f"{args.rl_env} | Average Episode Reward")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(rc_png, dpi=150)
+            plt.close()
+            figs["RL 平均エピソード報酬"] = rc_png
+            if args.rl_gameplay_gif:
+                mapper = build_action_mapper(action_space, stochastic=args.rl_stochastic, temp=args.rl_temp)
+                gif = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_gameplay.gif")
+                try:
+                    env = gym.make(args.rl_env, render_mode="rgb_array")
+                except TypeError:
+                    env = gym.make(args.rl_env)
+                frames = []
+                reset_out = env.reset()
+                obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out) >= 1) else reset_out
+                done = False
+                steps = 0
+                while not done and steps < args.rl_max_steps:
+                    y = best.forward_one(np.asarray(obs, dtype=np.float32).ravel())
+                    act = mapper(y)
+                    step_out = env.step(act)
+                    if isinstance(step_out, tuple) and len(step_out) == 5:
+                        obs, reward, terminated, truncated, info = step_out
+                        done = bool(terminated or truncated)
+                    else:
+                        obs, reward, done, info = step_out
+                        done = bool(done)
+                    try:
+                        frame = env.render()
+                    except Exception:
+                        frame = None
+                    if frame is not None:
+                        frames.append(frame)
+                    steps += 1
+                try:
+                    env.close()
+                except Exception:
+                    pass
+                if frames:
+                    imageio.mimsave(gif, frames, duration=1 / 30)
+                    figs["RL ゲームプレイ"] = gif
+        except Exception as e:
+            print("[WARN] RL branch skipped:", e)
+
+    if args.report and figs:
+        # minimal self-contained HTML (base64 embed)
+        def _data_uri(p: str) -> Tuple[str, str]:
+            with open(p, "rb") as f:
+                import base64
+
+                raw = base64.b64encode(f.read()).decode("ascii")
+            mime, _ = mimetypes.guess_type(p)
+            if mime is None:
+                if p.lower().endswith(".gif"):
+                    mime = "image/gif"
+                elif p.lower().endswith((".mp4", ".webm")):
+                    mime = "video/mp4"
+                else:
+                    mime = "application/octet-stream"
+            return f"data:{mime};base64,{raw}", mime
+
+        html = os.path.join(args.out, "Sakana_NEAT_Report.html")
+        with open(html, "w", encoding="utf-8") as f:
+            f.write("<!DOCTYPE html><html lang='ja'><meta charset='utf-8'><title>Report</title><body>")
+            for k, p in figs.items():
+                if p and os.path.exists(p):
+                    uri, mime = _data_uri(p)
+                    if mime == "image/gif":
+                        f.write(
+                            "<figure><video autoplay loop muted playsinline style='max-width:100%'>"
+                            f"<source src='{uri}' type='{mime}'></video>"
+                            f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                        )
+                    elif mime.startswith("image/"):
+                        f.write(
+                            f"<figure><img src='{uri}' style='max-width:100%'><figcaption><strong>{k}</strong></figcaption></figure>"
+                        )
+                    elif mime.startswith("video/"):
+                        f.write(
+                            "<figure><video autoplay loop muted playsinline style='max-width:100%'>"
+                            f"<source src='{uri}' type='{mime}'></video>"
+                            f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                        )
+                    else:
+                        f.write(
+                            f"<figure><a href='{uri}'>download {os.path.basename(p)}</a>"
+                            f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                        )
+            f.write("</body></html>")
+        print("[REPORT]", html)
+
+    print("[OK] outputs in:", args.out)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
