@@ -738,7 +738,7 @@ class ReproPlanaNEATPlus:
             self.edge_counts_history.append([sum(1 for c in g.connections.values() if c.enabled) for g in self.population])
             if verbose:
                 ev=self.event_log[-1] if self.event_log else {'sexual_within':0,'sexual_cross':0,'asexual_regen':0}
-                print(f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | diff {self.env['difficulty']:.2f} | sexual {ev.get('sexual_within',0)+ev.get('sexual_cross',0)} | regen {ev.get('asexual_regen',0)}")
+                print(f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {self.env['difficulty']:.2f} | sexual {ev.get('sexual_within',0)+ev.get('sexual_cross',0)} | regen {ev.get('asexual_regen',0)}")
             if best_fit > best_ever_fit: best_ever_fit = best_fit; best_ever = self.population[best_idx].copy()
             if target_fitness is not None and best_fit >= target_fitness: break
             species=self.speciate(fitnesses)
@@ -1578,10 +1578,20 @@ def run_backprop_neat_experiment(
     # NEAT
     rng = np.random.default_rng(rng_seed)
     neat = ReproPlanaNEATPlus(num_inputs=2, num_outputs=1, population_size=pop, output_activation='identity', rng=rng)
-    neat.mode = EvalMode(vanilla=True, enable_regen_reproduction=False, complexity_alpha=0.01, node_penalty=1.0, edge_penalty=0.5)
+    neat.mode = EvalMode(
+        vanilla=True,
+        enable_regen_reproduction=True,
+        complexity_alpha=0.01,
+        node_penalty=1.0,
+        edge_penalty=0.5,
+    )
+    neat.mix_asexual_base = 0.30  # encourage more asexual reproduction so regen events can occur
+
+    def _difficulty_schedule(gen, _ctx):
+        return {"difficulty": min(1.0, gen / 20.0)}
     def fit(g):
         return fitness_backprop_classifier(g, Xtr, ytr, Xva, yva, steps=steps, lr=5e-3, l2=1e-4, alpha_nodes=1e-3, alpha_edges=5e-4)
-    best, hist = neat.evolve(fit, n_generations=gens, verbose=True)
+    best, hist = neat.evolve(fit, n_generations=gens, verbose=True, env_schedule=_difficulty_schedule)
     # Outputs
     out_dir = os.path.dirname(out_prefix) or "."
     os.makedirs(out_dir, exist_ok=True)
