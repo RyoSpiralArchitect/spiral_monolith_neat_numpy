@@ -33,7 +33,57 @@ _ensure_matplotlib_agg()
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
-import imageio.v2 as imageio
+
+try:  # pragma: no cover - optional dependency
+    import imageio.v2 as imageio  # type: ignore
+except Exception:  # pragma: no cover - fallback path when imageio is unavailable
+    imageio = None  # type: ignore
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:  # pragma: no cover - Pillow also missing
+        Image = None  # type: ignore
+    else:
+        Image = Image  # type: ignore
+else:
+    Image = None  # type: ignore
+
+
+def _mimsave(path, frames, fps=12):
+    """Robust GIF writer that tolerates missing imageio by falling back to Pillow."""
+    frame_seq = list(frames)
+    if not frame_seq:
+        return
+    if imageio is not None:
+        imageio.mimsave(path, frame_seq, duration=1.0 / max(1, int(fps)))
+        return
+    if Image is None:
+        raise RuntimeError("imageio is unavailable and Pillow is not installed; cannot write GIF")
+    imgs = [Image.fromarray(np.asarray(fr)) for fr in frame_seq]
+    dur = int(1000 / max(1, int(fps)))
+    imgs[0].save(path, save_all=True, append_images=imgs[1:], duration=dur, loop=0)
+
+
+def _imread_image(src):
+    """imageio.imread fallback that also supports BytesIO via Pillow."""
+    if imageio is not None:
+        return imageio.imread(src)
+    if Image is None:
+        raise RuntimeError("imageio is unavailable and Pillow is not installed; cannot read image")
+    img = Image.open(src)
+    try:
+        return np.asarray(img.convert("RGB"))
+    finally:
+        img.close()
+
+
+def _imwrite_image(path, array):
+    """Write an image array using imageio or Pillow."""
+    if imageio is not None:
+        imageio.imwrite(path, array)
+        return
+    if Image is None:
+        raise RuntimeError("imageio is unavailable and Pillow is not installed; cannot write image")
+    Image.fromarray(np.asarray(array)).save(path)
 
 # ============================================================
 # 1) Genes & Genome (strict DAG)
@@ -47,7 +97,7 @@ __all__ = [
     "draw_genome_png","export_regen_gif","export_morph_gif","export_double_exposure",
     "plot_learning_and_complexity","plot_decision_boundary",
     "export_decision_boundaries_all","render_lineage","export_scars_spiral_map",
-    "output_dim_from_space","build_action_mapper","run_policy_in_env","run_gym_neat_experiment",
+    "output_dim_from_space","build_action_mapper","eval_with_node_activations","run_policy_in_env","run_gym_neat_experiment",
 ]
 
 @dataclass
@@ -1042,7 +1092,6 @@ def _export_morph_gif_with_scars(
     """Scar-aware morph GIF helper shared by export_morph_gif."""
 
     import numpy as _np
-    import imageio.v2 as _imageio
     import matplotlib.pyplot as _plt
 
     if not snapshots_genomes or len(snapshots_genomes) < 2:
@@ -1178,7 +1227,7 @@ def _export_morph_gif_with_scars(
             frames.append(img)
             _plt.close(fig)
 
-    _imageio.mimsave(path, frames, duration=1.0 / max(1, fps))
+    _mimsave(path, frames, fps=fps)
     return path
 
 def export_double_exposure(genome: Genome, lineage_edges: List[Tuple[Optional[int], Optional[int], int, int, str]],
@@ -1549,11 +1598,11 @@ def _fig_to_rgb(fig):
         return buf[:, :, 1:4].copy()
 
     # Fallback: save to PNG in-memory and read back
-    import io, imageio.v2 as _imageio
+    import io
     bio = io.BytesIO()
     fig.savefig(bio, format="png", dpi=fig.dpi, bbox_inches="tight", pad_inches=0.0)
     bio.seek(0)
-    img = _imageio.imread(bio)
+    img = _imread_image(bio)
     if img.ndim == 3 and img.shape[2] >= 3:
         img = img[:, :, :3]
     return img
@@ -1575,7 +1624,6 @@ def export_regen_gif(
     Encodes differences without color semantics: linestyle/linewidth/alpha only.
     """
     import numpy as _np
-    import imageio.v2 as _imageio
     import matplotlib.pyplot as _plt
 
     if not snapshots_genomes:
@@ -1676,7 +1724,7 @@ def export_regen_gif(
         _plt.close(fig)
         prev_edges = cur_edges
 
-    _imageio.mimsave(path, frames, duration=1.0 / max(1, fps))
+    _mimsave(path, frames, fps=fps)
     return path
 
 
@@ -1699,7 +1747,6 @@ def export_morph_gif(
     """
     import os as _os
     import numpy as _np
-    import imageio.v2 as _imageio
     import matplotlib.pyplot as _plt
 
     # Normalise "path" / scars arguments for backward compatibility.
@@ -1825,7 +1872,7 @@ def export_morph_gif(
             frames.append(img)
             _plt.close(fig)
 
-    _imageio.mimsave(path, frames, duration=1.0 / max(1, fps))
+    _mimsave(path, frames, fps=fps)
     return path
 
 
@@ -1995,11 +2042,12 @@ def export_scars_spiral_map(
 # ============================================================
 # 7') Gym action heads (Discrete / MultiDiscrete / MultiBinary / Box)
 # ============================================================
-def _softmax_np(x, axis=-1, temp=1.0):
-    x = x / max(1e-8, float(temp))
+def _softmax_np(x, axis=-1):
+    x = np.asarray(x, dtype=np.float64)
     x = x - np.max(x, axis=axis, keepdims=True)
     ex = np.exp(x)
-    return ex / (np.sum(ex, axis=axis, keepdims=True) + 1e-9)
+    denom = np.sum(ex, axis=axis, keepdims=True)
+    return ex / np.maximum(denom, 1e-9)
 
 def _import_gym():
     try:
@@ -2008,20 +2056,20 @@ def _import_gym():
         import gym  # type: ignore
     return gym
 
-def output_dim_from_space(space):
+def output_dim_from_space(space) -> int:
     try:
-        import gymnasium as _gym
-    except ImportError:
-        import gym as _gym
-    spaces = _gym.spaces
-    if isinstance(space, spaces.Discrete):
+        from gymnasium.spaces import Discrete, MultiDiscrete, MultiBinary, Box  # type: ignore
+    except Exception:
+        from gym.spaces import Discrete, MultiDiscrete, MultiBinary, Box  # type: ignore
+    import numpy as _np
+    if isinstance(space, Discrete):
         return int(space.n)
-    if isinstance(space, spaces.MultiDiscrete):
-        return int(np.sum(space.nvec))
-    if isinstance(space, spaces.MultiBinary):
-        return int(np.prod(space.n))
-    if isinstance(space, spaces.Box):
-        return int(np.prod(space.shape))
+    if isinstance(space, MultiBinary):
+        return int(_np.prod(space.n if hasattr(space, "n") else space.shape))
+    if isinstance(space, MultiDiscrete):
+        return int(_np.sum(space.nvec))
+    if isinstance(space, Box):
+        return int(_np.prod(space.shape))
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def obs_dim_from_space(space):
@@ -2033,66 +2081,69 @@ def obs_dim_from_space(space):
 
 def build_action_mapper(space, stochastic=False, temp=1.0):
     try:
-        import gymnasium as _gym
-    except ImportError:
-        import gym as _gym
-    spaces = _gym.spaces
+        from gymnasium.spaces import Discrete, MultiDiscrete, MultiBinary, Box  # type: ignore
+    except Exception:
+        from gym.spaces import Discrete, MultiDiscrete, MultiBinary, Box  # type: ignore
 
-    if isinstance(space, spaces.Discrete):
-        n = space.n
-        def f(y):
+    t = max(1e-6, float(temp))
+
+    if isinstance(space, Discrete):
+        def f(logits):
+            z = np.asarray(logits).reshape(-1)[: space.n]
+            probs = _softmax_np(z / t).ravel()
             if stochastic:
-                p = _softmax_np(y[:n], temp=temp)
-                return int(np.random.choice(n, p=p))
-            return int(np.argmax(y[:n]))
+                action = int(np.random.choice(len(probs), p=probs))
+            else:
+                action = int(np.argmax(z))
+            return action, probs
         return f
 
-    if isinstance(space, spaces.MultiDiscrete):
-        nvec = np.array(space.nvec, dtype=int)
-        def f(y):
-            out = []
-            start = 0
-            for k in nvec:
-                seg = y[start:start+k]
+    if isinstance(space, MultiDiscrete):
+        nvec = np.asarray(space.nvec, dtype=int)
+        cuts = np.cumsum(nvec)[:-1]
+
+        def f(logits):
+            z = np.asarray(logits).reshape(-1)
+            parts = np.split(z, cuts) if len(cuts) else [z]
+            actions = []
+            probs_all = []
+            for idx, nz in enumerate(nvec):
+                seg = parts[idx][:nz]
+                pp = _softmax_np(seg / t).ravel()
                 if stochastic:
-                    p = _softmax_np(seg, temp=temp)
-                    a = int(np.random.choice(k, p=p))
+                    a = int(np.random.choice(nz, p=pp))
                 else:
                     a = int(np.argmax(seg))
-                out.append(a)
-                start += k
-            return np.array(out, dtype=space.dtype)
+                actions.append(a)
+                probs_all.append(pp)
+            return np.asarray(actions, dtype=space.dtype), np.concatenate(probs_all, axis=0)
+
         return f
 
-    if isinstance(space, spaces.MultiBinary):
-        d = int(np.prod(space.n))
-        def f(y):
-            z = y[:d]
+    if isinstance(space, MultiBinary):
+        n = int(np.prod(space.n if hasattr(space, "n") else space.shape))
+
+        def f(logits):
+            z = np.asarray(logits).reshape(n)
+            probs = 1.0 / (1.0 + np.exp(-(z / t)))
             if stochastic:
-                p = 1.0/(1.0 + np.exp(-z))
-                a = (np.random.rand(d) < p).astype(space.dtype)
+                actions = (np.random.random(size=n) < probs).astype(space.dtype)
             else:
-                a = (z > 0.0).astype(space.dtype)
-            return a.reshape(space.n)
+                actions = (probs >= 0.5).astype(space.dtype)
+            return actions.reshape(space.shape), probs
+
         return f
 
-    if isinstance(space, spaces.Box):
-        shape = space.shape
-        low  = np.asarray(space.low,  dtype=np.float64)
-        high = np.asarray(space.high, dtype=np.float64)
-        d = int(np.prod(shape))
-        finite = np.isfinite(low) & np.isfinite(high)
-        def f(y):
-            z = np.tanh(y[:d])
-            out = z.copy()
-            if finite.all():
-                mid = 0.5*(high + low)
-                amp = 0.5*(high - low)
-                out = mid + amp * z
-            out = out.reshape(shape)
-            out = np.where(np.isfinite(low), np.maximum(out, low), out)
-            out = np.where(np.isfinite(high), np.minimum(out, high), out)
-            return out.astype(space.dtype)
+    if isinstance(space, Box):
+        low = np.broadcast_to(space.low, space.shape).astype(float)
+        high = np.broadcast_to(space.high, space.shape).astype(float)
+
+        def f(logits):
+            z = np.asarray(logits).reshape(space.shape)
+            tanh = np.tanh(z)
+            act = ((low + high) / 2.0) + ((high - low) / 2.0) * tanh
+            return act.astype(space.dtype), tanh.ravel()
+
         return f
 
     raise ValueError(f"Unsupported action space: {type(space)}")
@@ -2105,18 +2156,24 @@ def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str
     neat = ReproPlanaNEATPlus(num_inputs=obs_dim, num_outputs=out_dim, population_size=population, output_activation=output_activation)
     return neat, env
 
-def run_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_norm=None):
+def _rollout_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_norm=None):
     """Rollout one episode with a Genome and an action mapper."""
     total, steps, done = 0.0, 0, False
     reset_out = env.reset()
-    obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out)>=1) else reset_out
+    obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out) >= 1) else reset_out
     while not done:
         if render:
-            try: env.render()
-            except Exception: pass
+            try:
+                env.render()
+            except Exception:
+                pass
         x = obs if obs_norm is None else obs_norm(obs)
         y = genome.forward_one(np.asarray(x, dtype=np.float32).ravel())
-        act = mapper(y)
+        mapped = mapper(y)
+        if isinstance(mapped, tuple):
+            act = mapped[0]
+        else:
+            act = mapped
         step_out = env.step(act)
         if isinstance(step_out, tuple) and len(step_out) == 5:
             obs, reward, terminated, truncated, info = step_out
@@ -2124,28 +2181,257 @@ def run_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_nor
         else:
             obs, reward, done, info = step_out
             done = bool(done)
-        total += float(reward); steps += 1
+        total += float(reward)
+        steps += 1
         if (max_steps is not None) and (steps >= int(max_steps)):
             break
-    try: env.close()
-    except Exception: pass
     return total
 
 def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, episodes=1, obs_norm=None):
     """Return a fitness function for evolve() that evaluates average episodic reward."""
+    gym = _import_gym()
+    try:
+        env = gym.make(env_id, render_mode="rgb_array")
+    except TypeError:
+        env = gym.make(env_id)
+    mapper = build_action_mapper(env.action_space, stochastic=stochastic, temp=temp)
+    n_episodes = max(1, int(episodes))
+
     def _fitness(genome):
-        try:
-            import gymnasium as gym
-        except ImportError:
-            import gym
-        try: env = gym.make(env_id, render_mode="rgb_array")
-        except TypeError: env = gym.make(env_id)
-        mapper = build_action_mapper(env.action_space, stochastic=stochastic, temp=temp)
         total = 0.0
-        for _ in range(int(episodes)):
-            total += run_policy_in_env(genome, env, mapper, max_steps=max_steps, render=False, obs_norm=obs_norm)
-        return total / max(1, int(episodes))
+        for _ in range(n_episodes):
+            total += _rollout_policy_in_env(
+                genome,
+                env,
+                mapper,
+                max_steps=max_steps,
+                render=False,
+                obs_norm=obs_norm,
+            )
+        return total / float(n_episodes)
+
+    def _close_env():
+        try:
+            env.close()
+        except Exception:
+            pass
+
+    _fitness.close_env = _close_env  # type: ignore[attr-defined]
+    _fitness.env = env  # type: ignore[attr-defined]
     return _fitness
+
+
+def eval_with_node_activations(genome: 'Genome', obs_vec: np.ndarray):
+    """Evaluate a genome on a single observation and capture node activations."""
+    nodes = genome.nodes
+    order = genome.topological_order()
+    incoming = {}
+    for c in genome.enabled_connections():
+        if not c.enabled:
+            continue
+        incoming.setdefault(c.out_node, []).append(c)
+
+    acts = {nid: 0.0 for nid in nodes}
+    pre = {nid: 0.0 for nid in nodes}
+
+    inputs = [nid for nid, n in nodes.items() if n.type == 'input']
+    for i, nid in enumerate(inputs):
+        if i < len(obs_vec):
+            acts[nid] = float(obs_vec[i])
+    for nid, n in nodes.items():
+        if n.type == 'bias':
+            acts[nid] = 1.0
+
+    for nid in order:
+        node = nodes[nid]
+        if node.type in ('input', 'bias'):
+            pre[nid] = acts[nid]
+            continue
+        s = 0.0
+        for c in incoming.get(nid, []):
+            s += acts[c.in_node] * c.weight
+        pre[nid] = s
+        acts[nid] = act_forward(node.activation, s)
+
+    outs = [nid for nid, n in nodes.items() if n.type == 'output']
+    outs.sort()
+    logits = np.array([acts[o] for o in outs], dtype=np.float64)
+    return logits, acts, pre
+
+
+def _color_from_value(v: float):
+    v = float(np.tanh(v))
+    r = 0.2 + 0.6 * max(0.0, v)
+    b = 0.2 + 0.6 * max(0.0, -v)
+    g = 0.22
+    return (r, g, b)
+
+
+def _draw_nn(ax, genome: 'Genome', acts: Dict[int, float], show_values: bool = False, scars=None, radius: float = 0.10):
+    pos = layout_by_depth(genome)
+    ax.set_aspect('equal', adjustable='box')
+    ax.axis('off')
+    for c in genome.enabled_connections():
+        i, o = c.in_node, c.out_node
+        if i not in pos or o not in pos:
+            continue
+        p1, p2 = pos[i], pos[o]
+        lw = 0.6 + 2.2 * min(1.0, abs(c.weight))
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], linewidth=lw, alpha=0.75)
+    for nid, nd in genome.nodes.items():
+        if nid not in pos:
+            continue
+        x, y = pos[nid]
+        fc = _color_from_value(acts.get(nid, 0.0))
+        ax.add_patch(Circle((x, y), radius=radius, color=fc, alpha=0.95))
+        lw = 1.2
+        if scars and (nid in scars):
+            age = scars[nid].age
+            lw = 1.2 + 0.8 * math.exp(-0.15 * age)
+        ax.add_patch(Circle((x, y), radius=radius, fill=False, linewidth=lw, alpha=0.95))
+        ax.text(x, y - radius * 1.7, nd.type[0], ha='center', va='top', fontsize=7, alpha=0.86)
+        if show_values:
+            ax.text(x, y + radius * 1.6, f"{acts.get(nid, 0.0):+.2f}", ha='center', va='bottom', fontsize=7, alpha=0.9)
+
+
+def _draw_prob_bars(ax, probs, title="Action probabilities"):
+    probs = np.asarray(probs).ravel()
+    ax.clear()
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlim(-0.5, len(probs) - 0.5)
+    ax.bar(np.arange(len(probs)), probs, alpha=0.9)
+    ax.set_xticks(range(len(probs)))
+    ax.set_title(title, fontsize=9)
+    for i, p in enumerate(probs):
+        ax.text(i, p + 0.02, f"{p:.2f}", ha='center', va='bottom', fontsize=7)
+    ax.grid(alpha=0.15, linestyle=':')
+
+
+def _episode_bc_update(genome: 'Genome', obs_list, act_list, ret_list,
+                       steps=20, lr=1e-2, l2=1e-4, top_frac=0.3):
+    if len(obs_list) == 0:
+        return
+    n = len(obs_list)
+    k = max(1, int(max(1.0 / n, top_frac) * n))
+    idx = np.argsort(ret_list)[::-1][:k]
+    X = np.asarray([obs_list[i] for i in idx], dtype=np.float64)
+    y = np.asarray([act_list[i] for i in idx], dtype=np.int32)
+    try:
+        train_with_backprop_numpy(genome, X, y, steps=int(steps), lr=float(lr), l2=float(l2))
+    except Exception as e:
+        print("[warn] online update skipped:", e)
+
+
+def run_policy_in_env(genome: 'Genome', env_id: str,
+                      episodes: int = 1, max_steps: int = 1000,
+                      stochastic: bool = True, temp: float = 1.0,
+                      out_gif: str = "out/rl_rollout.gif", fps: int = 20,
+                      panel_ratio: float = 0.58,
+                      show_values: bool = True, show_bars: bool = True,
+                      rl_update: bool = False, gamma: float = 0.99,
+                      rl_steps: int = 20, rl_lr: float = 1e-2, rl_l2: float = 1e-4,
+                      top_frac: float = 0.3):
+    try:
+        import gymnasium as gym
+    except Exception:
+        import gym  # type: ignore
+
+    try:
+        env = gym.make(env_id, render_mode="rgb_array")
+    except TypeError:
+        env = gym.make(env_id)
+    mapper = build_action_mapper(env.action_space, stochastic=stochastic, temp=temp)
+
+    frames = []
+    for ep in range(int(episodes)):
+        reset_out = env.reset()
+        obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out) >= 1) else reset_out
+        obs = np.asarray(obs, dtype=np.float64).reshape(-1)
+        ep_obs, ep_act, ep_rew = [], [], []
+
+        for t in range(int(max_steps)):
+            logits, acts, _pre = eval_with_node_activations(genome, obs)
+            mapped = mapper(logits)
+            if isinstance(mapped, tuple):
+                action, probs = mapped
+            else:
+                action, probs = mapped, None
+
+            step_out = env.step(action)
+            if isinstance(step_out, tuple) and len(step_out) == 5:
+                next_obs, rew, terminated, truncated, _info = step_out
+                done = bool(terminated or truncated)
+            else:
+                next_obs, rew, done, _info = step_out
+                done = bool(done)
+            next_obs = np.asarray(next_obs, dtype=np.float64).reshape(-1)
+
+            fig = plt.figure(figsize=(9.2, 5.0))
+            if show_bars:
+                gs = fig.add_gridspec(2, 2, height_ratios=[0.65, 0.35], width_ratios=[panel_ratio, 1.0 - panel_ratio])
+                ax_env = fig.add_subplot(gs[0, 0])
+                ax_prob = fig.add_subplot(gs[1, 0])
+                ax_nn = fig.add_subplot(gs[:, 1])
+            else:
+                gs = fig.add_gridspec(1, 2, width_ratios=[panel_ratio, 1.0 - panel_ratio])
+                ax_env = fig.add_subplot(gs[0, 0])
+                ax_nn = fig.add_subplot(gs[0, 1])
+                ax_prob = None
+
+            try:
+                img = env.render()
+                ax_env.imshow(img)
+                ax_env.axis('off')
+            except Exception:
+                ax_env.text(0.5, 0.5, "(render unavailable)", ha='center', va='center')
+                ax_env.axis('off')
+
+            _draw_nn(ax_nn, genome, acts, show_values=show_values)
+            ax_env.set_title(f"{env_id} | ep {ep + 1} t={t} r={rew:.2f}")
+            ax_nn.set_title("Policy network (activations)")
+
+            if show_bars and probs is not None:
+                _draw_prob_bars(ax_prob, probs, title="Action probabilities")
+
+            fig.tight_layout()
+            fig.canvas.draw()
+            w, h = fig.canvas.get_width_height()
+            buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+            frames.append(buf)
+            plt.close(fig)
+
+            ep_obs.append(obs.copy())
+            if np.isscalar(action):
+                ep_act.append(int(action))
+            else:
+                flat = np.asarray(action).ravel()
+                ep_act.append(int(flat[0]) if flat.size == 1 else None)
+            ep_rew.append(float(rew))
+
+            obs = next_obs
+            if done:
+                if rl_update:
+                    G = 0.0
+                    rets = []
+                    for r in ep_rew[::-1]:
+                        G = float(r) + float(gamma) * G
+                        rets.append(G)
+                    rets = list(reversed(rets))
+                    rets_np = np.asarray(rets, dtype=np.float64)
+                    if len(rets_np) > 1 and np.std(rets_np) > 1e-8:
+                        rets_np = (rets_np - np.mean(rets_np)) / (np.std(rets_np) + 1e-8)
+                    if all(a is not None for a in ep_act):
+                        _episode_bc_update(genome, ep_obs, [int(a) for a in ep_act], rets_np,
+                                           steps=rl_steps, lr=rl_lr, l2=rl_l2, top_frac=top_frac)
+                break
+
+    os.makedirs(os.path.dirname(out_gif) or ".", exist_ok=True)
+    _mimsave(out_gif, frames, fps=fps)
+    try:
+        env.close()
+    except Exception:
+        pass
+    return out_gif
 
 
 def run_gym_neat_experiment(
@@ -2161,6 +2447,10 @@ def run_gym_neat_experiment(
     """Convenience wrapper that evolves NEAT agents on a Gym environment."""
 
     neat, env = setup_neat_for_env(env_id, population=pop, output_activation="identity")
+    try:
+        env.close()
+    except Exception:
+        pass
     fit = gym_fitness_factory(
         env_id,
         stochastic=stochastic,
@@ -2169,6 +2459,10 @@ def run_gym_neat_experiment(
         episodes=episodes,
     )
     best, hist = neat.evolve(fit, n_generations=gens, verbose=True)
+
+    close_env = getattr(fit, "close_env", None)
+    if callable(close_env):
+        close_env()
 
     os.makedirs(os.path.dirname(out_prefix) or ".", exist_ok=True)
     rc_png = f"{out_prefix}_reward_curve.png"
@@ -2185,11 +2479,6 @@ def run_gym_neat_experiment(
     plt.tight_layout()
     plt.savefig(rc_png, dpi=150)
     plt.close()
-
-    try:
-        env.close()
-    except Exception:
-        pass
 
     return {"best": best, "history": hist, "reward_curve": rc_png}
 
@@ -2234,12 +2523,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         figs["図1 学習曲線＋複雑度"] = res.get("learning_curve")
         figs["図2 最良トポロジ"] = res.get("topology")
         regen_gif = res.get("regen_gif")
-        if regen_gif and os.path.exists(regen_gif):
+        if regen_gif and os.path.exists(regen_gif) and imageio is not None:
             with imageio.get_reader(regen_gif) as r:
                 idx = max(0, r.get_length()//2 - 1)
                 frame = r.get_data(idx)
                 fig3 = os.path.join(args.out, f"{args.task}_fig3_regen_frame.png")
-                imageio.imwrite(fig3, frame)
+                _imwrite_image(fig3, frame)
                 figs["図3 再生ダイジェスト代表フレーム"] = fig3
         else:
             figs["図3 決定境界"] = res.get("decision_boundary")
@@ -2264,8 +2553,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             env_probe = gym.make(args.rl_env)
             try:
                 obs_dim = obs_dim_from_space(env_probe.observation_space)
-                action_space = env_probe.action_space
-                out_dim = output_dim_from_space(action_space)
+                out_dim = output_dim_from_space(env_probe.action_space)
             finally:
                 try:
                     env_probe.close()
@@ -2286,6 +2574,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 episodes=args.rl_episodes,
             )
             best, hist = neat.evolve(fit, n_generations=args.rl_gens, verbose=True)
+            close_env = getattr(fit, "close_env", None)
+            if callable(close_env):
+                close_env()
             rc_png = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_reward_curve.png")
             xs = list(range(len(hist)))
             ys_b = [b for (b, _a) in hist]
@@ -2302,41 +2593,21 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             plt.close()
             figs["RL 平均エピソード報酬"] = rc_png
             if args.rl_gameplay_gif:
-                mapper = build_action_mapper(action_space, stochastic=args.rl_stochastic, temp=args.rl_temp)
                 gif = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_gameplay.gif")
                 try:
-                    env = gym.make(args.rl_env, render_mode="rgb_array")
-                except TypeError:
-                    env = gym.make(args.rl_env)
-                frames = []
-                reset_out = env.reset()
-                obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out) >= 1) else reset_out
-                done = False
-                steps = 0
-                while not done and steps < args.rl_max_steps:
-                    y = best.forward_one(np.asarray(obs, dtype=np.float32).ravel())
-                    act = mapper(y)
-                    step_out = env.step(act)
-                    if isinstance(step_out, tuple) and len(step_out) == 5:
-                        obs, reward, terminated, truncated, info = step_out
-                        done = bool(terminated or truncated)
-                    else:
-                        obs, reward, done, info = step_out
-                        done = bool(done)
-                    try:
-                        frame = env.render()
-                    except Exception:
-                        frame = None
-                    if frame is not None:
-                        frames.append(frame)
-                    steps += 1
-                try:
-                    env.close()
-                except Exception:
-                    pass
-                if frames:
-                    imageio.mimsave(gif, frames, duration=1 / 30)
-                    figs["RL ゲームプレイ"] = gif
+                    out_path = run_policy_in_env(
+                        best,
+                        args.rl_env,
+                        episodes=max(1, args.rl_episodes),
+                        max_steps=args.rl_max_steps,
+                        stochastic=args.rl_stochastic,
+                        temp=args.rl_temp,
+                        out_gif=gif,
+                    )
+                    if out_path and os.path.exists(out_path):
+                        figs["RL ゲームプレイ"] = out_path
+                except Exception as gif_err:
+                    print("[WARN] gameplay gif failed:", gif_err)
         except Exception as e:
             print("[WARN] RL branch skipped:", e)
 
@@ -2365,8 +2636,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                     uri, mime = _data_uri(p)
                     if mime == "image/gif":
                         f.write(
-                            "<figure><video autoplay loop muted playsinline style='max-width:100%'>"
-                            f"<source src='{uri}' type='{mime}'></video>"
+                            f"<figure><img src='{uri}' style='max-width:100%'>"
                             f"<figcaption><strong>{k}</strong></figcaption></figure>"
                         )
                     elif mime.startswith("image/"):
