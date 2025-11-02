@@ -1297,28 +1297,6 @@ def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefi
         "summary_decisions": summary_paths,
     }
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--env_id", type=str, default=None, help="Gym/Gymnasium environment id for RL mode")
-    ap.add_argument("--episodes", type=int, default=1)
-    ap.add_argument("--max_steps", type=int, default=2000)
-    ap.add_argument("--stochastic", action="store_true")
-    ap.add_argument("--temp", type=float, default=1.0)
-    ap.add_argument("--task", type=str, default="circles", choices=["circles","xor","spiral"])
-    ap.add_argument("--gens", type=int, default=30)
-    ap.add_argument("--pop", type=int, default=48)
-    ap.add_argument("--steps", type=int, default=40, help="backprop steps per individual evaluation")
-    ap.add_argument("--out_prefix", type=str, default="out/exp")
-    ap.add_argument("--no_gifs", action="store_true")
-    ap.add_argument("--no_lineage", action="store_true")
-    args = ap.parse_args()
-    paths = run_backprop_neat_experiment(args.task, args.gens, args.pop, args.steps, args.out_prefix, make_gifs=not args.no_gifs, make_lineage=not args.no_lineage)
-    for k,v in paths.items(): print(k, v)
-
-if __name__ == "__main__":
-    main()
-
-
 # === backend-agnostic Figure -> RGB helper ===
 def _fig_to_rgb(fig):
     """
