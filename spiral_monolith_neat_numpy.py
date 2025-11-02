@@ -979,7 +979,11 @@ def export_regen_gif(genomes: List[Genome], scars_seq: List[Dict[int, 'Scar']], 
             _draw_nodes(ax, g, pos, scars=scars, pulse_t=t, decay_horizon=decay_horizon, radius=0.12, annotate_type=True, show_mode_mark=True)
             ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout()
             fig.canvas.draw(); w, h = fig.canvas.get_width_height()
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3); frames.append(img); plt.close(fig)
+            buf = fig.canvas.tostring_rgb() if hasattr(fig.canvas, "tostring_rgb") else fig.canvas.buffer_rgba()
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            if arr.size == (w * h * 4): arr = arr.reshape(h, w, 4)[..., :3]
+            else: arr = arr.reshape(h, w, 3)
+            frames.append(arr); plt.close(fig)
         prev = g
     imageio.mimsave(out_path, frames, fps=fps)
 
@@ -1005,7 +1009,11 @@ def _export_morph_gif_with_scars(genomes: List[Genome], scars_seq: List[Dict[int
             _draw_nodes(ax, g1, pos, scars=s1, pulse_t=t, decay_horizon=decay_horizon, radius=0.12, annotate_type=False, show_mode_mark=True)
             ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout()
             fig.canvas.draw(); w, h = fig.canvas.get_width_height()
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3); frames.append(img); plt.close(fig)
+            buf = fig.canvas.tostring_rgb() if hasattr(fig.canvas, "tostring_rgb") else fig.canvas.buffer_rgba()
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            if arr.size == (w * h * 4): arr = arr.reshape(h, w, 4)[..., :3]
+            else: arr = arr.reshape(h, w, 3)
+            frames.append(arr); plt.close(fig)
     imageio.mimsave(out_path, frames, fps=fps)
 
 def export_double_exposure(genome: Genome, lineage_edges: List[Tuple[Optional[int], Optional[int], int, int, str]],
@@ -1805,8 +1813,11 @@ def _import_gym():
     return gym
 
 def output_dim_from_space(space):
-    gym = _import_gym()
-    spaces = gym.spaces
+    try:
+        import gymnasium as _gym
+    except ImportError:
+        import gym as _gym
+    spaces = _gym.spaces
     if isinstance(space, spaces.Discrete):
         return int(space.n)
     if isinstance(space, spaces.MultiDiscrete):
@@ -1825,9 +1836,13 @@ def obs_dim_from_space(space):
     raise ValueError(f"Unsupported observation space: {type(space)}")
 
 def build_action_mapper(space, stochastic=False, temp=1.0):
-    gym = _import_gym()
+    try:
+        import gymnasium as _gym
+    except ImportError:
+        import gym as _gym
+    spaces = _gym.spaces
 
-    if isinstance(space, gym.spaces.Discrete):
+    if isinstance(space, spaces.Discrete):
         n = space.n
         def f(y):
             if stochastic:
@@ -1836,7 +1851,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
             return int(np.argmax(y[:n]))
         return f
 
-    if isinstance(space, gym.spaces.MultiDiscrete):
+    if isinstance(space, spaces.MultiDiscrete):
         nvec = np.array(space.nvec, dtype=int)
         def f(y):
             out = []
@@ -1853,7 +1868,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
             return np.array(out, dtype=space.dtype)
         return f
 
-    if isinstance(space, gym.spaces.MultiBinary):
+    if isinstance(space, spaces.MultiBinary):
         d = int(np.prod(space.n))
         def f(y):
             z = y[:d]
@@ -1865,7 +1880,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
             return a.reshape(space.n)
         return f
 
-    if isinstance(space, gym.spaces.Box):
+    if isinstance(space, spaces.Box):
         shape = space.shape
         low  = np.asarray(space.low,  dtype=np.float64)
         high = np.asarray(space.high, dtype=np.float64)
@@ -1887,7 +1902,10 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str = 'identity'):
-    gym = _import_gym()
+    try:
+        import gymnasium as gym
+    except ImportError:
+        import gym
     env = gym.make(env_id)
     obs_dim = obs_dim_from_space(env.observation_space)
     out_dim = output_dim_from_space(env.action_space)
@@ -1923,7 +1941,10 @@ def run_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_nor
 def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, episodes=1, obs_norm=None):
     """Return a fitness function for evolve() that evaluates average episodic reward."""
     def _fitness(genome):
-        gym = _import_gym()
+        try:
+            import gymnasium as gym
+        except ImportError:
+            import gym
         try: env = gym.make(env_id, render_mode="rgb_array")
         except TypeError: env = gym.make(env_id)
         mapper = build_action_mapper(env.action_space, stochastic=stochastic, temp=temp)
