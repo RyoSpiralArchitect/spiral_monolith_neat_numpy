@@ -46,7 +46,7 @@ __all__ = [
     "fitness_backprop_classifier","make_circles","make_xor","make_spirals",
     "draw_genome_png","export_regen_gif","export_morph_gif","export_double_exposure",
     "plot_learning_and_complexity","plot_decision_boundary",
-    "export_decision_boundaries_all","render_lineage",
+    "export_decision_boundaries_all","render_lineage","export_scars_spiral_map",
     "output_dim_from_space","build_action_mapper","run_policy_in_env","run_gym_neat_experiment",
 ]
 
@@ -1313,6 +1313,20 @@ def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefi
             morph_frames=12,
             decay_horizon=10.0,
         )
+
+    # 螺旋再生ヒートマップ
+    scars_spiral = None
+    if len(neat.snapshots_genomes) >= 2:
+        scars_spiral = f"{out_prefix}_scars_spiral.png"
+        export_scars_spiral_map(
+            neat.snapshots_genomes,
+            neat.snapshots_scars,
+            scars_spiral,
+            turns=None,
+            jitter=0.014,
+            marker_size=20,
+            dpi=220,
+        )
     # Lineage (auto)
     lineage_path = None
     if make_lineage:
@@ -1328,6 +1342,7 @@ def run_backprop_neat_experiment(task: str, gens=30, pop=48, steps=40, out_prefi
         "regen_gif": regen_gif,
         "morph_gif": morph_gif,
         "lineage": lineage_path,
+        "scars_spiral": scars_spiral,
         "summary_decisions": summary_paths,
     }
 
@@ -1652,6 +1667,135 @@ def export_morph_gif(
 
 
 
+def export_scars_spiral_map(
+    snapshots_genomes: List[Genome],
+    snapshots_scars: List[Dict[int, 'Scar']],
+    out_path: str,
+    *,
+    turns: Optional[float] = None,
+    jitter: float = 0.012,
+    marker_size: float = 18.0,
+    dpi: int = 220,
+    title: str = "Scars Spiral Map"
+):
+    """
+    再生痕(=新規ノード誕生)を、世代→角度θ・進行度→半径r のアルキメデス螺旋へ投影して可視化する。
+
+    座標系:
+      θ_g = (2π * turns) * g/(G-1)
+      r_g = r0 + (r1 - r0) * (θ_g / (2π * turns))   （中心から外周へ等間隔で広がる）
+
+    入力フォーマットは diff_scars の既存形式（Dict[node_id -> Scar]）に対応。
+    互換性のため、scarsが無い場合はノード集合差分から「新生ノード」を推定する。
+    """
+    if not snapshots_genomes:
+        raise ValueError("export_scars_spiral_map: snapshots_genomes is empty.")
+
+    import numpy as _np
+    import matplotlib.pyplot as _plt
+
+    G = len(snapshots_genomes)
+    if G <= 1:
+        raise ValueError("export_scars_spiral_map: need >= 2 snapshots.")
+
+    # 螺旋パラメータ
+    if turns is None:
+        # ランが長いほど少し多めに回す（2〜8回転の範囲）
+        turns = float(max(2.0, min(8.0, G / 10.0)))
+    theta_max = 2.0 * _np.pi * turns
+    r0, r1 = 0.12, 0.96  # 中心〜外周の正規化半径
+
+    # --- 世代ごとの「新生ノード」イベントを抽出 ---
+    events_by_gen: Dict[int, List[Tuple[int, str]]] = {}
+    for g in range(G):
+        new_nodes: List[Tuple[int, str]] = []
+
+        scars_g = snapshots_scars[g] if (snapshots_scars and g < len(snapshots_scars)) else None
+        if isinstance(scars_g, dict) and scars_g:
+            if "nodes" in scars_g or "edges" in scars_g:
+                raw_nodes = scars_g.get("nodes", {}) or {}
+                for nid, sc in raw_nodes.items():
+                    age = getattr(sc, "age", None)
+                    if age is None and isinstance(sc, dict):
+                        age = sc.get("age", None)
+                    if age is None and isinstance(sc, (int, float)):
+                        age = int(sc)
+                    birth = getattr(sc, "birth_gen", g)
+                    if isinstance(sc, dict):
+                        birth = sc.get("birth_gen", birth)
+                    if age == 0 and birth == g:
+                        mode = getattr(sc, "mode", None)
+                        if isinstance(sc, dict):
+                            mode = sc.get("mode", mode)
+                        new_nodes.append((int(nid), mode or "split"))
+            else:
+                # 既存の diff_scars 形式: Dict[nid -> Scar]
+                for nid, sc in scars_g.items():
+                    # その世代で age==0 かつ birth_gen==g のものを「新生」とみなす
+                    age = getattr(sc, "age", None)
+                    birth = getattr(sc, "birth_gen", g)
+                    mode = getattr(sc, "mode", None)
+                    if isinstance(sc, dict):
+                        age = sc.get("age", age)
+                        birth = sc.get("birth_gen", birth)
+                        mode = sc.get("mode", mode)
+                    if age == 0 and birth == g:
+                        new_nodes.append((int(nid), mode or "split"))
+        else:
+            # フォールバック: ノード集合差分から推定（互換目的）
+            if g > 0:
+                prev_ids = set(snapshots_genomes[g-1].nodes.keys())
+                curr_ids = set(snapshots_genomes[g].nodes.keys())
+                born = curr_ids - prev_ids
+                mode = getattr(snapshots_genomes[g], "regen_mode", "split")
+                new_nodes.extend((int(nid), mode) for nid in born)
+
+        if new_nodes:
+            events_by_gen[g] = new_nodes
+
+    # --- 角度θと半径rへ写像し、モード別に点群を作る ---
+    xs = {"split": [], "head": [], "tail": [], "other": []}
+    ys = {"split": [], "head": [], "tail": [], "other": []}
+
+    for g, items in events_by_gen.items():
+        theta = theta_max * (g / max(1, G-1))
+        base_r = r0 + (r1 - r0) * (theta / theta_max)
+
+        n = len(items)
+        offs = _np.linspace(-0.5, 0.5, n) if n > 1 else [0.0]  # 同一世代で少しだけ半径方向にズラす
+        for (offset, (nid, mode)) in zip(offs, items):
+            r = base_r + float(offset) * jitter
+            x = r * _np.cos(theta)
+            y = r * _np.sin(theta)
+            key = mode if mode in xs else "other"
+            xs[key].append(x); ys[key].append(y)
+
+    # --- 描画 ---
+    fig, ax = _plt.subplots(figsize=(6, 6), dpi=dpi, subplot_kw={"aspect": "equal"})
+    # 螺旋のセンターライン
+    ts = _np.linspace(0.0, theta_max, 1200)
+    rr = r0 + (r1 - r0) * (ts / theta_max)
+    ax.plot(rr * _np.cos(ts), rr * _np.sin(ts), linewidth=1.0, alpha=0.35, linestyle="-")
+
+    markers = {"split": "o", "head": "s", "tail": "^", "other": "x"}
+    labels  = {"split": "split", "head": "head", "tail": "tail", "other": "other"}
+    for k in ("split", "head", "tail", "other"):
+        if xs[k]:
+            ax.scatter(xs[k], ys[k], s=marker_size, alpha=0.35, marker=markers[k], linewidths=0.7, label=labels[k])
+
+    ax.set_xlim(-1.05, 1.05); ax.set_ylim(-1.05, 1.05)
+    ax.set_axis_off()
+    ax.set_title(title, fontsize=12, loc="left")
+    if any(xs[k] for k in xs):
+        ax.legend(loc="upper left", frameon=False, fontsize=9, handlelength=1.0)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    _plt.close(fig)
+    return out_path
+
+
+
 # ============================================================
 # 7') Gym action heads (Discrete / MultiDiscrete / MultiBinary / Box)
 # ============================================================
@@ -1905,6 +2049,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 figs["図3 再生ダイジェスト代表フレーム"] = fig3
         else:
             figs["図3 決定境界"] = res.get("decision_boundary")
+        figs["図4 螺旋再生ヒートマップ"] = res.get("scars_spiral")
 
         if args.gallery:
             gal = export_task_gallery(
