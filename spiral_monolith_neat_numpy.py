@@ -46,8 +46,9 @@ __all__ = [
     "fitness_backprop_classifier","make_circles","make_xor","make_spirals",
     "draw_genome_png","export_regen_gif","export_morph_gif","export_double_exposure",
     "plot_learning_and_complexity","plot_decision_boundary",
-    "export_decision_boundaries_all","render_lineage"
-, "output_dim_from_space","build_action_mapper","run_policy_in_env","run_gym_neat_experiment"]
+    "export_decision_boundaries_all","render_lineage",
+    "output_dim_from_space","build_action_mapper","run_policy_in_env","run_gym_neat_experiment",
+]
 
 @dataclass
 class NodeGene:
@@ -687,16 +688,10 @@ class ReproPlanaNEATPlus:
             species=self.speciate(fitnesses)
             self._adapt_compat_threshold(len(species))
             self.reproduce(species, fitnesses)
-        # Final best
-        best=None; bestf=-1e9
-        for g in self.population:
-            f = fitness_fn(g)
-            if not self.mode.vanilla:
-                f *= self.sex_fitness_scale.get(g.sex, 1.0) * (getattr(g,'hybrid_scale',1.0))
-                if g.regen: f += self.regen_bonus
-            f -= self._complexity_penalty(g)
-            if f > bestf: bestf=f; best=g
-        return best or best_ever, history
+        # Champion across all generations
+        if best_ever is None and self.population:
+            best_ever = self.population[0].copy()
+        return best_ever, history
 
 # ============================================================
 # 4) Backprop NEAT (NumPy only)
@@ -1218,6 +1213,37 @@ def export_decision_boundaries_all(genome: Genome, out_dir: str, steps: int = 50
     plot_decision_boundary(genome, Xs, ys, path_s, steps=steps)
     return {"circles": path_c, "xor": path_x, "spiral": path_s}
 
+
+def export_task_gallery(
+    tasks: Tuple[str, ...],
+    gens: int,
+    pop: int,
+    steps: int,
+    out_dir: str,
+) -> Dict[str, str]:
+    """Run a batch of miniature experiments and collect figure paths."""
+
+    os.makedirs(out_dir or ".", exist_ok=True)
+    outputs: Dict[str, str] = {}
+    for task in tasks:
+        tag = f"{task}_g{gens}_p{pop}_s{steps}"
+        res = run_backprop_neat_experiment(
+            task,
+            gens=gens,
+            pop=pop,
+            steps=steps,
+            out_prefix=os.path.join(out_dir, tag),
+            make_gifs=False,
+            make_lineage=False,
+        )
+        if res.get("learning_curve"):
+            outputs[f"{task.upper()} 学習曲線"] = res["learning_curve"]
+        if res.get("decision_boundary"):
+            outputs[f"{task.upper()} 決定境界"] = res["decision_boundary"]
+        if res.get("topology"):
+            outputs[f"{task.upper()} トポロジ"] = res["topology"]
+    return outputs
+
 # ============================================================
 # 7) Toy datasets & CLI demo
 # ============================================================
@@ -1403,8 +1429,23 @@ def export_regen_gif(
         node_scars = {}
         edge_scars = {}
         if snapshots_scars and t < len(snapshots_scars) and snapshots_scars[t]:
-            node_scars = dict(snapshots_scars[t].get("nodes", {}))
-            edge_scars = dict(snapshots_scars[t].get("edges", {}))
+            entry = snapshots_scars[t]
+            # 新形式: {"nodes": {...}, "edges": {...}}
+            if isinstance(entry, dict) and ("nodes" in entry or "edges" in entry):
+                raw_nodes = entry.get("nodes", {}) or {}
+                edge_scars = entry.get("edges", {}) or {}
+                try:
+                    node_scars = {
+                        nid: (val.age if hasattr(val, "age") else int(val))
+                        for nid, val in raw_nodes.items()
+                    }
+                except Exception:
+                    node_scars = {}
+            # 旧形式: {nid: Scar}
+            elif isinstance(entry, dict):
+                sample = next(iter(entry.values())) if entry else None
+                if hasattr(sample, "age"):
+                    node_scars = {nid: val.age for nid, val in entry.items()}
 
         fig, ax = _plt.subplots(figsize=(6.6, 4.8), dpi=dpi)
         ax.set_axis_off()
@@ -1760,6 +1801,52 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
             total += run_policy_in_env(genome, env, mapper, max_steps=max_steps, render=False, obs_norm=obs_norm)
         return total / max(1, int(episodes))
     return _fitness
+
+
+def run_gym_neat_experiment(
+    env_id: str,
+    gens: int = 20,
+    pop: int = 24,
+    episodes: int = 1,
+    max_steps: int = 500,
+    stochastic: bool = False,
+    temp: float = 1.0,
+    out_prefix: str = "out/rl",
+) -> Dict[str, Any]:
+    """Convenience wrapper that evolves NEAT agents on a Gym environment."""
+
+    neat, env = setup_neat_for_env(env_id, population=pop, output_activation="identity")
+    fit = gym_fitness_factory(
+        env_id,
+        stochastic=stochastic,
+        temp=temp,
+        max_steps=max_steps,
+        episodes=episodes,
+    )
+    best, hist = neat.evolve(fit, n_generations=gens, verbose=True)
+
+    os.makedirs(os.path.dirname(out_prefix) or ".", exist_ok=True)
+    rc_png = f"{out_prefix}_reward_curve.png"
+    xs = list(range(len(hist)))
+    ys_b = [b for (b, _a) in hist]
+    ys_a = [a for (_b, a) in hist]
+    plt.figure()
+    plt.plot(xs, ys_b, label="best")
+    plt.plot(xs, ys_a, label="avg")
+    plt.xlabel("generation")
+    plt.ylabel("episode reward")
+    plt.title(f"{env_id} | Average Episode Reward")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(rc_png, dpi=150)
+    plt.close()
+
+    try:
+        env.close()
+    except Exception:
+        pass
+
+    return {"best": best, "history": hist, "reward_curve": rc_png}
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
