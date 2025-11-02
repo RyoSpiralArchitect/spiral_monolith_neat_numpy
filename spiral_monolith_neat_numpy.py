@@ -979,7 +979,11 @@ def export_regen_gif(genomes: List[Genome], scars_seq: List[Dict[int, 'Scar']], 
             _draw_nodes(ax, g, pos, scars=scars, pulse_t=t, decay_horizon=decay_horizon, radius=0.12, annotate_type=True, show_mode_mark=True)
             ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout()
             fig.canvas.draw(); w, h = fig.canvas.get_width_height()
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3); frames.append(img); plt.close(fig)
+            buf = fig.canvas.tostring_rgb() if hasattr(fig.canvas, "tostring_rgb") else fig.canvas.buffer_rgba()
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            if arr.size == (w * h * 4): arr = arr.reshape(h, w, 4)[..., :3]
+            else: arr = arr.reshape(h, w, 3)
+            frames.append(arr); plt.close(fig)
         prev = g
     imageio.mimsave(out_path, frames, fps=fps)
 
@@ -1005,7 +1009,11 @@ def _export_morph_gif_with_scars(genomes: List[Genome], scars_seq: List[Dict[int
             _draw_nodes(ax, g1, pos, scars=s1, pulse_t=t, decay_horizon=decay_horizon, radius=0.12, annotate_type=False, show_mode_mark=True)
             ax.set_aspect('equal', adjustable='box'); ax.axis('off'); fig.tight_layout()
             fig.canvas.draw(); w, h = fig.canvas.get_width_height()
-            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3); frames.append(img); plt.close(fig)
+            buf = fig.canvas.tostring_rgb() if hasattr(fig.canvas, "tostring_rgb") else fig.canvas.buffer_rgba()
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            if arr.size == (w * h * 4): arr = arr.reshape(h, w, 4)[..., :3]
+            else: arr = arr.reshape(h, w, 3)
+            frames.append(arr); plt.close(fig)
     imageio.mimsave(out_path, frames, fps=fps)
 
 def export_double_exposure(genome: Genome, lineage_edges: List[Tuple[Optional[int], Optional[int], int, int, str]],
