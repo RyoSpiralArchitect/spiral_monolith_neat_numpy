@@ -1630,8 +1630,11 @@ def _import_gym():
     return gym
 
 def output_dim_from_space(space):
-    gym = _import_gym()
-    spaces = gym.spaces
+    try:
+        import gymnasium as _gym
+    except ImportError:
+        import gym as _gym
+    spaces = _gym.spaces
     if isinstance(space, spaces.Discrete):
         return int(space.n)
     if isinstance(space, spaces.MultiDiscrete):
@@ -1650,9 +1653,13 @@ def obs_dim_from_space(space):
     raise ValueError(f"Unsupported observation space: {type(space)}")
 
 def build_action_mapper(space, stochastic=False, temp=1.0):
-    gym = _import_gym()
+    try:
+        import gymnasium as _gym
+    except ImportError:
+        import gym as _gym
+    spaces = _gym.spaces
 
-    if isinstance(space, gym.spaces.Discrete):
+    if isinstance(space, spaces.Discrete):
         n = space.n
         def f(y):
             if stochastic:
@@ -1661,7 +1668,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
             return int(np.argmax(y[:n]))
         return f
 
-    if isinstance(space, gym.spaces.MultiDiscrete):
+    if isinstance(space, spaces.MultiDiscrete):
         nvec = np.array(space.nvec, dtype=int)
         def f(y):
             out = []
@@ -1678,7 +1685,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
             return np.array(out, dtype=space.dtype)
         return f
 
-    if isinstance(space, gym.spaces.MultiBinary):
+    if isinstance(space, spaces.MultiBinary):
         d = int(np.prod(space.n))
         def f(y):
             z = y[:d]
@@ -1690,7 +1697,7 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
             return a.reshape(space.n)
         return f
 
-    if isinstance(space, gym.spaces.Box):
+    if isinstance(space, spaces.Box):
         shape = space.shape
         low  = np.asarray(space.low,  dtype=np.float64)
         high = np.asarray(space.high, dtype=np.float64)
@@ -1712,7 +1719,10 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str = 'identity'):
-    gym = _import_gym()
+    try:
+        import gymnasium as gym
+    except ImportError:
+        import gym
     env = gym.make(env_id)
     obs_dim = obs_dim_from_space(env.observation_space)
     out_dim = output_dim_from_space(env.action_space)
@@ -1748,7 +1758,10 @@ def run_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_nor
 def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, episodes=1, obs_norm=None):
     """Return a fitness function for evolve() that evaluates average episodic reward."""
     def _fitness(genome):
-        gym = _import_gym()
+        try:
+            import gymnasium as gym
+        except ImportError:
+            import gym
         try: env = gym.make(env_id, render_mode="rgb_array")
         except TypeError: env = gym.make(env_id)
         mapper = build_action_mapper(env.action_space, stochastic=stochastic, temp=temp)
@@ -1760,11 +1773,7 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
 
 
 if __name__ == "__main__":
-    import argparse, os
-    import matplotlib
-    matplotlib.use("Agg")
-    import numpy as np
-    import imageio.v2 as imageio
+    import argparse, os, numpy as np, imageio.v2 as imageio
     ap = argparse.ArgumentParser(description="Spiral-NEAT NumPy | built-in CLI")
     ap.add_argument("--task", choices=["xor","circles","spiral"])
     ap.add_argument("--gens", type=int, default=30)
@@ -1820,7 +1829,10 @@ if __name__ == "__main__":
     # RL
     if args.rl_env:
         try:
-            gym = _import_gym()
+            try:
+                import gymnasium as gym
+            except ImportError:
+                import gym
             import matplotlib.pyplot as plt
             obs_dim = obs_dim_from_space(gym.make(args.rl_env).observation_space)
             out_dim = output_dim_from_space(gym.make(args.rl_env).action_space)
