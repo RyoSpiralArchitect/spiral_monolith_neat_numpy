@@ -16,9 +16,21 @@
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
 import math, argparse, os
-import numpy as np
 import matplotlib
-matplotlib.use("Agg")
+
+
+def _ensure_matplotlib_agg(force: bool = False):
+    """Select Agg backend even if pyplot was already imported elsewhere."""
+    try:
+        matplotlib.use("Agg", force=force)
+    except TypeError:  # pragma: no cover - older matplotlib doesn't support force
+        matplotlib.use("Agg")
+    return matplotlib
+
+
+_ensure_matplotlib_agg()
+
+import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
 import imageio.v2 as imageio
@@ -1772,8 +1784,10 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
     return _fitness
 
 
-if __name__ == "__main__":
-    import argparse, os, numpy as np, imageio.v2 as imageio
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    """Command-line interface entrypoint."""
+    _ensure_matplotlib_agg(force=True)
+
     ap = argparse.ArgumentParser(description="Spiral-NEAT NumPy | built-in CLI")
     ap.add_argument("--task", choices=["xor","circles","spiral"])
     ap.add_argument("--gens", type=int, default=30)
@@ -1793,10 +1807,10 @@ if __name__ == "__main__":
     ap.add_argument("--make-lineage", action="store_true")
     ap.add_argument("--gallery", nargs="*", default=[])
     ap.add_argument("--report", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(None if argv is None else list(argv))
 
     os.makedirs(args.out, exist_ok=True)
-    figs = {}
+    figs: Dict[str, Optional[str]] = {}
 
     # supervised
     if args.task:
@@ -1811,52 +1825,82 @@ if __name__ == "__main__":
         regen_gif = res.get("regen_gif")
         if regen_gif and os.path.exists(regen_gif):
             with imageio.get_reader(regen_gif) as r:
-                idx = max(0, r.get_length()//2 - 1); frame = r.get_data(idx)
+                idx = max(0, r.get_length()//2 - 1)
+                frame = r.get_data(idx)
                 fig3 = os.path.join(args.out, f"{args.task}_fig3_regen_frame.png")
-                imageio.imwrite(fig3, frame); figs["図3 再生ダイジェスト代表フレーム"] = fig3
+                imageio.imwrite(fig3, frame)
+                figs["図3 再生ダイジェスト代表フレーム"] = fig3
         else:
             figs["図3 決定境界"] = res.get("decision_boundary")
 
         if args.gallery:
-            gal = export_task_gallery(tasks=tuple(args.gallery),
-                                      gens=max(6, args.gens//2),
-                                      pop=max(12, args.pop//2),
-                                      steps=max(10, args.steps//2),
-                                      out_dir=os.path.join(args.out, "gallery"))
-            for k,v in gal.items():
+            gal = export_task_gallery(
+                tasks=tuple(args.gallery),
+                gens=max(6, args.gens // 2),
+                pop=max(12, args.pop // 2),
+                steps=max(10, args.steps // 2),
+                out_dir=os.path.join(args.out, "gallery"),
+            )
+            for k, v in gal.items():
                 figs[f"ギャラリー {k}"] = v
 
     # RL
     if args.rl_env:
         try:
+            gym = _import_gym()
+
+            env_probe = gym.make(args.rl_env)
             try:
-                import gymnasium as gym
-            except ImportError:
-                import gym
-            import matplotlib.pyplot as plt
-            obs_dim = obs_dim_from_space(gym.make(args.rl_env).observation_space)
-            out_dim = output_dim_from_space(gym.make(args.rl_env).action_space)
-            neat = ReproPlanaNEATPlus(num_inputs=obs_dim, num_outputs=out_dim,
-                                       population_size=args.rl_pop, output_activation='identity')
-            fit = gym_fitness_factory(args.rl_env, stochastic=args.rl_stochastic, temp=args.rl_temp,
-                                       max_steps=args.rl_max_steps, episodes=args.rl_episodes)
+                obs_dim = obs_dim_from_space(env_probe.observation_space)
+                action_space = env_probe.action_space
+                out_dim = output_dim_from_space(action_space)
+            finally:
+                try:
+                    env_probe.close()
+                except Exception:
+                    pass
+
+            neat = ReproPlanaNEATPlus(
+                num_inputs=obs_dim,
+                num_outputs=out_dim,
+                population_size=args.rl_pop,
+                output_activation="identity",
+            )
+            fit = gym_fitness_factory(
+                args.rl_env,
+                stochastic=args.rl_stochastic,
+                temp=args.rl_temp,
+                max_steps=args.rl_max_steps,
+                episodes=args.rl_episodes,
+            )
             best, hist = neat.evolve(fit, n_generations=args.rl_gens, verbose=True)
             rc_png = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_reward_curve.png")
-            xs = list(range(len(hist))); ys_b=[b for (b,a) in hist]; ys_a=[a for (b,a) in hist]
-            plt.figure(); plt.plot(xs, ys_b, label="best"); plt.plot(xs, ys_a, label="avg")
-            plt.xlabel("generation"); plt.ylabel("episode reward"); plt.title(f"{args.rl_env} | Average Episode Reward")
-            plt.legend(); plt.tight_layout(); plt.savefig(rc_png, dpi=150); plt.close()
+            xs = list(range(len(hist)))
+            ys_b = [b for (b, _a) in hist]
+            ys_a = [a for (_b, a) in hist]
+            plt.figure()
+            plt.plot(xs, ys_b, label="best")
+            plt.plot(xs, ys_a, label="avg")
+            plt.xlabel("generation")
+            plt.ylabel("episode reward")
+            plt.title(f"{args.rl_env} | Average Episode Reward")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(rc_png, dpi=150)
+            plt.close()
             figs["RL 平均エピソード報酬"] = rc_png
             if args.rl_gameplay_gif:
-                from math import isfinite
-                mapper = build_action_mapper(gym.make(args.rl_env).action_space, stochastic=args.rl_stochastic, temp=args.rl_temp)
+                mapper = build_action_mapper(action_space, stochastic=args.rl_stochastic, temp=args.rl_temp)
                 gif = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_gameplay.gif")
-                # record frames
-                try: env = gym.make(args.rl_env, render_mode="rgb_array")
-                except TypeError: env = gym.make(args.rl_env)
-                frames=[]; reset_out = env.reset()
-                obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out)>=1) else reset_out
-                done=False; steps=0
+                try:
+                    env = gym.make(args.rl_env, render_mode="rgb_array")
+                except TypeError:
+                    env = gym.make(args.rl_env)
+                frames = []
+                reset_out = env.reset()
+                obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out) >= 1) else reset_out
+                done = False
+                steps = 0
                 while not done and steps < args.rl_max_steps:
                     y = best.forward_one(np.asarray(obs, dtype=np.float32).ravel())
                     act = mapper(y)
@@ -1867,27 +1911,44 @@ if __name__ == "__main__":
                     else:
                         obs, reward, done, info = step_out
                         done = bool(done)
-                    try: frame = env.render()
-                    except Exception: frame = None
-                    if frame is not None: frames.append(frame)
+                    try:
+                        frame = env.render()
+                    except Exception:
+                        frame = None
+                    if frame is not None:
+                        frames.append(frame)
                     steps += 1
-                try: env.close()
-                except Exception: pass
-                if frames: imageio.mimsave(gif, frames, duration=1/30)
+                try:
+                    env.close()
+                except Exception:
+                    pass
+                if frames:
+                    imageio.mimsave(gif, frames, duration=1 / 30)
         except Exception as e:
             print("[WARN] RL branch skipped:", e)
 
     if args.report and figs:
         # minimal self-contained HTML (base64 embed)
-        def _data_uri(p):
-            with open(p, "rb") as f: import base64; return "data:image/png;base64,"+base64.b64encode(f.read()).decode("ascii")
+        def _data_uri(p: str) -> str:
+            with open(p, "rb") as f:
+                import base64
+
+                return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+
         html = os.path.join(args.out, "Sakana_NEAT_Report.html")
         with open(html, "w", encoding="utf-8") as f:
             f.write("<!DOCTYPE html><html lang='ja'><meta charset='utf-8'><title>Report</title><body>")
-            for k,p in figs.items():
+            for k, p in figs.items():
                 if p and os.path.exists(p):
-                    f.write(f"<figure><img src='{_data_uri(p)}' style='max-width:100%'><figcaption><strong>{k}</strong></figcaption></figure>")
+                    f.write(
+                        f"<figure><img src='{_data_uri(p)}' style='max-width:100%'><figcaption><strong>{k}</strong></figcaption></figure>"
+                    )
             f.write("</body></html>")
         print("[REPORT]", html)
 
     print("[OK] outputs in:", args.out)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
