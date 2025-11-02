@@ -1461,15 +1461,26 @@ def export_regen_gif(
 
 def export_morph_gif(
     snapshots_genomes,
+    snapshots_scars=None,
     path,
     fps=12,
     morph_frames=8,
+    decay_horizon=10.0,
     fixed_layout=True,
     dpi=130
 ):
     """
     Inter-generational morphological transition GIF.
     Fades-out edges that disappear, keeps common edges, fades-in new edges.
+
+    Parameters
+    ----------
+    snapshots_genomes : Sequence[Genome]
+        Per-generation genome snapshots.
+    snapshots_scars : Optional[Sequence[Dict[int, Scar]]]
+        Optional regeneration scar metadata aligned with ``snapshots_genomes``.
+    path : str
+        Output GIF path.
     """
     import numpy as _np
     import imageio.v2 as _imageio
@@ -1508,6 +1519,11 @@ def export_morph_gif(
                 pos[nid] = (x, ys[i])
         return pos
 
+    def _pulse_amp(age, frame_idx):
+        base = max(0.1, 1.0 - float(age) / max(1e-6, decay_horizon))
+        phase = 2.0 * _np.pi * (frame_idx % max(1, morph_frames)) / max(1, morph_frames)
+        return float(base * (0.5 + 0.5 * _np.sin(phase)))
+
     pos_fixed = _compute_positions(snapshots_genomes[0]) if fixed_layout else None
 
     frames = []
@@ -1523,8 +1539,11 @@ def export_morph_gif(
         gone = E0 - E1
         born = E1 - E0
 
+        scars0 = snapshots_scars[i] if snapshots_scars and i < len(snapshots_scars) else None
+        scars1 = snapshots_scars[i + 1] if snapshots_scars and (i + 1) < len(snapshots_scars) else None
+
         for k in range(max(1, morph_frames)):
-            t = 0.0 if morph_frames <= 1 else k / float(morph_frames - 1)
+            t = 0.0 if morph_frames <= 1 else k / float(max(1, morph_frames - 1))
 
             fig, ax = _plt.subplots(figsize=(6.6, 4.8), dpi=dpi)
             ax.set_axis_off(); ax.set_xlim(0.0, 1.0); ax.set_ylim(0.0, 1.0)
@@ -1532,20 +1551,23 @@ def export_morph_gif(
             # gone edges fade out
             for (u, v) in sorted(gone):
                 p = pos0 if (u in pos0 and v in pos0) else pos1
-                if (u not in p) or (v not in p): continue
+                if (u not in p) or (v not in p):
+                    continue
                 x0, y0 = p[u]; x1, y1 = p[v]
                 ax.plot([x0, x1], [y0, y1], linestyle="dashed", linewidth=1.4, alpha=max(0.0, 1.0 - t))
 
             # kept edges stay
             for (u, v) in sorted(kept):
-                if (u not in pos0) or (v not in pos0): continue
+                if (u not in pos0) or (v not in pos0):
+                    continue
                 x0, y0 = pos0[u]; x1, y1 = pos0[v]
                 ax.plot([x0, x1], [y0, y1], linewidth=1.8, alpha=0.9)
 
             # born edges fade in
             for (u, v) in sorted(born):
                 p = pos1 if (u in pos1 and v in pos1) else pos0
-                if (u not in p) or (v not in p): continue
+                if (u not in p) or (v not in p):
+                    continue
                 x0, y0 = p[u]; x1, y1 = p[v]
                 ax.plot([x0, x1], [y0, y1], linewidth=2.2, alpha=max(0.0, t))
 
@@ -1554,13 +1576,28 @@ def export_morph_gif(
                      for nid in set(list(g0.nodes.keys()) + list(g1.nodes.keys()))}
             p = pos1 if fixed_layout else pos0
             for nid, (x, y) in p.items():
-                if nid not in types: continue
+                if nid not in types:
+                    continue
                 tname = types[nid]
                 sz = 50.0
-                if tname == "input":  sz = 35.0
-                if tname == "bias":   sz = 28.0
-                if tname == "output": sz = 60.0
+                if tname == "input":
+                    sz = 35.0
+                if tname == "bias":
+                    sz = 28.0
+                if tname == "output":
+                    sz = 60.0
                 ax.scatter([x], [y], s=sz, alpha=1.0, zorder=3, linewidths=0.8)
+
+                age = None
+                if scars1 and isinstance(scars1, dict) and nid in scars1:
+                    age = getattr(scars1[nid], "age", None)
+                elif scars0 and isinstance(scars0, dict) and nid in scars0:
+                    age = getattr(scars0[nid], "age", None)
+                if age is not None:
+                    amp = _pulse_amp(age, len(frames))
+                    circ = _plt.Circle((x, y), 0.018 + 0.012 * amp, fill=False,
+                                       linewidth=1.0 + 2.0 * amp, alpha=0.6)
+                    ax.add_patch(circ)
 
             img = _fig_to_rgb(fig)
             frames.append(img)
@@ -1710,3 +1747,119 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
         return total / max(1, int(episodes))
     return _fitness
 
+
+if __name__ == "__main__":
+    import argparse, os, numpy as np, imageio.v2 as imageio
+    ap = argparse.ArgumentParser(description="Spiral-NEAT NumPy | built-in CLI")
+    ap.add_argument("--task", choices=["xor","circles","spiral"])
+    ap.add_argument("--gens", type=int, default=30)
+    ap.add_argument("--pop",  type=int, default=48)
+    ap.add_argument("--steps",type=int, default=40)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--rl-env", type=str)
+    ap.add_argument("--rl-gens", type=int, default=20)
+    ap.add_argument("--rl-pop",  type=int, default=24)
+    ap.add_argument("--rl-episodes", type=int, default=1)
+    ap.add_argument("--rl-max-steps", type=int, default=500)
+    ap.add_argument("--rl-stochastic", action="store_true")
+    ap.add_argument("--rl-temp", type=float, default=1.0)
+    ap.add_argument("--rl-gameplay-gif", action="store_true")
+    ap.add_argument("--out", default="out_monolith_cli")
+    ap.add_argument("--make-gifs", action="store_true")
+    ap.add_argument("--make-lineage", action="store_true")
+    ap.add_argument("--gallery", nargs="*", default=[])
+    ap.add_argument("--report", action="store_true")
+    args = ap.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+    figs = {}
+
+    # supervised
+    if args.task:
+        np.random.seed(args.seed)
+        res = run_backprop_neat_experiment(
+            args.task, gens=args.gens, pop=args.pop, steps=args.steps,
+            out_prefix=os.path.join(args.out, args.task),
+            make_gifs=args.make_gifs, make_lineage=args.make_lineage
+        )
+        figs["図1 学習曲線＋複雑度"] = res.get("learning_curve")
+        figs["図2 最良トポロジ"] = res.get("topology")
+        regen_gif = res.get("regen_gif")
+        if regen_gif and os.path.exists(regen_gif):
+            with imageio.get_reader(regen_gif) as r:
+                idx = max(0, r.get_length()//2 - 1); frame = r.get_data(idx)
+                fig3 = os.path.join(args.out, f"{args.task}_fig3_regen_frame.png")
+                imageio.imwrite(fig3, frame); figs["図3 再生ダイジェスト代表フレーム"] = fig3
+        else:
+            figs["図3 決定境界"] = res.get("decision_boundary")
+
+        if args.gallery:
+            gal = export_task_gallery(tasks=tuple(args.gallery),
+                                      gens=max(6, args.gens//2),
+                                      pop=max(12, args.pop//2),
+                                      steps=max(10, args.steps//2),
+                                      out_dir=os.path.join(args.out, "gallery"))
+            for k,v in gal.items():
+                figs[f"ギャラリー {k}"] = v
+
+    # RL
+    if args.rl_env:
+        try:
+            import gym, matplotlib.pyplot as plt
+            obs_dim = obs_dim_from_space(gym.make(args.rl_env).observation_space)
+            out_dim = output_dim_from_space(gym.make(args.rl_env).action_space)
+            neat = ReproPlanaNEATPlus(num_inputs=obs_dim, num_outputs=out_dim,
+                                       population_size=args.rl_pop, output_activation='identity')
+            fit = gym_fitness_factory(args.rl_env, stochastic=args.rl_stochastic, temp=args.rl_temp,
+                                       max_steps=args.rl_max_steps, episodes=args.rl_episodes)
+            best, hist = neat.evolve(fit, n_generations=args.rl_gens, verbose=True)
+            rc_png = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_reward_curve.png")
+            xs = list(range(len(hist))); ys_b=[b for (b,a) in hist]; ys_a=[a for (b,a) in hist]
+            plt.figure(); plt.plot(xs, ys_b, label="best"); plt.plot(xs, ys_a, label="avg")
+            plt.xlabel("generation"); plt.ylabel("episode reward"); plt.title(f"{args.rl_env} | Average Episode Reward")
+            plt.legend(); plt.tight_layout(); plt.savefig(rc_png, dpi=150); plt.close()
+            figs["RL 平均エピソード報酬"] = rc_png
+            if args.rl_gameplay_gif:
+                from math import isfinite
+                mapper = build_action_mapper(gym.make(args.rl_env).action_space, stochastic=args.rl_stochastic, temp=args.rl_temp)
+                gif = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_gameplay.gif")
+                # record frames
+                try: env = gym.make(args.rl_env, render_mode="rgb_array")
+                except TypeError: env = gym.make(args.rl_env)
+                frames=[]; reset_out = env.reset()
+                obs = reset_out[0] if (isinstance(reset_out, tuple) and len(reset_out)>=1) else reset_out
+                done=False; steps=0
+                while not done and steps < args.rl_max_steps:
+                    y = best.forward_one(np.asarray(obs, dtype=np.float32).ravel())
+                    act = mapper(y)
+                    step_out = env.step(act)
+                    if isinstance(step_out, tuple) and len(step_out) == 5:
+                        obs, reward, terminated, truncated, info = step_out
+                        done = bool(terminated or truncated)
+                    else:
+                        obs, reward, done, info = step_out
+                        done = bool(done)
+                    try: frame = env.render()
+                    except Exception: frame = None
+                    if frame is not None: frames.append(frame)
+                    steps += 1
+                try: env.close()
+                except Exception: pass
+                if frames: imageio.mimsave(gif, frames, duration=1/30)
+        except Exception as e:
+            print("[WARN] RL branch skipped:", e)
+
+    if args.report and figs:
+        # minimal self-contained HTML (base64 embed)
+        def _data_uri(p):
+            with open(p, "rb") as f: import base64; return "data:image/png;base64,"+base64.b64encode(f.read()).decode("ascii")
+        html = os.path.join(args.out, "Sakana_NEAT_Report.html")
+        with open(html, "w", encoding="utf-8") as f:
+            f.write("<!DOCTYPE html><html lang='ja'><meta charset='utf-8'><title>Report</title><body>")
+            for k,p in figs.items():
+                if p and os.path.exists(p):
+                    f.write(f"<figure><img src='{_data_uri(p)}' style='max-width:100%'><figcaption><strong>{k}</strong></figcaption></figure>")
+            f.write("</body></html>")
+        print("[REPORT]", html)
+
+    print("[OK] outputs in:", args.out)
