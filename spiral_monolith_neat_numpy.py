@@ -503,7 +503,7 @@ class ReproPlanaNEATPlus:
             g.sex = 'female' if self.rng.random() < 0.5 else 'male'
             g.regen = bool(self.rng.random() < 0.5)
             g.regen_mode = self.rng.choice(['head','tail','split'])
-            g.embryo_bias = self.rng.choice(['neutral','inputward','outputward'], p=[0.5,0.25,0.25])
+            g.embryo_bias = 'inputward'
             g.id = self.next_gid; self.next_gid += 1; g.birth_gen = 0
             self.population.append(g)
 
@@ -512,7 +512,7 @@ class ReproPlanaNEATPlus:
         self.compatibility_threshold = 3.0
         self.c1=self.c2=1.0; self.c3=0.4
         self.elitism = 1; self.survival_rate = 0.2
-        self.mutate_add_conn_prob = 0.05; self.mutate_add_node_prob = 0.03
+        self.mutate_add_conn_prob = 0.10; self.mutate_add_node_prob = 0.10
         self.mutate_weight_prob = 0.8; self.mutate_toggle_prob = 0.01
         self.weight_perturb_chance = 0.9; self.weight_sigma = 0.8; self.weight_reset_range = 2.0
         self.regen_mode_mut_rate = 0.05; self.embryo_bias_mut_rate = 0.03
@@ -1577,16 +1577,7 @@ def make_spirals(n=512, noise=0.1, turns=1.5, seed=0):
     y = np.concatenate([np.zeros(n2, dtype=np.int32), np.ones(n2, dtype=np.int32)])
     return X, y
 
-def run_backprop_neat_experiment(
-    task: str,
-    gens=30,
-    pop=48,
-    steps=40,
-    out_prefix="out/exp",
-    make_gifs: bool = True,
-    make_lineage: bool = True,
-    rng_seed: Optional[int] = None,
-):
+def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True):
     # dataset
     if task=="xor": Xtr,ytr = make_xor(512, noise=0.05, seed=0); Xva,yva = make_xor(256, noise=0.05, seed=1)
     elif task=="spiral": Xtr,ytr = make_spirals(512, noise=0.05, turns=1.5, seed=0); Xva,yva = make_spirals(256, noise=0.05, turns=1.5, seed=1)
@@ -2639,9 +2630,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     ap = argparse.ArgumentParser(description="Spiral-NEAT NumPy | built-in CLI")
     ap.add_argument("--task", choices=["xor","circles","spiral"])
-    ap.add_argument("--gens", type=int, default=30)
-    ap.add_argument("--pop",  type=int, default=48)
-    ap.add_argument("--steps",type=int, default=40)
+    ap.add_argument("--gens", type=int, default=60)
+    ap.add_argument("--pop",  type=int, default=64)
+    ap.add_argument("--steps",type=int, default=80)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--rl-env", type=str)
     ap.add_argument("--rl-gens", type=int, default=20)
