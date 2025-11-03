@@ -31,6 +31,8 @@ def _ensure_matplotlib_agg(force: bool = False):
 
 _ensure_matplotlib_agg()
 
+STRUCTURAL_EPS = 1e-9
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
