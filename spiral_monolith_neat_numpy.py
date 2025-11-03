@@ -15,7 +15,7 @@
 
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
-from collections import deque, defaultdict
+from collections import deque, defaultdict, OrderedDict
 import math, argparse, os, mimetypes, csv
 import matplotlib
 
@@ -99,7 +99,7 @@ __all__ = [
     "plot_learning_and_complexity","plot_decision_boundary",
     "export_decision_boundaries_all","render_lineage","export_scars_spiral_map",
     "output_dim_from_space","build_action_mapper","eval_with_node_activations","run_policy_in_env","run_gym_neat_experiment",
-    "LCSMonitor","summarize_graph_changes",
+    "LCSMonitor","summarize_graph_changes","load_lcs_log","export_lcs_ribbon_png","export_lcs_timeline_gif",
 ]
 
 @dataclass
@@ -406,6 +406,359 @@ def summarize_graph_changes(adj0: Dict[int, List[Tuple[int, float]]],
     return changed_nodes, changed_edges
 
 
+def load_lcs_log(csv_path: str) -> List[Dict[str, Any]]:
+    """Parse the LCS CSV into a list of numeric-friendly dict rows."""
+    if not csv_path or not os.path.exists(csv_path):
+        return []
+
+    def _as_int(value):
+        if value is None:
+            return None
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        s = str(value).strip()
+        if s == "":
+            return None
+        try:
+            return int(float(s))
+        except ValueError:
+            return None
+
+    def _as_float(value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float, np.floating)):
+            return float(value)
+        s = str(value).strip()
+        if s == "":
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    rows: List[Dict[str, Any]] = []
+    try:
+        with open(csv_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for raw in reader:
+                gen = _as_int(raw.get("gen"))
+                out_id = _as_int(raw.get("o"))
+                if gen is None or out_id is None:
+                    continue
+                lineage_raw = raw.get("lineage_id")
+                lineage_id = _as_int(lineage_raw)
+                row = {
+                    "gen": gen,
+                    "lineage_id": lineage_id if lineage_id is not None else lineage_raw,
+                    "mut_id": raw.get("mut_id"),
+                    "o": out_id,
+                    "changed_nodes": _as_int(raw.get("changed_nodes")) or 0,
+                    "changed_edges": _as_int(raw.get("changed_edges")) or 0,
+                    "R0": int(_as_int(raw.get("R0")) or 0),
+                    "R1": int(_as_int(raw.get("R1")) or 0),
+                    "P0": _as_int(raw.get("P0")) or 0,
+                    "P1": _as_int(raw.get("P1")) or 0,
+                    "d0": _as_int(raw.get("d0")),
+                    "d1": _as_int(raw.get("d1")),
+                    "detour": _as_float(raw.get("detour")),
+                    "delta_paths": _as_int(raw.get("delta_paths")) or 0,
+                    "delta_sp": _as_int(raw.get("delta_sp")),
+                    "heal_flag": int(_as_int(raw.get("heal_flag")) or 0),
+                    "time_to_heal": _as_int(raw.get("time_to_heal")),
+                    "disjoint_paths0": _as_int(raw.get("disjoint_paths0")) or 0,
+                    "disjoint_paths1": _as_int(raw.get("disjoint_paths1")) or 0,
+                }
+                rows.append(row)
+    except FileNotFoundError:
+        return []
+    return rows
+
+
+def _prepare_lcs_series(lcs_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    per_output: Dict[int, "OrderedDict[int, Dict[str, Any]]"] = {}
+    per_gen: Dict[int, Dict[str, Any]] = {}
+    gens: Set[int] = set()
+    for row in lcs_rows:
+        gen = row.get("gen")
+        out_id = row.get("o")
+        if gen is None or out_id is None:
+            continue
+        gens.add(gen)
+        per_output.setdefault(out_id, OrderedDict())[gen] = row
+        agg = per_gen.setdefault(
+            gen,
+            {
+                "count": 0,
+                "paths1": [],
+                "disjoint1": [],
+                "detour": [],
+                "delta_paths": [],
+                "changed_edges": 0,
+                "heals": 0,
+                "breaks": 0,
+                "time_to_heal": [],
+                "connected": 0,
+            },
+        )
+        agg["count"] += 1
+        agg["changed_edges"] += row.get("changed_edges", 0) or 0
+        agg["paths1"].append(row.get("P1", 0) or 0)
+        agg["disjoint1"].append(row.get("disjoint_paths1", 0) or 0)
+        detour_val = row.get("detour")
+        if detour_val is not None and not np.isnan(detour_val):
+            agg["detour"].append(float(detour_val))
+        agg["delta_paths"].append(row.get("delta_paths", 0) or 0)
+        if row.get("R0", 0) == 1 and row.get("R1", 0) == 0:
+            agg["breaks"] += 1
+        if row.get("heal_flag", 0):
+            agg["heals"] += 1
+        tth = row.get("time_to_heal")
+        if tth is not None:
+            agg["time_to_heal"].append(tth)
+        if row.get("R1", 0):
+            agg["connected"] += 1
+
+    outputs = sorted(per_output.keys())
+    for out_id in outputs:
+        per_output[out_id] = OrderedDict(sorted(per_output[out_id].items()))
+    generations = sorted(gens)
+    return {
+        "per_output": per_output,
+        "per_gen": per_gen,
+        "outputs": outputs,
+        "generations": generations,
+    }
+
+
+def _latest_gen_summary(series: Optional[Dict[str, Any]], upto_gen: int) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+    if not series:
+        return None, None
+    gens: List[int] = series.get("generations", [])  # type: ignore
+    for g in reversed(gens):
+        if g <= upto_gen:
+            return g, series.get("per_gen", {}).get(g)  # type: ignore
+    return None, None
+
+
+def _cumulative_lcs_counts(series: Optional[Dict[str, Any]], upto_gen: int) -> Tuple[int, int]:
+    if not series:
+        return 0, 0
+    heals = 0
+    breaks = 0
+    for gen, summary in series.get("per_gen", {}).items():  # type: ignore
+        if gen <= upto_gen:
+            heals += int(summary.get("heals", 0))
+            breaks += int(summary.get("breaks", 0))
+    return heals, breaks
+
+
+def _format_lcs_summary(summary: Optional[Dict[str, Any]]) -> str:
+    if not summary or summary.get("count", 0) == 0:
+        return "LCS: no connectivity data yet"
+
+    def _mean(vals: List[float], default: float = 0.0) -> float:
+        return float(np.mean(vals)) if vals else default
+
+    def _median(vals: List[float]) -> Optional[float]:
+        return float(np.median(vals)) if vals else None
+
+    avg_paths = _mean(summary.get("paths1", []))
+    avg_disjoint = _mean(summary.get("disjoint1", []))
+    mean_delta = _mean(summary.get("delta_paths", []))
+    med_detour = _median(summary.get("detour", []))
+    med_tth = _median(summary.get("time_to_heal", []))
+    connected_ratio = (
+        float(summary.get("connected", 0)) / float(summary.get("count", 1))
+        if summary.get("count", 0)
+        else 0.0
+    )
+    detour_str = f"detour≈{med_detour:.2f}" if med_detour is not None else "detour=—"
+    tth_str = f"Tth≈{med_tth:.1f}" if med_tth is not None else "Tth=—"
+    return (
+        f"altμ {avg_paths:.2f} | disjointμ {avg_disjoint:.2f} | Δpaths {mean_delta:+.2f} | "
+        f"{detour_str} | {tth_str} | conn {connected_ratio:.2f} | "
+        f"H:{summary.get('heals', 0)} B:{summary.get('breaks', 0)} | Δedges {summary.get('changed_edges', 0)}"
+    )
+
+
+def export_lcs_ribbon_png(
+    lcs_rows: List[Dict[str, Any]],
+    path: str,
+    series: Optional[Dict[str, Any]] = None,
+    outputs: Optional[Iterable[int]] = None,
+    dpi: int = 200,
+) -> Optional[str]:
+    if not lcs_rows:
+        return None
+    if series is None:
+        series = _prepare_lcs_series(lcs_rows)
+    outputs_list = list(outputs) if outputs is not None else list(series.get("outputs", []))
+    if not outputs_list:
+        return None
+
+    import matplotlib.pyplot as _plt
+
+    styles = ["solid", (0, (1, 1)), (0, (5, 1, 1, 1)), (0, (3, 2, 1, 2))]
+    markers = ["o", "s", "^", "v", "D", "P", "X", "+"]
+
+    fig, axes = _plt.subplots(3, 1, sharex=True, figsize=(7.2, 7.4), dpi=dpi)
+    detour_values = []
+    for _row in lcs_rows:
+        val = _row.get("detour")
+        if val is not None and not np.isnan(val):
+            detour_values.append(float(val))
+    alt_max = max((r.get("P1", 0) or 0) for r in lcs_rows)
+    dis_max = max((r.get("disjoint_paths1", 0) or 0) for r in lcs_rows)
+
+    for idx, out_id in enumerate(outputs_list):
+        data_dict = series.get("per_output", {}).get(out_id)  # type: ignore
+        if not data_dict:
+            continue
+        gens = list(data_dict.keys())
+        alt = [data_dict[g]["P1"] for g in gens]
+        dis = [data_dict[g]["disjoint_paths1"] for g in gens]
+        det = [data_dict[g]["detour"] if data_dict[g]["detour"] is not None else np.nan for g in gens]
+        conn = [data_dict[g]["R1"] for g in gens]
+        heals = [data_dict[g]["heal_flag"] for g in gens]
+        style = styles[idx % len(styles)]
+        marker = markers[idx % len(markers)]
+        label = f"output {out_id}"
+        axes[0].plot(gens, alt, linestyle=style, marker=marker, markersize=4.0, color="black", linewidth=1.5, label=label)
+        axes[1].plot(gens, dis, linestyle=style, marker=marker, markersize=4.0, color="black", linewidth=1.5)
+        axes[2].plot(gens, det, linestyle=style, marker=marker, markersize=4.0, color="black", linewidth=1.5)
+        for g_val, alt_val, connected in zip(gens, alt, conn):
+            if not connected:
+                axes[0].scatter([g_val], [alt_val], marker="x", color="black", s=36, linewidths=1.2)
+        for g_val, alt_val, heal, det_val in zip(gens, alt, heals, det):
+            if heal:
+                axes[0].scatter([g_val], [alt_val], marker="D", facecolors="none", edgecolors="black", s=58, linewidths=1.0)
+                if not np.isnan(det_val):
+                    axes[2].scatter([g_val], [det_val], marker="D", facecolors="none", edgecolors="black", s=58, linewidths=1.0)
+
+    axes[0].set_ylabel("alt paths")
+    axes[1].set_ylabel("edge-disjoint")
+    axes[2].set_ylabel("detour")
+    axes[2].set_xlabel("generation")
+    axes[0].set_ylim(-0.1, max(1.0, alt_max) + 1.0)
+    axes[1].set_ylim(-0.1, max(1.0, dis_max) + 1.0)
+    if detour_values:
+        d_min = min(detour_values)
+        d_max = max(detour_values)
+        pad = max(0.05, 0.05 * d_max)
+        axes[2].set_ylim(max(0.0, d_min - pad), d_max + pad)
+    else:
+        axes[2].set_ylim(0.8, 1.4)
+    axes[0].legend(loc="upper left", frameon=False)
+    for ax in axes:
+        ax.grid(True, color="0.85", linestyle=(0, (1, 3)), linewidth=0.6)
+
+    last_gen = series.get("generations", [])[-1] if series.get("generations") else None
+    _, summary = _latest_gen_summary(series, last_gen) if last_gen is not None else (None, None)
+    summary_text = _format_lcs_summary(summary)
+    fig.suptitle("Local Continuity Signature overview", y=0.98, fontsize=12)
+    fig.text(0.02, 0.03, summary_text, fontsize=9, family="monospace")
+    fig.tight_layout(rect=[0, 0.06, 1, 0.95])
+    fig.savefig(path, dpi=dpi)
+    _plt.close(fig)
+    return path
+
+
+def export_lcs_timeline_gif(
+    lcs_rows: List[Dict[str, Any]],
+    path: str,
+    series: Optional[Dict[str, Any]] = None,
+    fps: int = 6,
+    dpi: int = 150,
+) -> Optional[str]:
+    if not lcs_rows:
+        return None
+    if series is None:
+        series = _prepare_lcs_series(lcs_rows)
+    gens = list(series.get("generations", []))
+    if not gens:
+        return None
+
+    import matplotlib.pyplot as _plt
+
+    styles = ["solid", (0, (1, 1)), (0, (5, 1, 1, 1)), (0, (3, 2, 1, 2))]
+    markers = ["o", "s", "^", "v", "D", "P", "X", "+"]
+    first_gen = gens[0]
+    alt_max = max((r.get("P1", 0) or 0) for r in lcs_rows)
+    dis_max = max((r.get("disjoint_paths1", 0) or 0) for r in lcs_rows)
+    detour_values = []
+    for _row in lcs_rows:
+        val = _row.get("detour")
+        if val is not None and not np.isnan(val):
+            detour_values.append(float(val))
+    if detour_values:
+        d_min = min(detour_values)
+        d_max = max(detour_values)
+        pad = max(0.05, 0.05 * d_max)
+        det_ylim = (max(0.0, d_min - pad), d_max + pad)
+    else:
+        det_ylim = (0.8, 1.4)
+
+    frames = []
+    for upto in gens:
+        fig, axes = _plt.subplots(3, 1, sharex=True, figsize=(6.4, 5.6), dpi=dpi)
+        for idx, out_id in enumerate(series.get("outputs", [])):
+            data_dict = series.get("per_output", {}).get(out_id)  # type: ignore
+            if not data_dict:
+                continue
+            use_gens = [g for g in data_dict.keys() if g <= upto]
+            if not use_gens:
+                continue
+            alt = [data_dict[g]["P1"] for g in use_gens]
+            dis = [data_dict[g]["disjoint_paths1"] for g in use_gens]
+            det = [data_dict[g]["detour"] if data_dict[g]["detour"] is not None else np.nan for g in use_gens]
+            conn = [data_dict[g]["R1"] for g in use_gens]
+            heals = [data_dict[g]["heal_flag"] for g in use_gens]
+            style = styles[idx % len(styles)]
+            marker = markers[idx % len(markers)]
+            label = f"output {out_id}" if upto == first_gen else "_nolegend_"
+            axes[0].plot(use_gens, alt, linestyle=style, marker=marker, markersize=4.0, color="black", linewidth=1.4, label=label)
+            axes[1].plot(use_gens, dis, linestyle=style, marker=marker, markersize=4.0, color="black", linewidth=1.4)
+            axes[2].plot(use_gens, det, linestyle=style, marker=marker, markersize=4.0, color="black", linewidth=1.4)
+            for g_val, alt_val, connected in zip(use_gens, alt, conn):
+                if not connected:
+                    axes[0].scatter([g_val], [alt_val], marker="x", color="black", s=32, linewidths=1.1)
+            for g_val, alt_val, heal, det_val in zip(use_gens, alt, heals, det):
+                if heal:
+                    axes[0].scatter([g_val], [alt_val], marker="D", facecolors="none", edgecolors="black", s=54, linewidths=1.0)
+                    if not np.isnan(det_val):
+                        axes[2].scatter([g_val], [det_val], marker="D", facecolors="none", edgecolors="black", s=54, linewidths=1.0)
+
+        for ax in axes:
+            ax.axvline(upto, color="0.35", linestyle=(0, (2, 3)), linewidth=1.0)
+            ax.grid(True, color="0.85", linestyle=(0, (1, 3)), linewidth=0.6)
+
+        axes[0].set_ylabel("alt paths")
+        axes[1].set_ylabel("edge-disjoint")
+        axes[2].set_ylabel("detour")
+        axes[2].set_xlabel("generation")
+        axes[0].set_ylim(-0.1, max(1.0, alt_max) + 1.0)
+        axes[1].set_ylim(-0.1, max(1.0, dis_max) + 1.0)
+        axes[2].set_ylim(*det_ylim)
+        axes[0].legend(loc="upper left", frameon=False)
+
+        gen_key, summary = _latest_gen_summary(series, upto)
+        summary_line = _format_lcs_summary(summary)
+        cumulative = [r for r in lcs_rows if r.get("gen") is not None and r["gen"] <= upto]
+        cum_heals = sum(r.get("heal_flag", 0) for r in cumulative)
+        cum_breaks = sum(1 for r in cumulative if r.get("R0", 0) == 1 and r.get("R1", 0) == 0)
+        fig.suptitle(f"LCS timeline ≤ Gen {upto}", y=0.97, fontsize=12)
+        fig.text(0.02, 0.06, summary_line, fontsize=9, family="monospace")
+        fig.text(0.02, 0.03, f"cum heals {cum_heals} | cum breaks {cum_breaks}", fontsize=8, family="monospace")
+        fig.tight_layout(rect=[0, 0.08, 1, 0.95])
+        frame = _fig_to_rgb(fig)
+        _plt.close(fig)
+        frames.append(frame)
+
+    if not frames:
+        return None
+    _mimsave(path, frames, fps=max(1, fps))
+    return path
 def compatibility_distance(g1: Genome, g2: Genome, c1=1.0, c2=1.0, c3=0.4):
     innovs1 = sorted(g1.connections.keys()); innovs2 = sorted(g2.connections.keys())
     i=j=0; E=D=0; W_diffs=[]
@@ -1983,7 +2336,7 @@ def make_spirals(n=512, noise=0.1, turns=1.5, seed=0):
     y = np.concatenate([np.zeros(n2, dtype=np.int32), np.ones(n2, dtype=np.int32)])
     return X, y
 
-def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True):
+def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True, rng_seed: int = 0):
     # dataset
     if task=="xor": Xtr,ytr = make_xor(512, noise=0.05, seed=0); Xva,yva = make_xor(256, noise=0.05, seed=1)
     elif task=="spiral": Xtr,ytr = make_spirals(512, noise=0.05, turns=1.5, seed=0); Xva,yva = make_spirals(256, noise=0.05, turns=1.5, seed=1)
@@ -2024,6 +2377,8 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         verbose=True,
         env_schedule=_default_difficulty_schedule,
     )
+    lcs_rows = load_lcs_log(regen_log_path) if os.path.exists(regen_log_path) else []
+    lcs_series = _prepare_lcs_series(lcs_rows) if lcs_rows else None
     # Outputs
     out_dir = os.path.dirname(out_prefix) or "."
     os.makedirs(out_dir, exist_ok=True)
@@ -2052,6 +2407,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
             decay_horizon=6.0,
             fixed_layout=True,
             dpi=150,
+            lcs_series=lcs_series,
         )
         morph_gif = f"{out_prefix}_morph.gif"
         export_morph_gif(
@@ -2062,6 +2418,22 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
             morph_frames=14,
             decay_horizon=8.0,
         )
+
+    lcs_ribbon = None
+    lcs_timeline = None
+    if lcs_rows:
+        ribbon_path = f"{out_prefix}_lcs_ribbon.png"
+        try:
+            export_lcs_ribbon_png(lcs_rows, ribbon_path, series=lcs_series)
+            lcs_ribbon = ribbon_path
+        except Exception as ribbon_err:
+            print("[WARN] LCS ribbon export failed:", ribbon_err)
+        timeline_path = f"{out_prefix}_lcs_timeline.gif"
+        try:
+            export_lcs_timeline_gif(lcs_rows, timeline_path, series=lcs_series, fps=6)
+            lcs_timeline = timeline_path
+        except Exception as timeline_err:
+            print("[WARN] LCS timeline export failed:", timeline_err)
 
     # 螺旋再生ヒートマップ
     scars_spiral = None
@@ -2094,6 +2466,8 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         "scars_spiral": scars_spiral,
         "summary_decisions": summary_paths,
         "lcs_log": regen_log_path if os.path.exists(regen_log_path) else None,
+        "lcs_ribbon": lcs_ribbon,
+        "lcs_timeline": lcs_timeline,
     }
 
 # === backend-agnostic Figure -> RGB helper ===
@@ -2140,11 +2514,13 @@ def export_regen_gif(
     pulse_period_frames=16,
     decay_horizon=10.0,
     fixed_layout=True,
-    dpi=130
+    dpi=130,
+    lcs_series: Optional[Dict[str, Any]] = None,
 ):
     """
     Render a regeneration digest GIF from per-generation snapshots.
     Encodes differences without color semantics: linestyle/linewidth/alpha only.
+    When lcs_series is provided, overlays per-generation LCS summary text.
     """
     import numpy as _np
     import matplotlib.pyplot as _plt
@@ -2241,6 +2617,24 @@ def export_regen_gif(
                 amp = _pulse_amp(age, t)
                 circ = _plt.Circle((x, y), 0.018 + 0.012 * amp, fill=False, linewidth=1.0 + 2.0 * amp, alpha=0.6)
                 ax.add_patch(circ)
+
+        summary_line = None
+        cum_line = None
+        gen_label = f"generation {t}"
+        if lcs_series is not None:
+            _, summary = _latest_gen_summary(lcs_series, t)
+            summary_line = _format_lcs_summary(summary)
+            heals_cum, breaks_cum = _cumulative_lcs_counts(lcs_series, t)
+            cum_line = f"cum heals {heals_cum} | cum breaks {breaks_cum}"
+        if summary_line or cum_line:
+            fig.subplots_adjust(bottom=0.28)
+            fig.text(0.02, 0.18, summary_line or "", fontsize=8, family="monospace")
+            if cum_line:
+                fig.text(0.02, 0.11, cum_line, fontsize=7, family="monospace")
+            fig.text(0.02, 0.06, gen_label, fontsize=7, family="monospace")
+        else:
+            fig.subplots_adjust(bottom=0.08)
+            fig.text(0.02, 0.05, gen_label, fontsize=7, family="monospace")
 
         img = _fig_to_rgb(fig)
         frames.append(img)
@@ -3018,6 +3412,9 @@ def run_gym_neat_experiment(
     )
     best, hist = neat.evolve(fit, n_generations=gens, verbose=True, env_schedule=_default_difficulty_schedule)
 
+    lcs_rows = load_lcs_log(regen_log_path) if os.path.exists(regen_log_path) else []
+    lcs_series = _prepare_lcs_series(lcs_rows) if lcs_rows else None
+
     close_env = getattr(fit, "close_env", None)
     if callable(close_env):
         close_env()
@@ -3038,11 +3435,29 @@ def run_gym_neat_experiment(
     plt.savefig(rc_png, dpi=150)
     plt.close()
 
+    lcs_ribbon = None
+    lcs_timeline = None
+    if lcs_rows:
+        ribbon_path = f"{out_prefix}_lcs_ribbon.png"
+        try:
+            export_lcs_ribbon_png(lcs_rows, ribbon_path, series=lcs_series)
+            lcs_ribbon = ribbon_path
+        except Exception as ribbon_err:
+            print("[WARN] LCS ribbon export failed:", ribbon_err)
+        timeline_path = f"{out_prefix}_lcs_timeline.gif"
+        try:
+            export_lcs_timeline_gif(lcs_rows, timeline_path, series=lcs_series, fps=6)
+            lcs_timeline = timeline_path
+        except Exception as timeline_err:
+            print("[WARN] LCS timeline export failed:", timeline_err)
+
     return {
         "best": best,
         "history": hist,
         "reward_curve": rc_png,
         "lcs_log": regen_log_path if os.path.exists(regen_log_path) else None,
+        "lcs_ribbon": lcs_ribbon,
+        "lcs_timeline": lcs_timeline,
     }
 
 
@@ -3099,6 +3514,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         regen_log = res.get("lcs_log")
         if regen_log and os.path.exists(regen_log):
             figs["LCS Healing Log"] = regen_log
+        ribbon = res.get("lcs_ribbon")
+        if ribbon and os.path.exists(ribbon):
+            figs["LCS Ribbon"] = ribbon
+        timeline = res.get("lcs_timeline")
+        if timeline and os.path.exists(timeline):
+            figs["LCS Timeline"] = timeline
 
         if args.gallery:
             gal = export_task_gallery(
@@ -3169,8 +3590,23 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             plt.savefig(rc_png, dpi=150)
             plt.close()
             figs["RL 平均エピソード報酬"] = rc_png
+            lcs_rows = load_lcs_log(regen_log_path) if os.path.exists(regen_log_path) else []
+            lcs_series = _prepare_lcs_series(lcs_rows) if lcs_rows else None
             if os.path.exists(regen_log_path):
                 figs[f"LCS Healing Log ({args.rl_env})"] = regen_log_path
+            if lcs_rows:
+                ribbon_path = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_lcs_ribbon.png")
+                try:
+                    export_lcs_ribbon_png(lcs_rows, ribbon_path, series=lcs_series)
+                    figs[f"LCS Ribbon ({args.rl_env})"] = ribbon_path
+                except Exception as ribbon_err:
+                    print("[WARN] LCS ribbon export failed:", ribbon_err)
+                timeline_path = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_lcs_timeline.gif")
+                try:
+                    export_lcs_timeline_gif(lcs_rows, timeline_path, series=lcs_series, fps=6)
+                    figs[f"LCS Timeline ({args.rl_env})"] = timeline_path
+                except Exception as timeline_err:
+                    print("[WARN] LCS timeline export failed:", timeline_err)
             if args.rl_gameplay_gif:
                 gif = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_gameplay.gif")
                 try:
