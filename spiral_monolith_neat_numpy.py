@@ -377,13 +377,15 @@ class Genome:
 def summarize_graph_changes(adj0: Dict[int, List[Tuple[int, float]]],
                             adj1: Dict[int, List[Tuple[int, float]]],
                             weight_tol: float = 1e-9) -> Tuple[Set[int], int]:
-    """Return the set of nodes touched by structural changes and edge-change count."""
+    """Return nodes and edge-count touched by structural/weight deltas (|w|<=tol treated absent)."""
     def collect(adj):
         edges = {}
         nodes = set(adj.keys())
         for u, nbrs in adj.items():
             nodes.add(u)
             for v, w in nbrs:
+                if abs(w) <= weight_tol:
+                    continue
                 edges[(u, v)] = w
                 nodes.add(v)
         return edges, nodes
@@ -556,6 +558,8 @@ class LCSMonitor:
             for nbrs in adj.values():
                 for v, _ in nbrs:
                     nodes.add(v)
+            nodes.update(self.inputs)
+            nodes.update(self.outputs)
             return nodes
         scope = set(changed_nodes)
         frontier = list(changed_nodes)
@@ -572,6 +576,8 @@ class LCSMonitor:
                         scope.add(p)
                         nxt.append(p)
             frontier = nxt
+        scope.update(self.inputs)
+        scope.update(self.outputs)
         return scope
 
     def _induced_adj(self, adj, nodes):
@@ -652,6 +658,72 @@ class LCSMonitor:
             dist[v] = best
         return dist
 
+    def _build_unit_capacity_graph(self, adj):
+        base = {}
+        for u, nbrs in adj.items():
+            base.setdefault(u, {})
+            for v, _ in nbrs:
+                base[u][v] = 1
+                base.setdefault(v, {})
+        # ensure reverse edges present with zero capacity for residual graph
+        for u, nbrs in list(base.items()):
+            for v in list(nbrs.keys()):
+                base.setdefault(v, {})
+                base[v].setdefault(u, 0)
+        return base
+
+    def _max_flow(self, graph, source, sink):
+        if sink not in graph:
+            return 0
+        flow = 0
+        limit = self.K
+        while flow < limit:
+            parent = {source: None}
+            q = deque([source])
+            while q and sink not in parent:
+                u = q.popleft()
+                for v, cap in graph.get(u, {}).items():
+                    if cap > 0 and v not in parent:
+                        parent[v] = u
+                        if v == sink:
+                            break
+                        q.append(v)
+            if sink not in parent:
+                break
+            # compute bottleneck capacity
+            v = sink
+            path_cap = limit - flow
+            while parent[v] is not None:
+                u = parent[v]
+                path_cap = min(path_cap, graph[u][v])
+                v = u
+            # update residual capacities
+            v = sink
+            while parent[v] is not None:
+                u = parent[v]
+                graph[u][v] -= path_cap
+                graph[v].setdefault(u, 0)
+                graph[v][u] += path_cap
+                v = u
+            flow += path_cap
+        return int(flow)
+
+    def _edge_disjoint_counts(self, adj):
+        base = self._build_unit_capacity_graph(adj)
+        source = "__source__"
+        counts = {}
+        # Connect super-source to all inputs present in the scoped graph
+        base[source] = {}
+        capacity = max(len(base), 1)
+        for s in self.inputs:
+            if s in base:
+                base[source][s] = capacity
+                base[s].setdefault(source, 0)
+        for o in self.outputs:
+            graph = {u: dict(vs) for u, vs in base.items()}
+            counts[o] = self._max_flow(graph, source, o)
+        return counts
+
     def _compute_metrics(self, G0, G1, changed_nodes, changed_edges, lineage_id, gen, mut_id):
         adj0 = self._filtered_adj(G0)
         adj1 = self._filtered_adj(G1)
@@ -672,6 +744,9 @@ class LCSMonitor:
         dist0 = self._shortest_len_DAG(order0, parents0)
         dist1 = self._shortest_len_DAG(order1, parents1)
 
+        disjoint0 = self._edge_disjoint_counts(adj0s)
+        disjoint1 = self._edge_disjoint_counts(adj1s)
+
         rows = []
         for o in self.outputs:
             R0 = int(o in reach0)
@@ -687,6 +762,8 @@ class LCSMonitor:
                 delta_sp = d1 - d0
             elif d0 < INF and d1 < INF:
                 delta_sp = d1 - d0
+            dis0 = disjoint0.get(o, 0)
+            dis1 = disjoint1.get(o, 0)
             rows.append({
                 "gen": gen,
                 "lineage_id": lineage_id,
@@ -705,8 +782,8 @@ class LCSMonitor:
                 "delta_sp": delta_sp if delta_sp != "" else "",
                 "heal_flag": 0,
                 "time_to_heal": "",
-                "disjoint_paths0": "",
-                "disjoint_paths1": "",
+                "disjoint_paths0": dis0,
+                "disjoint_paths1": dis1,
             })
         return rows
 
