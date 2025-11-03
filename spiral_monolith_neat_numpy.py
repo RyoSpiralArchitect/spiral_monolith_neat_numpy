@@ -13,9 +13,10 @@
 #
 # Author: SpiralReality (Ryō) + GPT-5 Pro co-engineering
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
-import math, argparse, os, mimetypes
+from collections import deque, defaultdict
+import math, argparse, os, mimetypes, csv
 import matplotlib
 
 
@@ -98,6 +99,7 @@ __all__ = [
     "plot_learning_and_complexity","plot_decision_boundary",
     "export_decision_boundaries_all","render_lineage","export_scars_spiral_map",
     "output_dim_from_space","build_action_mapper","eval_with_node_activations","run_policy_in_env","run_gym_neat_experiment",
+    "LCSMonitor","summarize_graph_changes",
 ]
 
 @dataclass
@@ -178,6 +180,18 @@ class Genome:
         adj = {}
         for c in self.enabled_connections():
             adj.setdefault(c.in_node, set()).add(c.out_node)
+        return adj
+
+    def weighted_adjacency(self, include_disabled: bool = False):
+        nodes = set(self.nodes.keys())
+        adj: Dict[int, List[Tuple[int, float]]] = {nid: [] for nid in nodes}
+        for c in self.connections.values():
+            if include_disabled or c.enabled:
+                adj.setdefault(c.in_node, []).append((c.out_node, c.weight))
+                if c.out_node not in adj:
+                    adj[c.out_node] = []
+        for nid in nodes:
+            adj.setdefault(nid, [])
         return adj
 
     def has_connection(self, in_id, out_id):
@@ -359,6 +373,37 @@ class Genome:
             vals[nid] = y
         return np.array([vals[nid] for nid in output_ids], dtype=np.float32)
 
+
+def summarize_graph_changes(adj0: Dict[int, List[Tuple[int, float]]],
+                            adj1: Dict[int, List[Tuple[int, float]]],
+                            weight_tol: float = 1e-9) -> Tuple[Set[int], int]:
+    """Return the set of nodes touched by structural changes and edge-change count."""
+    def collect(adj):
+        edges = {}
+        nodes = set(adj.keys())
+        for u, nbrs in adj.items():
+            nodes.add(u)
+            for v, w in nbrs:
+                edges[(u, v)] = w
+                nodes.add(v)
+        return edges, nodes
+
+    edges0, nodes0 = collect(adj0)
+    edges1, nodes1 = collect(adj1)
+
+    changed_nodes: Set[int] = set()
+    changed_edges = 0
+    for edge in set(edges0.keys()).union(edges1.keys()):
+        w0 = edges0.get(edge)
+        w1 = edges1.get(edge)
+        if w0 is None or w1 is None or abs(w0 - w1) > weight_tol:
+            changed_edges += 1
+            changed_nodes.update(edge)
+
+    changed_nodes.update(nodes0.symmetric_difference(nodes1))
+    return changed_nodes, changed_edges
+
+
 def compatibility_distance(g1: Genome, g2: Genome, c1=1.0, c2=1.0, c3=0.4):
     innovs1 = sorted(g1.connections.keys()); innovs2 = sorted(g2.connections.keys())
     i=j=0; E=D=0; W_diffs=[]
@@ -471,6 +516,261 @@ class EvalMode:
     species_low: int = 3
     species_high: int = 8
 
+INF = 10 ** 12
+
+
+@dataclass
+class PairState:
+    status: str = "connected"
+    broke_at: int = -1
+
+
+@dataclass
+class LCSMonitor:
+    inputs: List[int]
+    outputs: List[int]
+    K: int = 5
+    T: int = 3
+    cooldown: int = 1
+    eps: float = 0.0
+    r_hop: int = 0
+    csv_path: str = "regen_log.csv"
+    _pair_state: Dict[int, PairState] = field(default_factory=dict)
+    _last_heal_gen: Dict[int, int] = field(default_factory=dict)
+
+    def _filtered_adj(self, adj):
+        out = {u: [] for u in adj}
+        for u, nbrs in adj.items():
+            bucket = out.setdefault(u, [])
+            for v, w in nbrs:
+                if abs(w) > self.eps:
+                    bucket.append((v, w))
+                    out.setdefault(v, [])
+        for node in self.inputs + self.outputs:
+            out.setdefault(node, [])
+        return out
+
+    def _nodes_in_scope(self, adj, changed_nodes):
+        if self.r_hop <= 0 or not changed_nodes:
+            nodes = set(adj.keys())
+            for nbrs in adj.values():
+                for v, _ in nbrs:
+                    nodes.add(v)
+            return nodes
+        scope = set(changed_nodes)
+        frontier = list(changed_nodes)
+        for _ in range(self.r_hop):
+            nxt = []
+            for u in frontier:
+                for v, _ in adj.get(u, ()):  # forward
+                    if v not in scope:
+                        scope.add(v)
+                        nxt.append(v)
+            for p, nbrs in adj.items():  # backward one hop
+                for v, _ in nbrs:
+                    if v in frontier and p not in scope:
+                        scope.add(p)
+                        nxt.append(p)
+            frontier = nxt
+        return scope
+
+    def _induced_adj(self, adj, nodes):
+        out = {u: [] for u in nodes}
+        for u in nodes:
+            for v, w in adj.get(u, ()):  # type: ignore[arg-type]
+                if v in nodes:
+                    out[u].append((v, w))
+        return out
+
+    def _topo_order(self, adj):
+        nodes = set(adj.keys())
+        for nbrs in adj.values():
+            for v, _ in nbrs:
+                nodes.add(v)
+        indeg = {v: 0 for v in nodes}
+        for u, nbrs in adj.items():
+            for v, _ in nbrs:
+                indeg[v] = indeg.get(v, 0) + 1
+        queue = deque([v for v in nodes if indeg.get(v, 0) == 0])
+        order = []
+        while queue:
+            v = queue.popleft()
+            order.append(v)
+            for w, _ in adj.get(v, ()):  # type: ignore[arg-type]
+                indeg[w] -= 1
+                if indeg[w] == 0:
+                    queue.append(w)
+        if len(order) != len(nodes):
+            raise ValueError("Graph has a cycle; LCS expects a DAG or SCC-condensed DAG.")
+        parents = {v: [] for v in nodes}
+        for u, nbrs in adj.items():
+            for v, _ in nbrs:
+                parents[v].append(u)
+        return order, parents
+
+    def _reachable_from_inputs(self, adj):
+        seen = set()
+        queue = deque(self.inputs)
+        for s in self.inputs:
+            seen.add(s)
+        while queue:
+            u = queue.popleft()
+            for v, _ in adj.get(u, ()):  # type: ignore[arg-type]
+                if v not in seen:
+                    seen.add(v)
+                    queue.append(v)
+        return seen
+
+    def _count_paths_DAG(self, order, parents):
+        paths = defaultdict(int)
+        for s in self.inputs:
+            paths[s] = 1
+        for v in order:
+            if v in self.inputs:
+                continue
+            total = 0
+            for u in parents.get(v, ()):  # type: ignore[arg-type]
+                total += paths[u]
+                if total >= self.K:
+                    total = self.K
+                    break
+            paths[v] = min(total, self.K)
+        return paths
+
+    def _shortest_len_DAG(self, order, parents):
+        dist = {v: INF for v in order}
+        for s in self.inputs:
+            dist[s] = 0
+        for v in order:
+            if v in self.inputs:
+                continue
+            best = INF
+            for u in parents.get(v, ()):  # type: ignore[arg-type]
+                cand = dist.get(u, INF)
+                if cand + 1 < best:
+                    best = cand + 1
+            dist[v] = best
+        return dist
+
+    def _compute_metrics(self, G0, G1, changed_nodes, changed_edges, lineage_id, gen, mut_id):
+        adj0 = self._filtered_adj(G0)
+        adj1 = self._filtered_adj(G1)
+
+        scope_nodes = self._nodes_in_scope(adj1, changed_nodes)
+        adj0s = self._induced_adj(adj0, scope_nodes)
+        adj1s = self._induced_adj(adj1, scope_nodes)
+
+        order0, parents0 = self._topo_order(adj0s)
+        order1, parents1 = self._topo_order(adj1s)
+
+        reach0 = self._reachable_from_inputs(adj0s)
+        reach1 = self._reachable_from_inputs(adj1s)
+
+        paths0 = self._count_paths_DAG(order0, parents0)
+        paths1 = self._count_paths_DAG(order1, parents1)
+
+        dist0 = self._shortest_len_DAG(order0, parents0)
+        dist1 = self._shortest_len_DAG(order1, parents1)
+
+        rows = []
+        for o in self.outputs:
+            R0 = int(o in reach0)
+            R1 = int(o in reach1)
+            P0 = int(min(self.K, paths0.get(o, 0)))
+            P1 = int(min(self.K, paths1.get(o, 0)))
+            d0 = dist0.get(o, INF)
+            d1 = dist1.get(o, INF)
+            detour = ""
+            delta_sp = ""
+            if R0 and R1 and d0 < INF and d1 < INF and d0 > 0:
+                detour = float(d1) / float(d0)
+                delta_sp = d1 - d0
+            elif d0 < INF and d1 < INF:
+                delta_sp = d1 - d0
+            rows.append({
+                "gen": gen,
+                "lineage_id": lineage_id,
+                "mut_id": mut_id,
+                "o": o,
+                "changed_nodes": len(changed_nodes),
+                "changed_edges": changed_edges,
+                "R0": R0,
+                "R1": R1,
+                "P0": P0,
+                "P1": P1,
+                "d0": "" if d0 >= INF else int(d0),
+                "d1": "" if d1 >= INF else int(d1),
+                "detour": detour,
+                "delta_paths": P1 - P0,
+                "delta_sp": delta_sp if delta_sp != "" else "",
+                "heal_flag": 0,
+                "time_to_heal": "",
+                "disjoint_paths0": "",
+                "disjoint_paths1": "",
+            })
+        return rows
+
+    def _update_heal_flags(self, gen, rows):
+        updated = []
+        for row in rows:
+            o = row["o"]
+            state = self._pair_state.setdefault(o, PairState())
+            last_heal = self._last_heal_gen.get(o, -INF)
+            R0 = bool(row["R0"])
+            R1 = bool(row["R1"])
+            if state.status == "connected":
+                if R0 and not R1:
+                    state.status = "broken"
+                    state.broke_at = gen
+            else:
+                if R1:
+                    tth = gen - state.broke_at
+                    if tth <= self.T and gen - last_heal > self.cooldown:
+                        row["heal_flag"] = 1
+                        row["time_to_heal"] = tth
+                        self._last_heal_gen[o] = gen
+                    state.status = "connected"
+                    state.broke_at = -1
+            updated.append(row)
+        return updated
+
+    def log_step(self, G_prev, G_post, changed_nodes, lineage_id, gen, mut_id, changed_edges=0):
+        rows = self._compute_metrics(G_prev, G_post, set(changed_nodes), changed_edges, lineage_id, gen, mut_id)
+        rows = self._update_heal_flags(gen, rows)
+        header = [
+            "gen",
+            "lineage_id",
+            "mut_id",
+            "o",
+            "changed_nodes",
+            "changed_edges",
+            "R0",
+            "R1",
+            "P0",
+            "P1",
+            "d0",
+            "d1",
+            "detour",
+            "delta_paths",
+            "delta_sp",
+            "heal_flag",
+            "time_to_heal",
+            "disjoint_paths0",
+            "disjoint_paths1",
+        ]
+        need_header = not os.path.exists(self.csv_path)
+        try:
+            with open(self.csv_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=header)
+                if need_header:
+                    writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+        except Exception as exc:  # pragma: no cover - logging failure should not crash
+            print(f"[LCS] CSV write error: {exc}")
+        return rows
+
+
 class ReproPlanaNEATPlus:
     def __init__(self, num_inputs, num_outputs, population_size=150, rng=None, output_activation='sigmoid'):
         self.num_inputs = num_inputs; self.num_outputs = num_outputs; self.pop_size = population_size
@@ -506,6 +806,10 @@ class ReproPlanaNEATPlus:
             g.embryo_bias = 'inputward'
             g.id = self.next_gid; self.next_gid += 1; g.birth_gen = 0
             self.population.append(g)
+
+        input_ids = list(range(num_inputs)) + [bias_id]
+        output_ids = list(range(num_inputs, num_inputs + num_outputs))
+        self.lcs_monitor = LCSMonitor(inputs=input_ids, outputs=output_ids)
 
         # Params
         self.generation = 0
@@ -633,12 +937,19 @@ class ReproPlanaNEATPlus:
             females = [g for g,_ in sp.members if g.sex=='female'] or females
             males   = [g for g,_ in sp.members if g.sex=='male'] or males
         mix_ratio=self._mix_asexual_ratio()
+        monitor = getattr(self, "lcs_monitor", None)
+        weight_tol = max(getattr(monitor, "eps", 0.0), 1e-9) if monitor is not None else 1e-9
         while remaining>0:
             mode=None
+            mother_id=None; father_id=None
+            parent_adj_before_regen=None
             if self.rng.random()<mix_ratio:
                 parent=pool[int(self.rng.integers(len(pool)))]
                 if parent.regen and self.mode.enable_regen_reproduction:
-                    child = platyregenerate(parent, self.rng, self.innov, intensity=self._regen_intensity()); mode='asexual_regen'
+                    if monitor is not None:
+                        parent_adj_before_regen = parent.weighted_adjacency()
+                    child = platyregenerate(parent, self.rng, self.innov, intensity=self._regen_intensity())
+                    mode='asexual_regen'
                 else:
                     child=parent.copy(); mode='asexual_clone'
                 mother_id=parent.id; father_id=None
@@ -662,13 +973,23 @@ class ReproPlanaNEATPlus:
                             else:
                                 child=parent.copy(); mode='asexual_clone'
                                 mother_id=parent.id; father_id=None
-                                child.id=self.next_gid; self.next_gid+=1; child.parents=(mother_id,father_id); child.birth_gen=self.generation+1
-                                self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
-                                self._mutate(child); new_pop.append(child); events[mode]+=1; remaining-=1; continue
-                child=self._crossover_maternal_biased(mother,father,sp_for_fit); child.hybrid_scale=self._heterosis_scale(mother,father); mother_id=mother.id; father_id=father.id
+                if mode in ('sexual_within','sexual_cross'):
+                    child=self._crossover_maternal_biased(mother,father,sp_for_fit); child.hybrid_scale=self._heterosis_scale(mother,father); mother_id=mother.id; father_id=father.id
             child.id=self.next_gid; self.next_gid+=1; child.parents=(mother_id,father_id); child.birth_gen=self.generation+1
             self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
-            self._mutate(child); new_pop.append(child); events[mode]+=1; remaining-=1
+            if monitor is not None and parent_adj_before_regen is not None:
+                regen_adj = child.weighted_adjacency()
+                changed_nodes, changed_edges = summarize_graph_changes(parent_adj_before_regen, regen_adj, weight_tol)
+                monitor.log_step(parent_adj_before_regen, regen_adj, changed_nodes, child.id, self.generation+1, f"{child.id}_regen", changed_edges=changed_edges)
+            pre_adj = child.weighted_adjacency() if monitor is not None else None
+            self._mutate(child)
+            if monitor is not None and pre_adj is not None:
+                post_adj = child.weighted_adjacency()
+                changed_nodes, changed_edges = summarize_graph_changes(pre_adj, post_adj, weight_tol)
+                monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation+1, f"{child.id}_{mode}", changed_edges=changed_edges)
+            if mode is None:
+                mode = 'asexual_clone'
+            new_pop.append(child); events[mode]+=1; remaining-=1
         return new_pop, events
 
     def reproduce(self, species, fitnesses):
@@ -684,6 +1005,8 @@ class ReproPlanaNEATPlus:
             while diff!=0:
                 idx=int(idxs[i%len(idxs)]); offspring_counts[idx]+=1 if diff>0 else -1; diff += -1 if diff>0 else 1; i+=1
         new_pop=[]; gen_events={'sexual_within':0,'sexual_cross':0,'asexual_regen':0,'asexual_clone':0}
+        monitor = getattr(self, "lcs_monitor", None)
+        weight_tol = max(getattr(monitor, "eps", 0.0), 1e-9) if monitor is not None else 1e-9
         for sidx,sp in enumerate(species):
             offspring,events=self._make_offspring(species,offspring_counts,sidx,species)
             for k,v in events.items(): gen_events[k]+=v
@@ -694,7 +1017,13 @@ class ReproPlanaNEATPlus:
                 parent=bests[int(self.rng.integers(len(bests)))]; child=parent.copy()
                 child.id=self.next_gid; self.next_gid+=1; child.parents=(parent.id,None); child.birth_gen=self.generation+1
                 self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
-                self._mutate(child); new_pop.append(child); gen_events['asexual_clone']+=1
+                pre_adj = child.weighted_adjacency() if monitor is not None else None
+                self._mutate(child)
+                if monitor is not None and pre_adj is not None:
+                    post_adj = child.weighted_adjacency()
+                    changed_nodes, changed_edges = summarize_graph_changes(pre_adj, post_adj, weight_tol)
+                    monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation+1, f"{child.id}_asexual_clone", changed_edges=changed_edges)
+                new_pop.append(child); gen_events['asexual_clone']+=1
         elif len(new_pop)>self.pop_size:
             new_pop=new_pop[:self.pop_size]
         self.population=new_pop; self.event_log.append(gen_events)
@@ -1586,6 +1915,11 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     rng = np.random.default_rng(rng_seed)
     neat = ReproPlanaNEATPlus(num_inputs=2, num_outputs=1, population_size=pop, output_activation='identity', rng=rng)
     _apply_stable_neat_defaults(neat)
+    regen_log_path = f"{out_prefix}_regen_log.csv"
+    if hasattr(neat, "lcs_monitor") and neat.lcs_monitor is not None:
+        neat.lcs_monitor.csv_path = regen_log_path
+        if os.path.exists(regen_log_path):
+            os.remove(regen_log_path)
 
     def fit(g):
         noise_std = float(neat.env.get('noise_std', 0.0))
@@ -1682,6 +2016,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         "lineage": lineage_path,
         "scars_spiral": scars_spiral,
         "summary_decisions": summary_paths,
+        "lcs_log": regen_log_path if os.path.exists(regen_log_path) else None,
     }
 
 # === backend-agnostic Figure -> RGB helper ===
@@ -2588,6 +2923,11 @@ def run_gym_neat_experiment(
     """Convenience wrapper that evolves NEAT agents on a Gym environment."""
 
     neat, env = setup_neat_for_env(env_id, population=pop, output_activation="identity")
+    regen_log_path = f"{out_prefix}_regen_log.csv"
+    if hasattr(neat, "lcs_monitor") and neat.lcs_monitor is not None:
+        neat.lcs_monitor.csv_path = regen_log_path
+        if os.path.exists(regen_log_path):
+            os.remove(regen_log_path)
     try:
         env.close()
     except Exception:
@@ -2621,7 +2961,12 @@ def run_gym_neat_experiment(
     plt.savefig(rc_png, dpi=150)
     plt.close()
 
-    return {"best": best, "history": hist, "reward_curve": rc_png}
+    return {
+        "best": best,
+        "history": hist,
+        "reward_curve": rc_png,
+        "lcs_log": regen_log_path if os.path.exists(regen_log_path) else None,
+    }
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
@@ -2674,6 +3019,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         else:
             figs["図3 決定境界"] = res.get("decision_boundary")
         figs["図4 螺旋再生ヒートマップ"] = res.get("scars_spiral")
+        regen_log = res.get("lcs_log")
+        if regen_log and os.path.exists(regen_log):
+            figs["LCS Healing Log"] = regen_log
 
         if args.gallery:
             gal = export_task_gallery(
@@ -2708,6 +3056,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 output_activation="identity",
             )
             _apply_stable_neat_defaults(neat)
+            regen_log_path = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_regen_log.csv")
+            if hasattr(neat, "lcs_monitor") and neat.lcs_monitor is not None:
+                neat.lcs_monitor.csv_path = regen_log_path
+                if os.path.exists(regen_log_path):
+                    os.remove(regen_log_path)
             fit = gym_fitness_factory(
                 args.rl_env,
                 stochastic=args.rl_stochastic,
@@ -2739,6 +3092,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             plt.savefig(rc_png, dpi=150)
             plt.close()
             figs["RL 平均エピソード報酬"] = rc_png
+            if os.path.exists(regen_log_path):
+                figs[f"LCS Healing Log ({args.rl_env})"] = regen_log_path
             if args.rl_gameplay_gif:
                 gif = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_gameplay.gif")
                 try:
