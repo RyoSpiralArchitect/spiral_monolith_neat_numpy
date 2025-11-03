@@ -3112,8 +3112,15 @@ def export_scars_spiral_map(
             theta_peak, base_peak = _theta_radius(peak_gen)
             px = base_peak * _np.cos(theta_peak)
             py = base_peak * _np.sin(theta_peak)
-            tx = px * 0.82
-            ty = py * 0.82
+            radial_boost = 0.12 + 0.18 * (_np.clip(peak_count / max_count, 0.0, 1.0) if max_count > 0 else 0.0)
+            norm = float(_np.hypot(px, py))
+            if norm < 1e-6:
+                # 極めて中心に近い場合は右方向へ逃がして重なりを回避
+                tx, ty = radial_boost, 0.0
+            else:
+                scale = norm + radial_boost
+                tx = (px / norm) * scale
+                ty = (py / norm) * scale
             ax.annotate(
                 f"Peak gen {peak_gen}\n{peak_count} births",
                 xy=(px, py),
@@ -3122,8 +3129,16 @@ def export_scars_spiral_map(
                 ha="center",
                 va="center",
                 fontsize=8,
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="black", lw=0.6, alpha=0.75),
-                arrowprops=dict(arrowstyle="-", color="black", linewidth=0.65, alpha=0.6),
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="black", lw=0.6, alpha=0.78),
+                arrowprops=dict(
+                    arrowstyle="-",
+                    color="black",
+                    linewidth=0.65,
+                    alpha=0.65,
+                    shrinkA=0,
+                    shrinkB=4.0,
+                    connectionstyle="arc3,rad=0.08",
+                ),
             )
 
     if generation_centers:
