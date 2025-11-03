@@ -1060,31 +1060,54 @@ class LCSMonitor:
         return dist
 
     def _topo_order(self, adj):
+        """Topologically sort a graph.
+
+        Accepts adjacency in two forms:
+          - dict[node] -> list[(neighbor, weight)]
+          - dict[node] -> list[neighbor]  (e.g., from SCC condensation)
+
+        Returns (order, parents) where:
+          - order is a list of nodes in topological order
+          - parents is a dict mapping node -> list of predecessor nodes
+        """
+        def _targets(nbrs):
+            # Support both (v,w) tuples and plain neighbor ints
+            for item in nbrs:
+                if isinstance(item, tuple):
+                    # Expected shape (v, weight)
+                    yield item[0]
+                else:
+                    # Plain neighbor id
+                    yield item
+
         nodes = set(adj.keys())
         for nbrs in adj.values():
-            for v, _ in nbrs:
+            for v in _targets(nbrs):
                 nodes.add(v)
+
         indeg = {v: 0 for v in nodes}
         for u, nbrs in adj.items():
-            for v, _ in nbrs:
+            for v in _targets(nbrs):
                 indeg[v] = indeg.get(v, 0) + 1
+
         queue = deque([v for v in nodes if indeg.get(v, 0) == 0])
         order = []
         while queue:
             v = queue.popleft()
             order.append(v)
-            for w, _ in adj.get(v, ()):  # type: ignore[arg-type]
+            for w in _targets(adj.get(v, ())):  # type: ignore[arg-type]
                 indeg[w] -= 1
                 if indeg[w] == 0:
                     queue.append(w)
+
         if len(order) != len(nodes):
             raise ValueError("Graph has a cycle; LCS expects a DAG or SCC-condensed DAG.")
+
         parents = {v: [] for v in nodes}
         for u, nbrs in adj.items():
-            for v, _ in nbrs:
+            for v in _targets(nbrs):
                 parents[v].append(u)
         return order, parents
-
     def _reachable_from_inputs(self, adj):
         seen = set()
         queue = deque(self.inputs)
