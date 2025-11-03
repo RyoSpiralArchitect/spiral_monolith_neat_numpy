@@ -378,7 +378,7 @@ class Genome:
 
 def summarize_graph_changes(adj0: Dict[int, List[Tuple[int, float]]],
                             adj1: Dict[int, List[Tuple[int, float]]],
-                            weight_tol: float = STRUCTURAL_EPS) -> Tuple[Set[int], int]:
+                            weight_tol: float = 0.0) -> Tuple[Set[int], int]:
     """Return nodes and edge-count touched by structural/weight deltas (|w|<=tol treated absent)."""
     def collect(adj):
         edges = {}
@@ -889,7 +889,7 @@ class LCSMonitor:
     K: int = 5
     T: int = 3
     cooldown: int = 1
-    eps: float = STRUCTURAL_EPS
+    eps: float = 0.0
     r_hop: int = 0
     csv_path: str = "regen_log.csv"
     _pair_state: Dict[int, PairState] = field(default_factory=dict)
@@ -942,6 +942,122 @@ class LCSMonitor:
                 if v in nodes:
                     out[u].append((v, w))
         return out
+
+    def _strongly_connected_components(self, adj):
+        nodes = []
+        seen = set()
+        for u in adj:
+            if u not in seen:
+                nodes.append(u)
+                seen.add(u)
+        for nbrs in adj.values():
+            for v, _ in nbrs:
+                if v not in seen:
+                    nodes.append(v)
+                    seen.add(v)
+        index = {}
+        lowlink = {}
+        stack = []
+        on_stack = set()
+        components = []
+        idx = 0
+
+        def strongconnect(v):
+            nonlocal idx
+            index[v] = idx
+            lowlink[v] = idx
+            idx += 1
+            stack.append(v)
+            on_stack.add(v)
+            for w, _ in adj.get(v, ()):  # pragma: no branch
+                if w not in index:
+                    strongconnect(w)
+                    lowlink[v] = min(lowlink[v], lowlink[w])
+                elif w in on_stack:
+                    lowlink[v] = min(lowlink[v], index[w])
+            if lowlink[v] == index[v]:
+                comp = []
+                while True:
+                    w = stack.pop()
+                    on_stack.remove(w)
+                    comp.append(w)
+                    if w == v:
+                        break
+                components.append(comp)
+
+        for v in nodes:
+            if v not in index:
+                strongconnect(v)
+
+        mapping = {}
+        for cid, comp in enumerate(components):
+            for node in comp:
+                mapping[node] = cid
+        condensed = {cid: [] for cid in range(len(components))}
+        for u, nbrs in adj.items():
+            cu = mapping[u]
+            bucket = condensed.setdefault(cu, [])
+            for v, _ in nbrs:
+                cv = mapping.get(v)
+                if cv is None:
+                    continue
+                if cu != cv:
+                    bucket.append(cv)
+        for cid, nbrs in condensed.items():
+            if nbrs:
+                condensed[cid] = sorted(set(nbrs))
+            else:
+                condensed[cid] = []
+        return components, mapping, condensed
+
+    def _count_paths_with_cycles(self, adj):
+        components, mapping, condensed = self._strongly_connected_components(adj)
+        if not components:
+            return {}
+        try:
+            order, parents = self._topo_order(condensed)
+        except ValueError:  # pragma: no cover - condensation must be a DAG
+            return {}
+        base = defaultdict(int)
+        for s in self.inputs:
+            if s in mapping:
+                base[mapping[s]] += 1
+        comp_paths = {}
+        for cid in order:
+            total = base.get(cid, 0)
+            for parent in parents.get(cid, ()):  # pragma: no branch
+                total += comp_paths.get(parent, 0)
+                if total >= self.K:
+                    total = self.K
+                    break
+            comp_paths[cid] = min(total, self.K)
+        node_paths = {}
+        for node, cid in mapping.items():
+            node_paths[node] = comp_paths.get(cid, 0)
+        return node_paths
+
+    def _shortest_len_unit(self, adj):
+        nodes = set(adj.keys())
+        for nbrs in adj.values():
+            for v, _ in nbrs:
+                nodes.add(v)
+        nodes.update(self.inputs)
+        nodes.update(self.outputs)
+        dist = {node: INF for node in nodes}
+        q = deque()
+        for s in self.inputs:
+            if dist[s] > 0:
+                dist[s] = 0
+                q.append(s)
+        while q:
+            u = q.popleft()
+            du = dist[u]
+            for v, _ in adj.get(u, ()):  # pragma: no branch
+                alt = du + 1
+                if alt < dist.get(v, INF):
+                    dist[v] = alt
+                    q.append(v)
+        return dist
 
     def _topo_order(self, adj):
         nodes = set(adj.keys())
@@ -1087,17 +1203,24 @@ class LCSMonitor:
         adj0s = self._induced_adj(adj0, scope_nodes)
         adj1s = self._induced_adj(adj1, scope_nodes)
 
-        order0, parents0 = self._topo_order(adj0s)
-        order1, parents1 = self._topo_order(adj1s)
-
         reach0 = self._reachable_from_inputs(adj0s)
         reach1 = self._reachable_from_inputs(adj1s)
 
-        paths0 = self._count_paths_DAG(order0, parents0)
-        paths1 = self._count_paths_DAG(order1, parents1)
+        try:
+            order0, parents0 = self._topo_order(adj0s)
+            paths0 = self._count_paths_DAG(order0, parents0)
+            dist0 = self._shortest_len_DAG(order0, parents0)
+        except ValueError:
+            paths0 = self._count_paths_with_cycles(adj0s)
+            dist0 = self._shortest_len_unit(adj0s)
 
-        dist0 = self._shortest_len_DAG(order0, parents0)
-        dist1 = self._shortest_len_DAG(order1, parents1)
+        try:
+            order1, parents1 = self._topo_order(adj1s)
+            paths1 = self._count_paths_DAG(order1, parents1)
+            dist1 = self._shortest_len_DAG(order1, parents1)
+        except ValueError:
+            paths1 = self._count_paths_with_cycles(adj1s)
+            dist1 = self._shortest_len_unit(adj1s)
 
         disjoint0 = self._edge_disjoint_counts(adj0s)
         disjoint1 = self._edge_disjoint_counts(adj1s)
@@ -1241,7 +1364,7 @@ class ReproPlanaNEATPlus:
 
         input_ids = list(range(num_inputs))
         output_ids = list(range(num_inputs, num_inputs + num_outputs))
-        self.lcs_monitor = LCSMonitor(inputs=input_ids, outputs=output_ids, eps=STRUCTURAL_EPS)
+        self.lcs_monitor = LCSMonitor(inputs=input_ids, outputs=output_ids)
 
         # Params
         self.generation = 0
@@ -1370,7 +1493,7 @@ class ReproPlanaNEATPlus:
             males   = [g for g,_ in sp.members if g.sex=='male'] or males
         mix_ratio=self._mix_asexual_ratio()
         monitor = getattr(self, "lcs_monitor", None)
-        weight_tol = max(getattr(monitor, "eps", 0.0), STRUCTURAL_EPS) if monitor is not None else STRUCTURAL_EPS
+        weight_tol = getattr(monitor, "eps", 0.0) if monitor is not None else 0.0
         while remaining>0:
             mode=None
             mother_id=None; father_id=None
@@ -1438,7 +1561,7 @@ class ReproPlanaNEATPlus:
                 idx=int(idxs[i%len(idxs)]); offspring_counts[idx]+=1 if diff>0 else -1; diff += -1 if diff>0 else 1; i+=1
         new_pop=[]; gen_events={'sexual_within':0,'sexual_cross':0,'asexual_regen':0,'asexual_clone':0}
         monitor = getattr(self, "lcs_monitor", None)
-        weight_tol = max(getattr(monitor, "eps", 0.0), STRUCTURAL_EPS) if monitor is not None else STRUCTURAL_EPS
+        weight_tol = getattr(monitor, "eps", 0.0) if monitor is not None else 0.0
         for sidx,sp in enumerate(species):
             offspring,events=self._make_offspring(species,offspring_counts,sidx,species)
             for k,v in events.items(): gen_events[k]+=v
@@ -2888,12 +3011,26 @@ def export_scars_spiral_map(
     heat_x: List[float] = []
     heat_y: List[float] = []
 
-    for g, items in events_by_gen.items():
-        theta = theta_max * (g / max(1, G-1))
+    def _theta_radius(gen_idx: int) -> Tuple[float, float]:
+        theta = theta_max * (gen_idx / max(1, G - 1))
         base_r = r0 + (r1 - r0) * (theta / theta_max)
+        return theta, base_r
+
+    generation_centers: List[Tuple[float, float]] = []
+    generation_counts: List[int] = []
+
+    for g in range(G):
+        theta, base_r = _theta_radius(g)
+        cx = base_r * _np.cos(theta)
+        cy = base_r * _np.sin(theta)
+        generation_centers.append((cx, cy))
+        items = events_by_gen.get(g, [])
+        generation_counts.append(len(items))
 
         n = len(items)
-        offs = _np.linspace(-0.5, 0.5, n) if n > 1 else [0.0]  # 同一世代で少しだけ半径方向にズラす
+        if n == 0:
+            continue
+        offs = _np.linspace(-0.5, 0.5, n) if n > 1 else [0.0]  # 同一世代で半径方向にわずかにズラす
         for (offset, (nid, mode)) in zip(offs, items):
             r = base_r + float(offset) * jitter
             x = r * _np.cos(theta)
@@ -2906,10 +3043,19 @@ def export_scars_spiral_map(
 
     # --- 描画 ---
     fig, ax = _plt.subplots(figsize=(6, 6), dpi=dpi, subplot_kw={"aspect": "equal"})
-    # 螺旋のセンターライン
+    # グリッド: 等半径リングと扇状のガイドライン
     ts = _np.linspace(0.0, theta_max, 1200)
     rr = r0 + (r1 - r0) * (ts / theta_max)
-    ax.plot(rr * _np.cos(ts), rr * _np.sin(ts), linewidth=1.0, alpha=0.35, linestyle="-")
+    ax.plot(rr * _np.cos(ts), rr * _np.sin(ts), linewidth=1.0, alpha=0.32, linestyle="-")
+
+    ring_levels = _np.linspace(r0, r1, 5)
+    base_angles = _np.linspace(0.0, 2.0 * _np.pi, 361)
+    for level in ring_levels:
+        ax.plot(level * _np.cos(base_angles), level * _np.sin(base_angles), linestyle="--", linewidth=0.55, color="#444", alpha=0.18)
+
+    spoke_count = max(6, int(turns * 4.0))
+    for t in _np.linspace(0.0, theta_max, spoke_count, endpoint=False):
+        ax.plot([r0 * _np.cos(t), r1 * _np.cos(t)], [r0 * _np.sin(t), r1 * _np.sin(t)], linestyle=":", linewidth=0.5, color="#333", alpha=0.18)
 
     # ヒートマップ層（2Dビニング）
     if heat_x and heat_y:
@@ -2943,7 +3089,68 @@ def export_scars_spiral_map(
     labels  = {"split": "split", "head": "head", "tail": "tail", "other": "other"}
     for k in ("split", "head", "tail", "other"):
         if xs[k]:
-            ax.scatter(xs[k], ys[k], s=marker_size, alpha=0.15, marker=markers[k], linewidths=0.7, label=labels[k])
+            ax.scatter(xs[k], ys[k], s=marker_size * 1.1, alpha=0.28, marker=markers[k], linewidths=0.75, label=labels[k], edgecolors="black")
+
+    max_count = max(generation_counts) if generation_counts else 0
+    if max_count > 0:
+        for idx in range(1, len(generation_centers)):
+            prev = generation_centers[idx - 1]
+            curr = generation_centers[idx]
+            weight = 0.35 + 2.4 * ((_np.clip(generation_counts[idx], 0, max_count) / max_count) ** 0.65)
+            alpha = 0.14 + 0.58 * ((_np.clip(generation_counts[idx], 0, max_count) / max_count) ** 0.5)
+            ax.plot([prev[0], curr[0]], [prev[1], curr[1]], linewidth=weight, alpha=alpha, color="black", solid_capstyle="round")
+
+        for (cx, cy), count in zip(generation_centers, generation_counts):
+            if count <= 0:
+                continue
+            radius = 30.0 + 6.0 * count
+            ax.scatter([cx], [cy], s=radius, facecolors="none", edgecolors="black", linewidths=0.9, alpha=0.7)
+
+        peak_gen = int(_np.argmax(generation_counts))
+        peak_count = generation_counts[peak_gen]
+        if peak_count > 0:
+            theta_peak, base_peak = _theta_radius(peak_gen)
+            px = base_peak * _np.cos(theta_peak)
+            py = base_peak * _np.sin(theta_peak)
+            tx = px * 0.82
+            ty = py * 0.82
+            ax.annotate(
+                f"Peak gen {peak_gen}\n{peak_count} births",
+                xy=(px, py),
+                xytext=(tx, ty),
+                textcoords="data",
+                ha="center",
+                va="center",
+                fontsize=8,
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="black", lw=0.6, alpha=0.75),
+                arrowprops=dict(arrowstyle="-", color="black", linewidth=0.65, alpha=0.6),
+            )
+
+    if generation_centers:
+        theta_start, r_start = _theta_radius(0)
+        sx = r_start * _np.cos(theta_start)
+        sy = r_start * _np.sin(theta_start)
+        ax.text(
+            sx * 1.04,
+            sy * 1.04,
+            "Gen 0",
+            fontsize=8,
+            ha="center",
+            va="center",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="black", lw=0.5, alpha=0.85),
+        )
+        theta_end, r_end = _theta_radius(G - 1)
+        ex = r_end * _np.cos(theta_end)
+        ey = r_end * _np.sin(theta_end)
+        ax.text(
+            ex * 1.04,
+            ey * 1.04,
+            f"Gen {G-1}",
+            fontsize=8,
+            ha="center",
+            va="center",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="black", lw=0.5, alpha=0.85),
+        )
 
     ax.set_xlim(-1.05, 1.05); ax.set_ylim(-1.05, 1.05)
     ax.set_axis_off()
@@ -3502,6 +3709,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         )
         figs["図1 学習曲線＋複雑度"] = res.get("learning_curve")
         figs["図2 最良トポロジ"] = res.get("topology")
+        db_path = res.get("decision_boundary")
+        if db_path and os.path.exists(db_path):
+            figs["図3 決定境界"] = db_path
         regen_gif = res.get("regen_gif")
         if regen_gif and os.path.exists(regen_gif) and imageio is not None:
             with imageio.get_reader(regen_gif) as r:
@@ -3509,10 +3719,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 frame = r.get_data(idx)
                 fig3 = os.path.join(args.out, f"{args.task}_fig3_regen_frame.png")
                 _imwrite_image(fig3, frame)
-                figs["図3 再生ダイジェスト代表フレーム"] = fig3
-        else:
-            figs["図3 決定境界"] = res.get("decision_boundary")
+                figs["図3A 再生ダイジェスト代表フレーム"] = fig3
         figs["図4 螺旋再生ヒートマップ"] = res.get("scars_spiral")
+        lineage_path = res.get("lineage")
+        if lineage_path and os.path.exists(lineage_path):
+            figs["図5 系統ラインエイジ"] = lineage_path
         regen_log = res.get("lcs_log")
         if regen_log and os.path.exists(regen_log):
             figs["LCS Healing Log"] = regen_log
