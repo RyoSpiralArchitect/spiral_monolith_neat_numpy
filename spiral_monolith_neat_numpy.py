@@ -2593,6 +2593,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         "lcs_log": regen_log_path if os.path.exists(regen_log_path) else None,
         "lcs_ribbon": lcs_ribbon,
         "lcs_timeline": lcs_timeline,
+        "history": hist,
     }
 
 # === backend-agnostic Figure -> RGB helper ===
@@ -3710,8 +3711,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     ap.add_argument("--report", action="store_true")
     args = ap.parse_args(None if argv is None else list(argv))
 
+    script_name = os.path.basename(__file__) if "__file__" in globals() else "spiral_monolith_neat_numpy.py"
+
     os.makedirs(args.out, exist_ok=True)
     figs: Dict[str, Optional[str]] = {}
+    report_meta: Dict[str, Optional[Dict[str, Any]]] = {"supervised": None, "rl": None}
 
     # supervised
     if args.task:
@@ -3735,19 +3739,48 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 fig3 = os.path.join(args.out, f"{args.task}_fig3_regen_frame.png")
                 _imwrite_image(fig3, frame)
                 figs["図3A 再生ダイジェスト代表フレーム"] = fig3
-        figs["図4 螺旋再生ヒートマップ"] = res.get("scars_spiral")
+        scars_spiral_path = res.get("scars_spiral")
+        has_scars_spiral = bool(scars_spiral_path and os.path.exists(scars_spiral_path))
+        if has_scars_spiral:
+            figs["図4 螺旋再生ヒートマップ"] = scars_spiral_path
+        else:
+            figs["図4 螺旋再生ヒートマップ"] = res.get("scars_spiral")
         lineage_path = res.get("lineage")
-        if lineage_path and os.path.exists(lineage_path):
+        has_lineage = bool(lineage_path and os.path.exists(lineage_path))
+        if has_lineage:
             figs["図5 系統ラインエイジ"] = lineage_path
         regen_log = res.get("lcs_log")
-        if regen_log and os.path.exists(regen_log):
+        has_regen_log = bool(regen_log and os.path.exists(regen_log))
+        if has_regen_log:
             figs["LCS Healing Log"] = regen_log
         ribbon = res.get("lcs_ribbon")
-        if ribbon and os.path.exists(ribbon):
+        has_ribbon = bool(ribbon and os.path.exists(ribbon))
+        if has_ribbon:
             figs["LCS Ribbon"] = ribbon
         timeline = res.get("lcs_timeline")
-        if timeline and os.path.exists(timeline):
+        has_timeline = bool(timeline and os.path.exists(timeline))
+        if has_timeline:
             figs["LCS Timeline"] = timeline
+
+        history = res.get("history") or []
+        best_fit = max((b for (b, _a) in history), default=None)
+        final_best = history[-1][0] if history else None
+        final_avg = history[-1][1] if history else None
+        initial_best = history[0][0] if history else None
+        report_meta["supervised"] = {
+            "task": args.task,
+            "gens": args.gens,
+            "pop": args.pop,
+            "steps": args.steps,
+            "best_fit": best_fit,
+            "final_best": final_best,
+            "final_avg": final_avg,
+            "initial_best": initial_best,
+            "has_lineage": has_lineage,
+            "has_regen_log": has_regen_log,
+            "has_lcs_viz": bool(has_ribbon or has_timeline),
+            "has_spiral": has_scars_spiral,
+        }
 
         if args.gallery:
             gal = export_task_gallery(
@@ -3835,6 +3868,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                     figs[f"LCS Timeline ({args.rl_env})"] = timeline_path
                 except Exception as timeline_err:
                     print("[WARN] LCS timeline export failed:", timeline_err)
+            gif = None
             if args.rl_gameplay_gif:
                 gif = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_gameplay.gif")
                 try:
@@ -3851,6 +3885,22 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                         figs["RL ゲームプレイ"] = out_path
                 except Exception as gif_err:
                     print("[WARN] gameplay gif failed:", gif_err)
+
+            rl_best = max((b for (b, _a) in hist), default=None)
+            rl_final_best = hist[-1][0] if hist else None
+            rl_final_avg = hist[-1][1] if hist else None
+            report_meta["rl"] = {
+                "env": args.rl_env,
+                "gens": args.rl_gens,
+                "pop": args.rl_pop,
+                "episodes": args.rl_episodes,
+                "best_reward": rl_best,
+                "final_best": rl_final_best,
+                "final_avg": rl_final_avg,
+                "has_lcs_log": bool(os.path.exists(regen_log_path)),
+                "has_lcs_viz": bool(lcs_rows),
+                "has_gameplay": bool(gif and os.path.exists(gif)),
+            }
         except Exception as e:
             print("[WARN] RL branch skipped:", e)
 
@@ -3875,17 +3925,23 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         entries = [(k, p) for k, p in figs.items() if p and os.path.exists(p)]
         with open(html, "w", encoding="utf-8") as f:
             from datetime import datetime
+            import html as htmllib
 
-            f.write("<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'><title>Report</title>")
+            f.write("<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'><title>Spiral Monolith NEAT Report | スパイラル・モノリスNEATレポート</title>")
             f.write(
                 "<style>body{font-family:'Hiragino Sans','Noto Sans JP',sans-serif;background:#fafafa;color:#222;line-height:1.6;padding:2rem;}"
                 "header.cover{background:#fff;border:1px solid #ddd;border-radius:12px;padding:1.5rem;margin-bottom:2rem;box-shadow:0 8px 20px rgba(0,0,0,0.05);}"
                 "header.cover h1{margin-top:0;font-size:1.9rem;}"
+                "header.cover p.meta{margin:0.35rem 0 0.6rem 0;}"
                 "header.cover ul{margin:0;padding-left:1.2rem;}"
-                "section.legend{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:1.25rem;margin-bottom:2rem;}"
-                "section.narrative{background:#fff;border:1px solid #e4e4e4;border-radius:10px;padding:1.25rem;margin-bottom:2rem;box-shadow:0 10px 24px rgba(0,0,0,0.035);}"
-                "section.narrative h2{margin-top:0;font-size:1.35rem;}section.narrative p{margin:0 0 0.8rem 0;}"
+                "section.summary,section.legend,section.narrative,section.examples{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:1.25rem;margin-bottom:2rem;box-shadow:0 10px 24px rgba(0,0,0,0.035);}"
+                "section.summary h2,section.legend h2,section.narrative h2,section.examples h2{margin-top:0;font-size:1.35rem;}"
+                "section.summary ul{margin:0;padding-left:1.4rem;}"
                 "section.legend ol{margin:0;padding-left:1.4rem;}"
+                "section.narrative p{margin:0 0 0.8rem 0;}"
+                "section.examples ul{margin:0;padding-left:1.4rem;}"
+                "section.examples li{margin:0 0 0.65rem 0;}"
+                "section.examples code{background:#f4f4f4;border-radius:6px;display:block;padding:0.35rem 0.55rem;font-size:0.92rem;}"
                 "figure{background:#fff;border:1px solid #e8e8e8;border-radius:12px;padding:1rem;margin:0 0 2rem 0;box-shadow:0 12px 24px rgba(0,0,0,0.04);}"
                 "figure img,figure video{width:100%;height:auto;border-radius:8px;}"
                 "figcaption{margin-top:0.75rem;font-weight:600;}"
@@ -3893,61 +3949,129 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             )
 
             f.write("<header class='cover'>")
-            f.write("<h1>Spiral Monolith NEAT Report</h1>")
+            f.write("<h1>Spiral Monolith NEAT Report / スパイラル・モノリスNEATレポート</h1>")
             f.write(
-                f"<p>生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 主要タスク: {args.task.upper() if args.task else 'N/A'}</p>"
+                f"<p class='meta'>Generated at / 生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Primary Task / 主タスク: {args.task.upper() if args.task else 'N/A'}</p>"
             )
             if args.gallery:
-                f.write("<p>ギャラリー: " + ", ".join(t.upper() for t in args.gallery) + "</p>")
+                f.write("<p class='meta'>Gallery Tasks / ギャラリー対象: " + ", ".join(htmllib.escape(t.upper()) for t in args.gallery) + "</p>")
             f.write("<ul>")
-            f.write(f"<li>世代数: {args.gens}</li>")
-            f.write(f"<li>集団サイズ: {args.pop}</li>")
-            f.write(f"<li>Backprop steps: {args.steps}</li>")
+            f.write(f"<li>Generations / 世代数: {args.gens}</li>")
+            f.write(f"<li>Population / 個体数: {args.pop}</li>")
+            f.write(f"<li>Backprop Steps / 学習反復: {args.steps}</li>")
             if args.rl_env:
-                f.write(f"<li>RL 環境: {args.rl_env}</li>")
+                f.write(f"<li>RL Environment / 強化学習環境: {htmllib.escape(args.rl_env)}</li>")
             f.write("</ul>")
             f.write("</header>")
 
-            f.write("<section class='narrative'><h2>進化ダイジェスト</h2>")
+            summary_items = []
+
+            def _fmt_float(val: Optional[float]) -> str:
+                return "–" if val is None else f"{val:.4f}"
+
+            sup_meta = report_meta.get("supervised")
+            if sup_meta:
+                extras = []
+                if sup_meta.get("has_regen_log"):
+                    extras.append("LCS log")
+                if sup_meta.get("has_lcs_viz"):
+                    extras.append("LCS visuals")
+                if sup_meta.get("has_lineage"):
+                    extras.append("lineage")
+                if sup_meta.get("has_spiral"):
+                    extras.append("scar map")
+                extra_txt = f" [{', '.join(extras)}]" if extras else ""
+                summary_items.append(
+                    f"<li><strong>Supervised ({htmllib.escape(sup_meta['task'].upper())})</strong> — best {_fmt_float(sup_meta.get('best_fit'))} | final {_fmt_float(sup_meta.get('final_best'))} / avg {_fmt_float(sup_meta.get('final_avg'))}{extra_txt}</li>"
+                )
+
+            rl_meta = report_meta.get("rl")
+            if rl_meta and rl_meta.get("env"):
+                extras = []
+                if rl_meta.get("has_lcs_log"):
+                    extras.append("LCS log")
+                if rl_meta.get("has_lcs_viz"):
+                    extras.append("LCS visuals")
+                if rl_meta.get("has_gameplay"):
+                    extras.append("gameplay gif")
+                extra_txt = f" [{', '.join(extras)}]" if extras else ""
+                summary_items.append(
+                    f"<li><strong>RL ({htmllib.escape(rl_meta['env'])})</strong> — best {_fmt_float(rl_meta.get('best_reward'))} | final {_fmt_float(rl_meta.get('final_best'))} / avg {_fmt_float(rl_meta.get('final_avg'))}{extra_txt}</li>"
+                )
+
+            f.write("<section class='summary'><h2>Overview / 概要</h2>")
+            f.write(f"<p>Figures included / 図版数: {len(entries)}</p>")
+            if summary_items:
+                f.write("<ul>")
+                for item in summary_items:
+                    f.write(item)
+                f.write("</ul>")
+            else:
+                f.write("<p>No supervised or RL runs were summarised for this report.</p>")
+            f.write("</section>")
+
+            f.write("<section class='narrative'><h2>Evolution Digest / 進化ダイジェスト</h2>")
             f.write(
                 "<p>Early generations showed smooth structural adaptation and convergence under low-difficulty conditions.</p>"
             )
             f.write(
                 "<p>However, as environmental difficulty and noise increased, regeneration-driven mutations began to trigger bursts of morphological diversification, resembling biological punctuated equilibria.</p>"
             )
+            if sup_meta and sup_meta.get("has_regen_log"):
+                f.write(
+                    "<p>LCS metrics highlighted how severed pathways recovered within the allowed healing window, aligning regenerative bursts with topology repairs.</p>"
+                )
             f.write("</section>")
 
             if entries:
-                f.write("<section class='legend'><h2>図版リスト</h2><ol>")
+                f.write("<section class='legend'><h2>Figure Index / 図版リスト</h2><ol>")
                 for label, path in entries:
                     f.write(
-                        f"<li><strong>{label}</strong><br><small>{os.path.basename(path)}</small></li>"
+                        f"<li><strong>{htmllib.escape(label)}</strong><br><small>{htmllib.escape(os.path.basename(path))}</small></li>"
                     )
                 f.write("</ol></section>")
 
+            cli_examples = [
+                f"python {script_name} --task {htmllib.escape((args.task or 'spiral'))} --gens {max(args.gens, 60)} --pop {max(args.pop, 64)} --steps {max(args.steps, 80)} --make-gifs --make-lineage --report --out demo_{htmllib.escape((args.task or 'spiral'))}",
+                f"python {script_name} --task xor --gallery spiral circles --gens 40 --pop 48 --steps 60 --report --out gallery_pack"
+            ]
+            rl_example_env = args.rl_env or "CartPole-v1"
+            cli_examples.append(
+                f"python {script_name} --rl-env {htmllib.escape(rl_example_env)} --rl-gens {max(args.rl_gens, 30)} --rl-pop {max(args.rl_pop, 32)} --rl-episodes {max(args.rl_episodes, 2)} --rl-max-steps {args.rl_max_steps} --report --out rl_{htmllib.escape(rl_example_env.replace(':','_'))}"
+            )
+
+            f.write("<section class='examples'><h2>CLI Quickstart / CLIクイックスタート</h2>")
+            f.write("<p>Use the following commands as templates for supervised runs, gallery batches, and Gym integrations.</p>")
+            f.write("<ul>")
+            for cmd in cli_examples:
+                f.write(f"<li><code>{cmd}</code></li>")
+            f.write("</ul></section>")
+
             for k, p in entries:
                 uri, mime = _data_uri(p)
+                escaped_label = htmllib.escape(k)
                 if mime == "image/gif":
                     f.write(
                         f"<figure><img src='{uri}' style='max-width:100%'>"
-                        f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                        f"<figcaption><strong>{escaped_label}</strong></figcaption></figure>"
                     )
                 elif mime.startswith("image/"):
                     f.write(
-                        f"<figure><img src='{uri}' style='max-width:100%'><figcaption><strong>{k}</strong></figcaption></figure>"
+                        f"<figure><img src='{uri}' style='max-width:100%'><figcaption><strong>{escaped_label}</strong></figcaption></figure>"
                     )
                 elif mime.startswith("video/"):
                     f.write(
                         "<figure><video autoplay loop muted playsinline style='max-width:100%'>"
                         f"<source src='{uri}' type='{mime}'></video>"
-                        f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                        f"<figcaption><strong>{escaped_label}</strong></figcaption></figure>"
                     )
                 else:
                     f.write(
-                        f"<figure><a href='{uri}'>download {os.path.basename(p)}</a>"
-                        f"<figcaption><strong>{k}</strong></figcaption></figure>"
+                        f"<figure><a href='{uri}'>download {htmllib.escape(os.path.basename(p))}</a>"
+                        f"<figcaption><strong>{escaped_label}</strong></figcaption></figure>"
                     )
             f.write("</body></html>")
+
         print("[REPORT]", html)
 
     print("[OK] outputs in:", args.out)
