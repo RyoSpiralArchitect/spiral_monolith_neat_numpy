@@ -907,11 +907,21 @@ class LCSMonitor:
             out.setdefault(node, [])
         return out
 
+    def _nbr_targets(self, nbrs):
+        """Yield neighbor ids from adjacency entries that may be (v, w) tuples or plain v ids.
+        This lets monitors operate on both weighted adjacencies and SCC-condensed graphs.
+        """
+        for item in nbrs:
+            if isinstance(item, (tuple, list)) and len(item) >= 1:
+                yield item[0]
+            else:
+                yield item
+
     def _nodes_in_scope(self, adj, changed_nodes):
         if self.r_hop <= 0 or not changed_nodes:
             nodes = set(adj.keys())
             for nbrs in adj.values():
-                for v, _ in nbrs:
+                for v in self._nbr_targets(nbrs):
                     nodes.add(v)
             nodes.update(self.inputs)
             nodes.update(self.outputs)
@@ -921,12 +931,12 @@ class LCSMonitor:
         for _ in range(self.r_hop):
             nxt = []
             for u in frontier:
-                for v, _ in adj.get(u, ()):  # forward
+                for v in self._nbr_targets(adj.get(u, ())):  # forward
                     if v not in scope:
                         scope.add(v)
                         nxt.append(v)
             for p, nbrs in adj.items():  # backward one hop
-                for v, _ in nbrs:
+                for v in self._nbr_targets(nbrs):
                     if v in frontier and p not in scope:
                         scope.add(p)
                         nxt.append(p)
@@ -938,9 +948,14 @@ class LCSMonitor:
     def _induced_adj(self, adj, nodes):
         out = {u: [] for u in nodes}
         for u in nodes:
-            for v, w in adj.get(u, ()):  # type: ignore[arg-type]
+            for nbr in adj.get(u, ()):  # type: ignore[arg-type]
+                # support both (v,w) entries and plain v entries
+                if isinstance(nbr, (tuple, list)) and len(nbr) >= 1:
+                    v, w = nbr[0], (nbr[1] if len(nbr) > 1 else None)
+                else:
+                    v, w = nbr, None
                 if v in nodes:
-                    out[u].append((v, w))
+                    out[u].append((v, w if w is not None else 0.0))
         return out
 
     def _strongly_connected_components(self, adj):
@@ -951,7 +966,7 @@ class LCSMonitor:
                 nodes.append(u)
                 seen.add(u)
         for nbrs in adj.values():
-            for v, _ in nbrs:
+            for v in self._nbr_targets(nbrs):
                 if v not in seen:
                     nodes.append(v)
                     seen.add(v)
@@ -969,7 +984,7 @@ class LCSMonitor:
             idx += 1
             stack.append(v)
             on_stack.add(v)
-            for w, _ in adj.get(v, ()):  # pragma: no branch
+            for w in self._nbr_targets(adj.get(v, ())):  # pragma: no branch
                 if w not in index:
                     strongconnect(w)
                     lowlink[v] = min(lowlink[v], lowlink[w])
@@ -997,7 +1012,7 @@ class LCSMonitor:
         for u, nbrs in adj.items():
             cu = mapping[u]
             bucket = condensed.setdefault(cu, [])
-            for v, _ in nbrs:
+            for v in self._nbr_targets(nbrs):
                 cv = mapping.get(v)
                 if cv is None:
                     continue
@@ -1039,7 +1054,7 @@ class LCSMonitor:
     def _shortest_len_unit(self, adj):
         nodes = set(adj.keys())
         for nbrs in adj.values():
-            for v, _ in nbrs:
+            for v in self._nbr_targets(nbrs):
                 nodes.add(v)
         nodes.update(self.inputs)
         nodes.update(self.outputs)
@@ -1052,7 +1067,7 @@ class LCSMonitor:
         while q:
             u = q.popleft()
             du = dist[u]
-            for v, _ in adj.get(u, ()):  # pragma: no branch
+            for v in self._nbr_targets(adj.get(u, ())):  # pragma: no branch
                 alt = du + 1
                 if alt < dist.get(v, INF):
                     dist[v] = alt
@@ -1065,47 +1080,29 @@ class LCSMonitor:
         Accepts adjacency in two forms:
           - dict[node] -> list[(neighbor, weight)]
           - dict[node] -> list[neighbor]  (e.g., from SCC condensation)
-
-        Returns (order, parents) where:
-          - order is a list of nodes in topological order
-          - parents is a dict mapping node -> list of predecessor nodes
         """
-        def _targets(nbrs):
-            # Support both (v,w) tuples and plain neighbor ints
-            for item in nbrs:
-                if isinstance(item, tuple):
-                    # Expected shape (v, weight)
-                    yield item[0]
-                else:
-                    # Plain neighbor id
-                    yield item
-
         nodes = set(adj.keys())
         for nbrs in adj.values():
-            for v in _targets(nbrs):
+            for v in self._nbr_targets(nbrs):
                 nodes.add(v)
-
         indeg = {v: 0 for v in nodes}
         for u, nbrs in adj.items():
-            for v in _targets(nbrs):
+            for v in self._nbr_targets(nbrs):
                 indeg[v] = indeg.get(v, 0) + 1
-
         queue = deque([v for v in nodes if indeg.get(v, 0) == 0])
         order = []
         while queue:
             v = queue.popleft()
             order.append(v)
-            for w in _targets(adj.get(v, ())):  # type: ignore[arg-type]
+            for w in self._nbr_targets(adj.get(v, ())):  # type: ignore[arg-type]
                 indeg[w] -= 1
                 if indeg[w] == 0:
                     queue.append(w)
-
         if len(order) != len(nodes):
             raise ValueError("Graph has a cycle; LCS expects a DAG or SCC-condensed DAG.")
-
         parents = {v: [] for v in nodes}
         for u, nbrs in adj.items():
-            for v in _targets(nbrs):
+            for v in self._nbr_targets(nbrs):
                 parents[v].append(u)
         return order, parents
     def _reachable_from_inputs(self, adj):
@@ -1115,7 +1112,7 @@ class LCSMonitor:
             seen.add(s)
         while queue:
             u = queue.popleft()
-            for v, _ in adj.get(u, ()):  # type: ignore[arg-type]
+            for v in self._nbr_targets(adj.get(u, ())):  # type: ignore[arg-type]
                 if v not in seen:
                     seen.add(v)
                     queue.append(v)
@@ -1156,7 +1153,7 @@ class LCSMonitor:
         base = {}
         for u, nbrs in adj.items():
             base.setdefault(u, {})
-            for v, _ in nbrs:
+            for v in self._nbr_targets(nbrs):
                 base[u][v] = 1
                 base.setdefault(v, {})
         # ensure reverse edges present with zero capacity for residual graph
