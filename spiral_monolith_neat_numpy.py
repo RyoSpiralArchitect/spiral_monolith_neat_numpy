@@ -31,6 +31,8 @@ def _ensure_matplotlib_agg(force: bool = False):
 
 _ensure_matplotlib_agg()
 
+STRUCTURAL_EPS = 1e-9
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
@@ -376,7 +378,7 @@ class Genome:
 
 def summarize_graph_changes(adj0: Dict[int, List[Tuple[int, float]]],
                             adj1: Dict[int, List[Tuple[int, float]]],
-                            weight_tol: float = 1e-9) -> Tuple[Set[int], int]:
+                            weight_tol: float = STRUCTURAL_EPS) -> Tuple[Set[int], int]:
     """Return nodes and edge-count touched by structural/weight deltas (|w|<=tol treated absent)."""
     def collect(adj):
         edges = {}
@@ -887,7 +889,7 @@ class LCSMonitor:
     K: int = 5
     T: int = 3
     cooldown: int = 1
-    eps: float = 0.0
+    eps: float = STRUCTURAL_EPS
     r_hop: int = 0
     csv_path: str = "regen_log.csv"
     _pair_state: Dict[int, PairState] = field(default_factory=dict)
@@ -1237,9 +1239,9 @@ class ReproPlanaNEATPlus:
             g.id = self.next_gid; self.next_gid += 1; g.birth_gen = 0
             self.population.append(g)
 
-        input_ids = list(range(num_inputs)) + [bias_id]
+        input_ids = list(range(num_inputs))
         output_ids = list(range(num_inputs, num_inputs + num_outputs))
-        self.lcs_monitor = LCSMonitor(inputs=input_ids, outputs=output_ids)
+        self.lcs_monitor = LCSMonitor(inputs=input_ids, outputs=output_ids, eps=STRUCTURAL_EPS)
 
         # Params
         self.generation = 0
@@ -1368,7 +1370,7 @@ class ReproPlanaNEATPlus:
             males   = [g for g,_ in sp.members if g.sex=='male'] or males
         mix_ratio=self._mix_asexual_ratio()
         monitor = getattr(self, "lcs_monitor", None)
-        weight_tol = max(getattr(monitor, "eps", 0.0), 1e-9) if monitor is not None else 1e-9
+        weight_tol = max(getattr(monitor, "eps", 0.0), STRUCTURAL_EPS) if monitor is not None else STRUCTURAL_EPS
         while remaining>0:
             mode=None
             mother_id=None; father_id=None
@@ -1436,7 +1438,7 @@ class ReproPlanaNEATPlus:
                 idx=int(idxs[i%len(idxs)]); offspring_counts[idx]+=1 if diff>0 else -1; diff += -1 if diff>0 else 1; i+=1
         new_pop=[]; gen_events={'sexual_within':0,'sexual_cross':0,'asexual_regen':0,'asexual_clone':0}
         monitor = getattr(self, "lcs_monitor", None)
-        weight_tol = max(getattr(monitor, "eps", 0.0), 1e-9) if monitor is not None else 1e-9
+        weight_tol = max(getattr(monitor, "eps", 0.0), STRUCTURAL_EPS) if monitor is not None else STRUCTURAL_EPS
         for sidx,sp in enumerate(species):
             offspring,events=self._make_offspring(species,offspring_counts,sidx,species)
             for k,v in events.items(): gen_events[k]+=v
