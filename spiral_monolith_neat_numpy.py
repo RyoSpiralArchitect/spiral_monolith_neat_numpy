@@ -3412,6 +3412,13 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     # Summary decision boundaries for all tasks (separate files)
     summary_dir = f"{out_prefix}_decisions"
     summary_paths = export_decision_boundaries_all(best, summary_dir, steps=steps, seed=0)
+    
+    # Convert genome snapshots to Cytoscape format for interactive report
+    genomes_cyto = []
+    if hasattr(neat, 'snapshots_genomes') and neat.snapshots_genomes:
+        for g in neat.snapshots_genomes:
+            genomes_cyto.append(_genome_to_cyto(g))
+    
     return {
         "learning_curve": lc_path,
         "decision_boundary": db_path,
@@ -3425,6 +3432,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         "lcs_ribbon": lcs_ribbon,
         "lcs_timeline": lcs_timeline,
         "history": hist,
+        "genomes_cyto": genomes_cyto,
     }
 
 # === backend-agnostic Figure -> RGB helper ===
@@ -4520,6 +4528,427 @@ def run_gym_neat_experiment(
     }
 
 
+def _genome_to_cyto(genome: Genome) -> dict:
+    """
+    Convert a Genome object to Cytoscape.js-compatible dictionary format.
+    Returns dict with 'nodes', 'edges', 'id', and 'meta' keys.
+    """
+    nodes = []
+    for nid, node in genome.nodes.items():
+        node_data = {
+            "id": str(nid),
+            "label": f"{node.type[0].upper()}{nid}",
+            "type": node.type,
+            "bias": getattr(node, "bias", 0.0),
+            "activation": node.activation,
+        }
+        nodes.append({"data": node_data})
+    
+    edges = []
+    for innov, conn in genome.connections.items():
+        edge_data = {
+            "id": f"e{innov}",
+            "source": str(conn.in_node),
+            "target": str(conn.out_node),
+            "weight": float(conn.weight),
+            "enabled": bool(conn.enabled),
+        }
+        edges.append({"data": edge_data})
+    
+    return {
+        "id": genome.id,
+        "nodes": nodes,
+        "edges": edges,
+        "meta": {
+            "fitness": getattr(genome, "fitness", None),
+            "birth_gen": genome.birth_gen,
+        }
+    }
+
+
+def export_interactive_html_report(path: str, title: str, history, genomes, *, max_genomes: int = 50):
+    """
+    Write a self-contained interactive HTML report with:
+    - Plotly learning curve (pan/zoom/hover)
+    - Cytoscape genome viewer with:
+        - Right-click context menu on nodes: Fix/Unfix, Color, Note
+        - Drag nodes, zoom, click for detail
+    No extra Python deps; loads JS via CDN. Per-node edits persist in localStorage.
+    """
+    import json, os
+    # history is expected as list of (best, avg)
+    xs = list(range(len(history or [])))
+    ys_best = [float(b) for (b, a) in (history or [])]
+    ys_avg  = [float(a) for (b, a) in (history or [])]
+
+    # Downsample genomes if needed (evenly spaced picks)
+    genomes = genomes or []
+    if len(genomes) > max_genomes:
+        idxs = [round(i) for i in [k*(len(genomes)-1)/(max_genomes-1) for k in range(max_genomes)]]
+        genomes = [genomes[i] for i in idxs]
+
+    # Convert to cytoscape-friendly dicts if raw Genome objects slipped in
+    if genomes and "nodes" not in genomes[0]:
+        genomes = [_genome_to_cyto(g) for g in genomes]
+
+    data = {
+        "title": title,
+        "lc": {"x": xs, "best": ys_best, "avg": ys_avg},
+        "genomes": genomes,
+    }
+
+    # NOTE: f-string uses {{ }} for literal braces inside CSS/JS
+    html = f"""<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8"/>
+  <title>{title}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+  <style>
+    :root {{ --grid:#e5e5e5; --fg:#111; --muted:#666; --ok1:#0072B2; --ok2:#D55E00; --ok3:#009E73; --ok4:#CC79A7; --ok5:#F0E442; --ok6:#56B4E9; --ok7:#E69F00; --ok8:#000; }}
+    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--fg); }}
+    .container {{ max-width:1200px; margin:24px auto; padding:0 16px; }}
+    h1 {{ font-size:22px; margin:0 0 12px; }}
+    .card {{ border:1px solid var(--grid); border-radius:8px; padding:12px; background:#fff; margin-bottom:16px; }}
+    #lc {{ height:360px; }}
+    .panel {{ display:grid; grid-template-columns:1fr 320px; gap:16px; }}
+    #cy {{ width:100%; height:560px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}
+    .detail {{ border:1px dashed var(--grid); border-radius:6px; padding:8px; font-size:13px; height:560px; overflow:auto; background:#fafafa; }}
+    .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }}
+    select,button {{ padding:6px 8px; font-size:14px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}
+    .dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}
+    .legend {{ display:inline-flex; gap:8px; align-items:center; }}
+    /* Tooltip */
+    .tip {{ position:fixed; pointer-events:none; background:rgba(0,0,0,.8); color:#fff; padding:6px 8px; font-size:12px; border-radius:4px; transform:translate(8px,8px); z-index:1000; display:none; max-width:320px; white-space:nowrap; }}
+    /* Context menu */
+    .ctx-menu {{
+      position: fixed; z-index: 2000; display: none; min-width: 220px;
+      background: #fff; color: var(--fg); border: 1px solid var(--grid); border-radius: 8px;
+      box-shadow: 0 8px 20px rgba(0,0,0,.12); padding: 6px;
+    }}
+    .ctx-item {{ font-size: 13px; padding: 8px 10px; cursor: pointer; border-radius:6px; }}
+    .ctx-item:hover {{ background: #f3f3f3; }}
+    .ctx-sep {{ height:1px; background: var(--grid); margin:6px 0; }}
+    .swatches {{ display:flex; flex-wrap:wrap; gap:6px; padding: 4px 2px 2px; }}
+    .swatch {{ width:18px; height:18px; border-radius:50%; cursor:pointer; border:1px solid rgba(0,0,0,.15); }}
+    .ctx-row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>{title}</h1>
+    <div class="card">
+      <h2>Learning Curve</h2>
+      <div id="lc"></div>
+    </div>
+    <div class="card">
+      <h2>Genome Viewer</h2>
+      <div class="row">
+        <label for="genomeSelect">Genome:</label>
+        <select id="genomeSelect"></select>
+        <button id="layoutBtn">Re-layout</button>
+        <span class="legend">
+          <span class="dot" style="background:#009E73"></span> input
+          <span class="dot" style="background:#999"></span> hidden
+          <span class="dot" style="background:#0072B2"></span> output
+        </span>
+      </div>
+      <div class="panel">
+        <div id="cy"></div>
+        <div class="detail" id="detail"><div class="fine">ノードやエッジを選択すると詳細が表示されます。</div></div>
+      </div>
+    </div>
+  </div>
+  <div class="tip" id="tip"></div>
+  <div class="ctx-menu" id="ctx"></div>
+
+  <script>
+    const DATA = {json.dumps(data, ensure_ascii=False)};
+    // Learning curve
+    (function(){{
+      const traces = [];
+      if (DATA.lc && DATA.lc.x.length) {{
+        traces.push({{ x: DATA.lc.x, y: DATA.lc.best, mode:'lines', name:'best', line:{{width:2, color:'#0072B2'}},
+          hovertemplate:'gen=%{{x}}<br>best=%{{y:.4f}}<extra></extra>' }});
+        traces.push({{ x: DATA.lc.x, y: DATA.lc.avg,  mode:'lines', name:'avg',  line:{{width:2, color:'#D55E00'}},
+          hovertemplate:'gen=%{{x}}<br>avg=%{{y:.4f}}<extra></extra>' }});
+      }}
+      Plotly.newPlot('lc', traces, {{
+        margin:{{l:40,r:10,t:10,b:40}},
+        xaxis:{{title:'Generation', gridcolor:'#eee'}},
+        yaxis:{{title:'Fitness', gridcolor:'#eee'}},
+        legend:{{orientation:'h'}}
+      }}, {{displayModeBar:true, responsive:true}});
+    }})();
+
+    // Genome viewer
+    const cyContainer = document.getElementById('cy');
+    const detail = document.getElementById('detail');
+    const tip = document.getElementById('tip');
+    const sel = document.getElementById('genomeSelect');
+    const layoutBtn = document.getElementById('layoutBtn');
+    const ctx = document.getElementById('ctx');
+    let cy = null;
+    let currentGenome = null; // store current genome object
+    let ctxNode = null;
+
+    function lsKey(gid) {{ return 'NEAT_REPORT_GENOME_STATE::' + String(gid); }}
+    function saveState() {{
+      if (!cy || !currentGenome) return;
+      const st = {{}};
+      cy.nodes().forEach(n => {{
+        st[n.id()] = {{
+          pos: n.position(),
+          locked: n.locked(),
+          color: n.data('color') || null,
+          note: n.data('note') || null
+        }};
+      }});
+      try {{ localStorage.setItem(lsKey(currentGenome.id || 'genome'), JSON.stringify(st)); }} catch(e){{}}
+    }}
+    function applyState() {{
+      if (!cy || !currentGenome) return;
+      let raw = null;
+      try {{ raw = localStorage.getItem(lsKey(currentGenome.id || 'genome')); }} catch(e){{}}
+      if (!raw) return;
+      let st = null;
+      try {{ st = JSON.parse(raw); }} catch(e) {{ return; }}
+      if (!st) return;
+      cy.batch(() => {{
+        cy.nodes().forEach(n => {{
+          const s = st[n.id()]; if (!s) return;
+          if (s.pos && Number.isFinite(s.pos.x) && Number.isFinite(s.pos.y)) n.position(s.pos);
+          if (s.locked) n.lock(); else n.unlock();
+          if (s.color) {{ n.data('color', s.color); n.style('background-color', s.color); }}
+          if (s.note) {{
+            n.data('note', s.note);
+            const orig = n.data('orig_label') || n.data('label') || n.id();
+            n.data('label', orig + '\\n' + s.note);
+          }}
+        }});
+      }});
+    }}
+
+    function genomeToElements(g) {{
+      // Ensure orig_label availability for annotations
+      const nodes = (g.nodes||[]).map(n => {{
+        const d = n.data || n;
+        return {{ data: Object.assign({{}}, d, {{ orig_label: d.label }}) }};
+      }});
+      const edges = (g.edges||[]).map(e => ({{ data: e.data || e, classes: ((e.data||e).enabled? 'enabled':'disabled') }}));
+      return nodes.concat(edges);
+    }}
+    function populateSelect() {{
+      sel.innerHTML = '';
+      if (!DATA.genomes || DATA.genomes.length===0) {{
+        const opt = document.createElement('option'); opt.text='(no genomes)'; sel.add(opt); sel.disabled=true; return;
+      }}
+      sel.disabled=false;
+      DATA.genomes.forEach((g,i) => {{
+        const meta = g.meta || {{}};
+        const label = (g.id || ('genome_'+i)) + (meta.fitness!==undefined ? (' (fitness='+meta.fitness+')') : '');
+        const opt = document.createElement('option'); opt.value=String(i); opt.text=label; sel.add(opt);
+      }});
+    }}
+    function renderGenome(idx) {{
+      if (!DATA.genomes || !DATA.genomes[idx]) return;
+      const g = DATA.genomes[idx];
+      currentGenome = g;
+      const elements = genomeToElements(g);
+      const styles = [
+        {{ selector:'node', style:{{ 'label':'data(label)', 'font-size':11, 'text-valign':'center', 'text-halign':'center',
+           'text-wrap':'wrap', 'text-max-width': 90, 'background-color':'#999','width':22,'height':22, 'color':'#111','border-color':'#333','border-width':0.5 }} }},
+        {{ selector:'node[type = "input"]',  style:{{ 'background-color':'#009E73' }} }},
+        {{ selector:'node[type = "output"]', style:{{ 'background-color':'#0072B2' }} }},
+        {{ selector:'edge', style:{{ 'line-color':'#888', 'width':'mapData(weight, -2, 2, 0.6, 4)', 'opacity':0.95,
+           'curve-style':'bezier','target-arrow-shape':'triangle','target-arrow-color':'#888' }} }},
+        {{ selector:'edge[weight < 0]',  style:{{ 'line-color':'#D55E00', 'target-arrow-color':'#D55E00' }} }},
+        {{ selector:'edge[weight >= 0]', style:{{ 'line-color':'#56B4E9', 'target-arrow-color':'#56B4E9' }} }},
+        {{ selector:'edge.disabled', style:{{ 'line-style':'dotted','opacity':0.3 }} }},
+        {{ selector:':selected', style:{{ 'border-width':2, 'border-color':'#F0E442' }} }},
+      ];
+      if (cy) cy.destroy();
+      cy = cytoscape({{ container: cyContainer, elements: elements, style: styles, layout: {{ name:'cose', animate:false }},
+        wheelSensitivity:0.2, minZoom:0.2, maxZoom:5 }});
+
+      function showDetail(html) {{ detail.innerHTML = html; }}
+      function nodeHtml(d) {{
+        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');
+        return `<div><b>Node</b></div>
+          <div>ID: ${{a('id')}}</div>
+          <div>Label: ${{a('label')}}</div>
+          <div>Type: ${{a('type')}}</div>
+          <div>Bias: ${{a('bias')}}</div>
+          <div>Activation: ${{a('activation')}}</div>
+          <div>Note: ${{a('note')}}</div>`;
+      }}
+      function edgeHtml(d) {{
+        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');
+        return `<div><b>Edge</b></div>
+          <div>Source: ${{a('source')}}</div>
+          <div>Target: ${{a('target')}}</div>
+          <div>Weight: ${{a('weight')}}</div>
+          <div>Enabled: ${{a('enabled')}}</div>`;
+      }}
+
+      // Click selects → details
+      cy.on('tap','node',(evt)=> showDetail(nodeHtml(evt.target.data())));
+      cy.on('tap','edge',(evt)=> showDetail(edgeHtml(evt.target.data())));
+      cy.on('tap',(evt)=> {{ if (evt.target===cy) showDetail('<div class="fine">ノードやエッジを選択すると詳細が表示されます。</div>'); }});
+
+      // Hover tooltip
+      const moveTip = (e) => {{ tip.style.left=(e.renderedPosition.x + cyContainer.getBoundingClientRect().left)+'px';
+                                tip.style.top=(e.renderedPosition.y + cyContainer.getBoundingClientRect().top)+'px'; }};
+      cy.on('mouseover','node',(evt)=>{{ tip.innerHTML = evt.target.data('label') || evt.target.data('id'); tip.style.display='block'; moveTip(evt); }});
+      cy.on('mousemove','node',(evt)=> moveTip(evt));
+      cy.on('mouseout','node',()=> {{ tip.style.display='none'; }});
+
+      // Persist position/color/note
+      cy.on('free', 'node', saveState);
+      cy.on('lock unlock', 'node', saveState);
+
+      // Apply saved state for this genome
+      applyState();
+
+      // Context menu handlers
+      cy.on('cxttapstart', 'node', (evt) => {{
+        ctxNode = evt.target;
+        openCtxAt(evt.renderedPosition);
+      }});
+      cy.on('cxttapstart', (evt) => {{
+        if (evt.target === cy) closeCtx();
+      }});
+      document.addEventListener('click', (e) => {{
+        if (!ctx.contains(e.target)) closeCtx();
+      }});
+      window.addEventListener('resize', closeCtx);
+      document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeCtx(); }});
+    }}
+
+    // UI wiring
+    populateSelect();
+    if (DATA.genomes && DATA.genomes.length>0) renderGenome(0);
+    sel.addEventListener('change', ()=> {{ const idx=parseInt(sel.value,10); if(!Number.isNaN(idx)) renderGenome(idx); }});
+    layoutBtn.addEventListener('click', ()=> {{ if (cy) cy.layout({{name:'cose', animate:true}}).run(); }});
+
+    // Context menu building
+    const PALETTE = ['#0072B2','#D55E00','#009E73','#CC79A7','#F0E442','#56B4E9','#E69F00','#000000','#777777','#999999'];
+    const hiddenColorPicker = document.createElement('input'); hiddenColorPicker.type='color'; hiddenColorPicker.style.display='none'; document.body.appendChild(hiddenColorPicker);
+
+    function openCtxAt(renderedPos) {{
+      if (!ctxNode) return;
+      const rect = cyContainer.getBoundingClientRect();
+      const x = rect.left + renderedPos.x;
+      const y = rect.top + renderedPos.y;
+      ctx.innerHTML = '';
+      const menu = document.createElement('div');
+
+      // Title
+      const title = document.createElement('div');
+      title.className='ctx-item';
+      title.style.cursor='default';
+      title.innerHTML = '<b>Node:</b> ' + (ctxNode.data('label') || ctxNode.id());
+      ctx.appendChild(title);
+
+      // Fix/Unfix
+      const fix = document.createElement('div');
+      fix.className='ctx-item';
+      const locked = ctxNode.locked();
+      fix.textContent = locked ? '位置の固定を解除' : '位置を固定';
+      fix.onclick = () => {{
+        if (ctxNode.locked()) ctxNode.unlock(); else ctxNode.lock();
+        saveState(); closeCtx();
+      }};
+      ctx.appendChild(fix);
+
+      // Color row
+      const colorRow = document.createElement('div');
+      colorRow.className='ctx-item';
+      colorRow.innerHTML = '<div class="ctx-row"><span>色を変更</span><span style="font-size:12px;color:var(--muted)">クリックで適用</span></div>';
+      const sw = document.createElement('div'); sw.className='swatches';
+      PALETTE.forEach(c => {{
+        const d = document.createElement('div'); d.className='swatch'; d.style.background=c;
+        d.title = c;
+        d.onclick = () => {{ ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx(); }};
+        sw.appendChild(d);
+      }});
+      // Custom picker
+      const custom = document.createElement('div');
+      custom.className='ctx-item';
+      custom.textContent='カスタムカラー…';
+      custom.onclick = () => {{
+        hiddenColorPicker.value = ctxNode.data('color') || '#999999';
+        hiddenColorPicker.onchange = () => {{
+          const c = hiddenColorPicker.value;
+          ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx();
+        }};
+        hiddenColorPicker.click();
+      }};
+      colorRow.appendChild(sw);
+      ctx.appendChild(colorRow);
+      ctx.appendChild(custom);
+
+      // Note editor
+      const noteBtn = document.createElement('div');
+      noteBtn.className='ctx-item';
+      noteBtn.textContent='注釈を追加/編集…';
+      noteBtn.onclick = () => {{
+        const cur = ctxNode.data('note') || '';
+        const txt = window.prompt('ノードの注釈（空で削除）', cur);
+        if (txt === null) return;
+        const orig = ctxNode.data('orig_label') || ctxNode.data('label') || ctxNode.id();
+        if (txt.trim() === '') {{
+          ctxNode.data('note', null);
+          ctxNode.data('label', orig);
+        }} else {{
+          ctxNode.data('note', txt);
+          ctxNode.data('label', orig + '\\n' + txt);
+        }}
+        saveState(); closeCtx();
+      }};
+      ctx.appendChild(noteBtn);
+
+      // Reset color
+      const resetColor = document.createElement('div');
+      resetColor.className='ctx-item';
+      resetColor.textContent='色をリセット';
+      resetColor.onclick = () => {{
+        ctxNode.data('color', null);
+        // Revert to type-based color by removing inline style
+        ctxNode.removeStyle('background-color');
+        saveState(); closeCtx();
+      }};
+      ctx.appendChild(resetColor);
+
+      // Separator
+      const sep = document.createElement('div'); sep.className='ctx-sep'; ctx.appendChild(sep);
+
+      // Save layout now
+      const saveBtn = document.createElement('div');
+      saveBtn.className='ctx-item';
+      saveBtn.textContent='レイアウトを保存';
+      saveBtn.onclick = () => {{ saveState(); closeCtx(); }};
+      ctx.appendChild(saveBtn);
+
+      // Open
+      ctx.style.left = Math.round(x) + 'px';
+      ctx.style.top  = Math.round(y) + 'px';
+      ctx.style.display = 'block';
+    }}
+
+    function closeCtx() {{ ctx.style.display='none'; ctxNode = null; }}
+
+  </script>
+</body>
+</html>"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print("[REPORT]", path)
+
+
 def main(argv: Optional[Iterable[str]] = None) -> int:
     """Command-line interface entrypoint."""
     _ensure_matplotlib_agg(force=True)
@@ -4739,175 +5168,198 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         except Exception as e:
             print("[WARN] RL branch skipped:", e)
 
-    if args.report and figs:
-        # minimal self-contained HTML (base64 embed)
-        def _data_uri(p: str) -> Tuple[str, str]:
-            with open(p, "rb") as f:
-                import base64
-
-                raw = base64.b64encode(f.read()).decode("ascii")
-            mime, _ = mimetypes.guess_type(p)
-            if mime is None:
-                if p.lower().endswith(".gif"):
-                    mime = "image/gif"
-                elif p.lower().endswith((".mp4", ".webm")):
-                    mime = "video/mp4"
-                else:
-                    mime = "application/octet-stream"
-            return f"data:{mime};base64,{raw}", mime
-
-        html = os.path.join(args.out, "Sakana_NEAT_Report.html")
-        entries = [(k, p) for k, p in figs.items() if p and os.path.exists(p)]
-        with open(html, "w", encoding="utf-8") as f:
-            from datetime import datetime
-            import html as htmllib
-
-            f.write("<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'><title>Spiral Monolith NEAT Report | スパイラル・モノリスNEATレポート</title>")
-            f.write(
-                "<style>body{font-family:'Hiragino Sans','Noto Sans JP',sans-serif;background:#fafafa;color:#222;line-height:1.6;padding:2rem;}"
-                "header.cover{background:#fff;border:1px solid #ddd;border-radius:12px;padding:1.5rem;margin-bottom:2rem;box-shadow:0 8px 20px rgba(0,0,0,0.05);}"
-                "header.cover h1{margin-top:0;font-size:1.9rem;}"
-                "header.cover p.meta{margin:0.35rem 0 0.6rem 0;}"
-                "header.cover ul{margin:0;padding-left:1.2rem;}"
-                "section.summary,section.legend,section.narrative,section.examples{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:1.25rem;margin-bottom:2rem;box-shadow:0 10px 24px rgba(0,0,0,0.035);}"
-                "section.summary h2,section.legend h2,section.narrative h2,section.examples h2{margin-top:0;font-size:1.35rem;}"
-                "section.summary ul{margin:0;padding-left:1.4rem;}"
-                "section.legend ol{margin:0;padding-left:1.4rem;}"
-                "section.narrative p{margin:0 0 0.8rem 0;}"
-                "section.examples ul{margin:0;padding-left:1.4rem;}"
-                "section.examples li{margin:0 0 0.65rem 0;}"
-                "section.examples code{background:#f4f4f4;border-radius:6px;display:block;padding:0.35rem 0.55rem;font-size:0.92rem;}"
-                "figure{background:#fff;border:1px solid #e8e8e8;border-radius:12px;padding:1rem;margin:0 0 2rem 0;box-shadow:0 12px 24px rgba(0,0,0,0.04);}"
-                "figure img,figure video{width:100%;height:auto;border-radius:8px;}"
-                "figcaption{margin-top:0.75rem;font-weight:600;}"
-                "</style></head><body>"
+    if args.report:
+        # Priority: supervised task interactive report
+        if args.task:
+            title = f"{args.task.upper()} | Interactive NEAT Report"
+            html_path = os.path.join(args.out, f"{args.task}_interactive.html")
+            export_interactive_html_report(
+                html_path,
+                title=title,
+                history=res.get("history", []),
+                genomes=res.get("genomes_cyto", []),
+                max_genomes=60
             )
+        # RL execution: show learning curve only (genomes optional)
+        if args.rl_env:
+            title = f"{args.rl_env} | Interactive NEAT Report"
+            html_path = os.path.join(args.out, f"{args.rl_env.replace(':','_')}_interactive.html")
+            # RL part: hist variable scope is within this block if it exists
+            try:
+                export_interactive_html_report(html_path, title=title, history=hist, genomes=[], max_genomes=1)
+            except Exception:
+                pass
+        
+        # Also generate the legacy static report if figs exist
+        if figs:
+            # minimal self-contained HTML (base64 embed)
+            def _data_uri(p: str) -> Tuple[str, str]:
+                with open(p, "rb") as f:
+                    import base64
 
-            f.write("<header class='cover'>")
-            f.write("<h1>Spiral Monolith NEAT Report / スパイラル・モノリスNEATレポート</h1>")
-            f.write(
-                f"<p class='meta'>Generated at / 生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Primary Task / 主タスク: {args.task.upper() if args.task else 'N/A'}</p>"
-            )
-            if args.gallery:
-                f.write("<p class='meta'>Gallery Tasks / ギャラリー対象: " + ", ".join(htmllib.escape(t.upper()) for t in args.gallery) + "</p>")
-            f.write("<ul>")
-            f.write(f"<li>Generations / 世代数: {args.gens}</li>")
-            f.write(f"<li>Population / 個体数: {args.pop}</li>")
-            f.write(f"<li>Backprop Steps / 学習反復: {args.steps}</li>")
-            if args.rl_env:
-                f.write(f"<li>RL Environment / 強化学習環境: {htmllib.escape(args.rl_env)}</li>")
-            f.write("</ul>")
-            f.write("</header>")
+                    raw = base64.b64encode(f.read()).decode("ascii")
+                mime, _ = mimetypes.guess_type(p)
+                if mime is None:
+                    if p.lower().endswith(".gif"):
+                        mime = "image/gif"
+                    elif p.lower().endswith((".mp4", ".webm")):
+                        mime = "video/mp4"
+                    else:
+                        mime = "application/octet-stream"
+                return f"data:{mime};base64,{raw}", mime
 
-            summary_items = []
+            html = os.path.join(args.out, "Sakana_NEAT_Report.html")
+            entries = [(k, p) for k, p in figs.items() if p and os.path.exists(p)]
+            with open(html, "w", encoding="utf-8") as f:
+                from datetime import datetime
+                import html as htmllib
 
-            def _fmt_float(val: Optional[float]) -> str:
-                return "–" if val is None else f"{val:.4f}"
-
-            sup_meta = report_meta.get("supervised")
-            if sup_meta:
-                extras = []
-                if sup_meta.get("has_regen_log"):
-                    extras.append("LCS log")
-                if sup_meta.get("has_lcs_viz"):
-                    extras.append("LCS visuals")
-                if sup_meta.get("has_lineage"):
-                    extras.append("lineage")
-                if sup_meta.get("has_spiral"):
-                    extras.append("scar map")
-                extra_txt = f" [{', '.join(extras)}]" if extras else ""
-                summary_items.append(
-                    f"<li><strong>Supervised ({htmllib.escape(sup_meta['task'].upper())})</strong> — best {_fmt_float(sup_meta.get('best_fit'))} | final {_fmt_float(sup_meta.get('final_best'))} / avg {_fmt_float(sup_meta.get('final_avg'))}{extra_txt}</li>"
-                )
-
-            rl_meta = report_meta.get("rl")
-            if rl_meta and rl_meta.get("env"):
-                extras = []
-                if rl_meta.get("has_lcs_log"):
-                    extras.append("LCS log")
-                if rl_meta.get("has_lcs_viz"):
-                    extras.append("LCS visuals")
-                if rl_meta.get("has_gameplay"):
-                    extras.append("gameplay gif")
-                extra_txt = f" [{', '.join(extras)}]" if extras else ""
-                summary_items.append(
-                    f"<li><strong>RL ({htmllib.escape(rl_meta['env'])})</strong> — best {_fmt_float(rl_meta.get('best_reward'))} | final {_fmt_float(rl_meta.get('final_best'))} / avg {_fmt_float(rl_meta.get('final_avg'))}{extra_txt}</li>"
-                )
-
-            f.write("<section class='summary'><h2>Overview / 概要</h2>")
-            f.write(f"<p>Figures included / 図版数: {len(entries)}</p>")
-            if summary_items:
-                f.write("<ul>")
-                for item in summary_items:
-                    f.write(item)
-                f.write("</ul>")
-            else:
-                f.write("<p>No supervised or RL runs were summarised for this report.</p>")
-            f.write("</section>")
-
-            f.write("<section class='narrative'><h2>Evolution Digest / 進化ダイジェスト</h2>")
-            f.write(
-                "<p>Early generations showed smooth structural adaptation and convergence under low-difficulty conditions.</p>"
-            )
-            f.write(
-                "<p>However, as environmental difficulty and noise increased, regeneration-driven mutations began to trigger bursts of morphological diversification, resembling biological punctuated equilibria.</p>"
-            )
-            if sup_meta and sup_meta.get("has_regen_log"):
+                f.write("<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'><title>Spiral Monolith NEAT Report | スパイラル・モノリスNEATレポート</title>")
                 f.write(
-                    "<p>LCS metrics highlighted how severed pathways recovered within the allowed healing window, aligning regenerative bursts with topology repairs.</p>"
+                    "<style>body{font-family:'Hiragino Sans','Noto Sans JP',sans-serif;background:#fafafa;color:#222;line-height:1.6;padding:2rem;}"
+                    "header.cover{background:#fff;border:1px solid #ddd;border-radius:12px;padding:1.5rem;margin-bottom:2rem;box-shadow:0 8px 20px rgba(0,0,0,0.05);}"
+                    "header.cover h1{margin-top:0;font-size:1.9rem;}"
+                    "header.cover p.meta{margin:0.35rem 0 0.6rem 0;}"
+                    "header.cover ul{margin:0;padding-left:1.2rem;}"
+                    "section.summary,section.legend,section.narrative,section.examples{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:1.25rem;margin-bottom:2rem;box-shadow:0 10px 24px rgba(0,0,0,0.035);}"
+                    "section.summary h2,section.legend h2,section.narrative h2,section.examples h2{margin-top:0;font-size:1.35rem;}"
+                    "section.summary ul{margin:0;padding-left:1.4rem;}"
+                    "section.legend ol{margin:0;padding-left:1.4rem;}"
+                    "section.narrative p{margin:0 0 0.8rem 0;}"
+                    "section.examples ul{margin:0;padding-left:1.4rem;}"
+                    "section.examples li{margin:0 0 0.65rem 0;}"
+                    "section.examples code{background:#f4f4f4;border-radius:6px;display:block;padding:0.35rem 0.55rem;font-size:0.92rem;}"
+                    "figure{background:#fff;border:1px solid #e8e8e8;border-radius:12px;padding:1rem;margin:0 0 2rem 0;box-shadow:0 12px 24px rgba(0,0,0,0.04);}"
+                    "figure img,figure video{width:100%;height:auto;border-radius:8px;}"
+                    "figcaption{margin-top:0.75rem;font-weight:600;}"
+                    "</style></head><body>"
                 )
-            f.write("</section>")
 
-            if entries:
-                f.write("<section class='legend'><h2>Figure Index / 図版リスト</h2><ol>")
-                for label, path in entries:
-                    f.write(
-                        f"<li><strong>{htmllib.escape(label)}</strong><br><small>{htmllib.escape(os.path.basename(path))}</small></li>"
-                    )
-                f.write("</ol></section>")
+                f.write("<header class='cover'>")
+                f.write("<h1>Spiral Monolith NEAT Report / スパイラル・モノリスNEATレポート</h1>")
+                f.write(
+                    f"<p class='meta'>Generated at / 生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Primary Task / 主タスク: {args.task.upper() if args.task else 'N/A'}</p>"
+                )
+                if args.gallery:
+                    f.write("<p class='meta'>Gallery Tasks / ギャラリー対象: " + ", ".join(htmllib.escape(t.upper()) for t in args.gallery) + "</p>")
+                f.write("<ul>")
+                f.write(f"<li>Generations / 世代数: {args.gens}</li>")
+                f.write(f"<li>Population / 個体数: {args.pop}</li>")
+                f.write(f"<li>Backprop Steps / 学習反復: {args.steps}</li>")
+                if args.rl_env:
+                    f.write(f"<li>RL Environment / 強化学習環境: {htmllib.escape(args.rl_env)}</li>")
+                f.write("</ul>")
+                f.write("</header>")
 
-            cli_examples = [
-                f"python {script_name} --task {htmllib.escape((args.task or 'spiral'))} --gens {max(args.gens, 60)} --pop {max(args.pop, 64)} --steps {max(args.steps, 80)} --make-gifs --make-lineage --report --out demo_{htmllib.escape((args.task or 'spiral'))}",
-                f"python {script_name} --task xor --gallery spiral circles --gens 40 --pop 48 --steps 60 --report --out gallery_pack"
-            ]
-            rl_example_env = args.rl_env or "CartPole-v1"
-            cli_examples.append(
-                f"python {script_name} --rl-env {htmllib.escape(rl_example_env)} --rl-gens {max(args.rl_gens, 30)} --rl-pop {max(args.rl_pop, 32)} --rl-episodes {max(args.rl_episodes, 2)} --rl-max-steps {args.rl_max_steps} --report --out rl_{htmllib.escape(rl_example_env.replace(':','_'))}"
-            )
+                summary_items = []
 
-            f.write("<section class='examples'><h2>CLI Quickstart / CLIクイックスタート</h2>")
-            f.write("<p>Use the following commands as templates for supervised runs, gallery batches, and Gym integrations.</p>")
-            f.write("<ul>")
-            for cmd in cli_examples:
-                f.write(f"<li><code>{cmd}</code></li>")
-            f.write("</ul></section>")
+                def _fmt_float(val: Optional[float]) -> str:
+                    return "–" if val is None else f"{val:.4f}"
 
-            for k, p in entries:
-                uri, mime = _data_uri(p)
-                escaped_label = htmllib.escape(k)
-                if mime == "image/gif":
-                    f.write(
-                        f"<figure><img src='{uri}' style='max-width:100%'>"
-                        f"<figcaption><strong>{escaped_label}</strong></figcaption></figure>"
+                sup_meta = report_meta.get("supervised")
+                if sup_meta:
+                    extras = []
+                    if sup_meta.get("has_regen_log"):
+                        extras.append("LCS log")
+                    if sup_meta.get("has_lcs_viz"):
+                        extras.append("LCS visuals")
+                    if sup_meta.get("has_lineage"):
+                        extras.append("lineage")
+                    if sup_meta.get("has_spiral"):
+                        extras.append("scar map")
+                    extra_txt = f" [{', '.join(extras)}]" if extras else ""
+                    summary_items.append(
+                        f"<li><strong>Supervised ({htmllib.escape(sup_meta['task'].upper())})</strong> — best {_fmt_float(sup_meta.get('best_fit'))} | final {_fmt_float(sup_meta.get('final_best'))} / avg {_fmt_float(sup_meta.get('final_avg'))}{extra_txt}</li>"
                     )
-                elif mime.startswith("image/"):
-                    f.write(
-                        f"<figure><img src='{uri}' style='max-width:100%'><figcaption><strong>{escaped_label}</strong></figcaption></figure>"
+
+                rl_meta = report_meta.get("rl")
+                if rl_meta and rl_meta.get("env"):
+                    extras = []
+                    if rl_meta.get("has_lcs_log"):
+                        extras.append("LCS log")
+                    if rl_meta.get("has_lcs_viz"):
+                        extras.append("LCS visuals")
+                    if rl_meta.get("has_gameplay"):
+                        extras.append("gameplay gif")
+                    extra_txt = f" [{', '.join(extras)}]" if extras else ""
+                    summary_items.append(
+                        f"<li><strong>RL ({htmllib.escape(rl_meta['env'])})</strong> — best {_fmt_float(rl_meta.get('best_reward'))} | final {_fmt_float(rl_meta.get('final_best'))} / avg {_fmt_float(rl_meta.get('final_avg'))}{extra_txt}</li>"
                     )
-                elif mime.startswith("video/"):
-                    f.write(
-                        "<figure><video autoplay loop muted playsinline style='max-width:100%'>"
-                        f"<source src='{uri}' type='{mime}'></video>"
-                        f"<figcaption><strong>{escaped_label}</strong></figcaption></figure>"
-                    )
+
+                f.write("<section class='summary'><h2>Overview / 概要</h2>")
+                f.write(f"<p>Figures included / 図版数: {len(entries)}</p>")
+                if summary_items:
+                    f.write("<ul>")
+                    for item in summary_items:
+                        f.write(item)
+                    f.write("</ul>")
                 else:
-                    f.write(
-                        f"<figure><a href='{uri}'>download {htmllib.escape(os.path.basename(p))}</a>"
-                        f"<figcaption><strong>{escaped_label}</strong></figcaption></figure>"
-                    )
-            f.write("</body></html>")
+                    f.write("<p>No supervised or RL runs were summarised for this report.</p>")
+                f.write("</section>")
 
-        print("[REPORT]", html)
+                f.write("<section class='narrative'><h2>Evolution Digest / 進化ダイジェスト</h2>")
+                f.write(
+                    "<p>Early generations showed smooth structural adaptation and convergence under low-difficulty conditions.</p>"
+                )
+                f.write(
+                    "<p>However, as environmental difficulty and noise increased, regeneration-driven mutations began to trigger bursts of morphological diversification, resembling biological punctuated equilibria.</p>"
+                )
+                if sup_meta and sup_meta.get("has_regen_log"):
+                    f.write(
+                        "<p>LCS metrics highlighted how severed pathways recovered within the allowed healing window, aligning regenerative bursts with topology repairs.</p>"
+                    )
+                f.write("</section>")
+
+                if entries:
+                    f.write("<section class='legend'><h2>Figure Index / 図版リスト</h2><ol>")
+                    for label, path in entries:
+                        f.write(
+                            f"<li><strong>{htmllib.escape(label)}</strong><br><small>{htmllib.escape(os.path.basename(path))}</small></li>"
+                        )
+                    f.write("</ol></section>")
+
+                cli_examples = [
+                    f"python {script_name} --task {htmllib.escape((args.task or 'spiral'))} --gens {max(args.gens, 60)} --pop {max(args.pop, 64)} --steps {max(args.steps, 80)} --make-gifs --make-lineage --report --out demo_{htmllib.escape((args.task or 'spiral'))}",
+                    f"python {script_name} --task xor --gallery spiral circles --gens 40 --pop 48 --steps 60 --report --out gallery_pack"
+                ]
+                rl_example_env = args.rl_env or "CartPole-v1"
+                cli_examples.append(
+                    f"python {script_name} --rl-env {htmllib.escape(rl_example_env)} --rl-gens {max(args.rl_gens, 30)} --rl-pop {max(args.rl_pop, 32)} --rl-episodes {max(args.rl_episodes, 2)} --rl-max-steps {args.rl_max_steps} --report --out rl_{htmllib.escape(rl_example_env.replace(':','_'))}"
+                )
+
+                f.write("<section class='examples'><h2>CLI Quickstart / CLIクイックスタート</h2>")
+                f.write("<p>Use the following commands as templates for supervised runs, gallery batches, and Gym integrations.</p>")
+                f.write("<ul>")
+                for cmd in cli_examples:
+                    f.write(f"<li><code>{cmd}</code></li>")
+                f.write("</ul></section>")
+
+                for k, p in entries:
+                    uri, mime = _data_uri(p)
+                    escaped_label = htmllib.escape(k)
+                    if mime == "image/gif":
+                        f.write(
+                            f"<figure><img src='{uri}' style='max-width:100%'>"
+                            f"<figcaption><strong>{escaped_label}</strong></figcaption></figure>"
+                        )
+                    elif mime.startswith("image/"):
+                        f.write(
+                            f"<figure><img src='{uri}' style='max-width:100%'><figcaption><strong>{escaped_label}</strong></figcaption></figure>"
+                        )
+                    elif mime.startswith("video/"):
+                        f.write(
+                            "<figure><video autoplay loop muted playsinline style='max-width:100%'>"
+                            f"<source src='{uri}' type='{mime}'></video>"
+                            f"<figcaption><strong>{escaped_label}</strong></figcaption></figure>"
+                        )
+                    else:
+                        f.write(
+                            f"<figure><a href='{uri}'>download {htmllib.escape(os.path.basename(p))}</a>"
+                            f"<figcaption><strong>{escaped_label}</strong></figcaption></figure>"
+                        )
+                f.write("</body></html>")
+
+            print("[REPORT]", html)
 
     print("[OK] outputs in:", args.out)
     return 0
