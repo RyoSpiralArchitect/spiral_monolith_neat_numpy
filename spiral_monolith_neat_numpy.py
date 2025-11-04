@@ -272,7 +272,7 @@ class Genome:
                  hybrid_scale: float = 1.0, parents: Optional[Tuple[Optional[int], Optional[int]]] = None):
         self.nodes = nodes
         self.connections = connections
-        # Hermaphrodites not created in initial distribution, only through mutation
+        # Initialize sex as male or female (hermaphrodites only emerge through mutation)
         self.sex = sex or ('female' if np.random.random() < 0.5 else 'male')
         self.regen = bool(regen)
         self.regen_mode = regen_mode or np.random.choice(['head','tail','split'])
@@ -1933,9 +1933,7 @@ class ReproPlanaNEATPlus:
             use_sexual_reproduction = False  # Explicit flag for sexual reproduction
             
             # Hermaphrodites have high mating bias - reduce asexual ratio when present
-            effective_mix_ratio = mix_ratio
-            if hermaphrodites:
-                effective_mix_ratio = mix_ratio / self.hermaphrodite_mate_bias
+            effective_mix_ratio = mix_ratio / self.hermaphrodite_mate_bias if hermaphrodites else mix_ratio
             
             if self.rng.random()<effective_mix_ratio:
                 parent=pool[int(self.rng.integers(len(pool)))]
