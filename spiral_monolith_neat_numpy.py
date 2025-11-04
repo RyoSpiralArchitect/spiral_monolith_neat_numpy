@@ -54,6 +54,7 @@ def _is_picklable(obj) -> bool:
 _SHM_LOCAL = {}   # parent-owned SharedMemory objects (for cleanup)
 _SHM_META  = {}   # {label -> {'name','shape','dtype','readonly'}}
 _SHM_CACHE = {}   # worker-attached numpy views
+_SHM_HANDLES = {}  # worker-side: keep SharedMemory objects alive
 
 def shm_register_dataset(label: str, arr: "np.ndarray", readonly: bool = True) -> dict:
     """Create shared memory for arr (parent), return metadata dict."""
@@ -73,9 +74,10 @@ def shm_register_dataset(label: str, arr: "np.ndarray", readonly: bool = True) -
 
 def shm_set_worker_meta(meta: dict | None):
     """Install metadata in worker; views are attached lazily on demand."""
-    global _SHM_META, _SHM_CACHE
+    global _SHM_META, _SHM_CACHE, _SHM_HANDLES
     _SHM_META = dict(meta or {})
     _SHM_CACHE = {}
+    _SHM_HANDLES = {}
 
 def get_shared_dataset(label: str) -> "np.ndarray":
     """Worker-side: return cached numpy view to shared dataset by label."""
@@ -93,6 +95,8 @@ def get_shared_dataset(label: str) -> "np.ndarray":
             arr.setflags(write=False)
         except Exception:
             pass
+    # 重要: ハンドルを保持して GC で閉じられないようにする
+    _SHM_HANDLES[label] = shm
     _SHM_CACHE[label] = arr
     return arr
 
@@ -111,6 +115,16 @@ def shm_release_all():
             pass
     _SHM_LOCAL.clear()
 
+def shm_worker_release_all():
+    """Worker-side: close all attached SharedMemory handles."""
+    global _SHM_HANDLES
+    for _label, shm in list(_SHM_HANDLES.items()):
+        try:
+            shm.close()
+        except Exception:
+            pass
+    _SHM_HANDLES.clear()
+
 def _proc_init_worker(meta: dict | None = None):
     """ProcessPool initializer: cap BLAS threads and install SHM metadata."""
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -123,6 +137,12 @@ def _proc_init_worker(meta: dict | None = None):
             shm_set_worker_meta(meta)
         except Exception:
             pass
+    # 重要: worker 終了時に SHM を確実に close
+    try:
+        import atexit
+        atexit.register(shm_worker_release_all)
+    except Exception:
+        pass
 
 def _ensure_matplotlib_agg(force: bool = False):
     """Select Agg backend even if pyplot was already imported elsewhere."""
@@ -3080,27 +3100,47 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
             os.remove(regen_log_path)
 
     # --- Shared memory registration for process-parallel zero-copy
-    shm_meta = {}
-    try:
-        shm_meta["Xtr"] = shm_register_dataset("Xtr", Xtr, readonly=True)
-        shm_meta["ytr"] = shm_register_dataset("ytr", ytr, readonly=True)
-        shm_meta["Xva"] = shm_register_dataset("Xva", Xva, readonly=True)
-        shm_meta["yva"] = shm_register_dataset("yva", yva, readonly=True)
-        neat._shm_meta = shm_meta
-    except Exception:
+    # プロセス並列時のみ SHM を使う（thread では不要なのでリスクを減らす）
+    use_shm = (os.environ.get("NEAT_EVAL_BACKEND", "thread") == "process")
+    if use_shm:
+        shm_meta = {}
+        try:
+            shm_meta["Xtr"] = shm_register_dataset("Xtr", Xtr, readonly=True)
+            shm_meta["ytr"] = shm_register_dataset("ytr", ytr, readonly=True)
+            shm_meta["Xva"] = shm_register_dataset("Xva", Xva, readonly=True)
+            shm_meta["yva"] = shm_register_dataset("yva", yva, readonly=True)
+            neat._shm_meta = shm_meta
+        except Exception:
+            neat._shm_meta = None
+    else:
+        # For thread backend, store datasets directly in cache without SHM
+        _SHM_CACHE["Xtr"] = Xtr
+        _SHM_CACHE["ytr"] = ytr
+        _SHM_CACHE["Xva"] = Xva
+        _SHM_CACHE["yva"] = yva
         neat._shm_meta = None
+    
     fit = FitnessBackpropShared(steps=steps, lr=5e-3, l2=1e-4, alpha_nodes=1e-3, alpha_edges=5e-4)
-    best, hist = neat.evolve(
-        fit,
-        n_generations=gens,
-        verbose=True,
-        env_schedule=_default_difficulty_schedule,
-    )
-    # SHM cleanup
+    
+    # shm_release_all() は try/finally で evolve 呼び出しを包むと例外でも確実に実行されます
     try:
-        shm_release_all()
-    except Exception:
-        pass
+        best, hist = neat.evolve(
+            fit,
+            n_generations=gens,
+            verbose=True,
+            env_schedule=_default_difficulty_schedule,
+        )
+    finally:
+        # SHM cleanup
+        if use_shm:
+            try:
+                shm_release_all()
+            except Exception:
+                pass
+        else:
+            # Clear thread-mode cache
+            _SHM_CACHE.clear()
+    
     lcs_rows = load_lcs_log(regen_log_path) if os.path.exists(regen_log_path) else []
     lcs_series = _prepare_lcs_series(lcs_rows) if lcs_rows else None
     # Outputs
