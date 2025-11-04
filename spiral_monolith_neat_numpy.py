@@ -272,6 +272,7 @@ class Genome:
                  hybrid_scale: float = 1.0, parents: Optional[Tuple[Optional[int], Optional[int]]] = None):
         self.nodes = nodes
         self.connections = connections
+        # Hermaphrodites not created in initial distribution, only through mutation
         self.sex = sex or ('female' if np.random.random() < 0.5 else 'male')
         self.regen = bool(regen)
         self.regen_mode = regen_mode or np.random.choice(['head','tail','split'])
@@ -439,6 +440,15 @@ class Genome:
         self.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
         self.connections[inn2] = ConnectionGene(new_nid, c.out_node, c.weight, True, inn2)
         return True
+
+    def mutate_sex(self, rng: np.random.Generator, hermaphrodite_prob=0.01):
+        """Mutate sex, with low probability of becoming hermaphrodite."""
+        if rng.random() < hermaphrodite_prob:
+            # Can mutate to hermaphrodite from male or female
+            if self.sex in ('male', 'female'):
+                self.sex = 'hermaphrodite'
+                return True
+        return False
 
     # ----- Inference -----
     def evaluate(self, X: np.ndarray) -> np.ndarray:
@@ -1696,8 +1706,10 @@ class ReproPlanaNEATPlus:
         self.mutate_weight_prob = 0.8; self.mutate_toggle_prob = 0.01
         self.weight_perturb_chance = 0.9; self.weight_sigma = 0.8; self.weight_reset_range = 2.0
         self.regen_mode_mut_rate = 0.05; self.embryo_bias_mut_rate = 0.03
+        self.mutate_sex_prob = 0.005  # Low probability for hermaphrodite emergence
         self.regen_rate = 0.15; self.allow_selfing = True
-        self.sex_fitness_scale = {'female':1.0, 'male':0.9}; self.regen_bonus = 0.2
+        self.sex_fitness_scale = {'female':1.0, 'male':0.9, 'hermaphrodite':1.2}; self.regen_bonus = 0.2
+        self.hermaphrodite_mate_bias = 2.5  # Hermaphrodites have high mating preference
         self.env = {'difficulty':0.0, 'noise_std':0.0}
         self.mix_asexual_base = 0.10; self.mix_asexual_gain = 0.40
         self.injury_intensity_base = 0.25; self.injury_intensity_gain = 0.65
@@ -1836,6 +1848,7 @@ class ReproPlanaNEATPlus:
         if self.rng.random() < self.mutate_add_node_prob: genome.mutate_add_node(self.rng, self.innov)
         if self.rng.random() < self.mutate_add_conn_prob: genome.mutate_add_connection(self.rng, self.innov)
         if self.rng.random() < self.mutate_weight_prob: genome.mutate_weights(self.rng, self.weight_perturb_chance, self.weight_sigma, self.weight_reset_range)
+        if self.rng.random() < self.mutate_sex_prob: genome.mutate_sex(self.rng)
         if self.rng.random() < self.regen_mode_mut_rate:
             if self.env['difficulty'] > 0.6: genome.regen_mode = self.rng.choice(['split','head','tail'], p=[0.6,0.25,0.15])
             else: genome.regen_mode = self.rng.choice(['split','head','tail'])
@@ -1873,7 +1886,14 @@ class ReproPlanaNEATPlus:
                         child_nodes[nid] = NodeGene(n.id, n.type, n.activation)
         child = Genome(child_nodes, child_conns)
         child.max_hidden_nodes = self.max_hidden_nodes; child.max_edges = self.max_edges
-        child.sex = 'female' if self.rng.random() < 0.5 else 'male'
+        # Hermaphrodite trait is very difficult to inherit (only 5% chance if at least one parent is hermaphrodite)
+        if mother.sex == 'hermaphrodite' or father.sex == 'hermaphrodite':
+            if self.rng.random() < 0.05:  # Very low inheritance rate
+                child.sex = 'hermaphrodite'
+            else:
+                child.sex = 'female' if self.rng.random() < 0.5 else 'male'
+        else:
+            child.sex = 'female' if self.rng.random() < 0.5 else 'male'
         p = 0.7 if (mother.regen or father.regen) else 0.2
         child.regen = bool(self.rng.random() < p)
         child.regen_mode = self.rng.choice(['head','tail','split'])
@@ -1890,10 +1910,13 @@ class ReproPlanaNEATPlus:
             self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
         remaining = offspring_counts[sidx]-len(elites)
         k = max(2, int(math.ceil(self.survival_rate * len(sp.members))))
-        females=[g for g,_ in sp.members[:k] if g.sex=='female']; males=[g for g,_ in sp.members[:k] if g.sex=='male']; pool=[g for g,_ in sp.members[:k]]
+        females=[g for g,_ in sp.members[:k] if g.sex=='female']; males=[g for g,_ in sp.members[:k] if g.sex=='male']
+        hermaphrodites=[g for g,_ in sp.members[:k] if g.sex=='hermaphrodite']
+        pool=[g for g,_ in sp.members[:k]]
         if (not females) or (not males):
             females = [g for g,_ in sp.members if g.sex=='female'] or females
             males   = [g for g,_ in sp.members if g.sex=='male'] or males
+            hermaphrodites = [g for g,_ in sp.members if g.sex=='hermaphrodite'] or hermaphrodites
         mix_ratio=self._mix_asexual_ratio()
         monitor = getattr(self, "lcs_monitor", None)
         weight_tol = getattr(monitor, "eps", 0.0) if monitor is not None else 0.0
@@ -1901,9 +1924,17 @@ class ReproPlanaNEATPlus:
             mode=None
             mother_id=None; father_id=None
             parent_adj_before_regen=None
-            if self.rng.random()<mix_ratio:
+            # Hermaphrodites have high mating bias - reduce asexual ratio when present
+            effective_mix_ratio = mix_ratio
+            if hermaphrodites:
+                effective_mix_ratio = mix_ratio / self.hermaphrodite_mate_bias
+            if self.rng.random()<effective_mix_ratio:
                 parent=pool[int(self.rng.integers(len(pool)))]
-                if parent.regen and self.mode.enable_regen_reproduction:
+                # Hermaphrodites CANNOT reproduce parthenogenetically
+                if parent.sex == 'hermaphrodite':
+                    # Force sexual reproduction for hermaphrodites
+                    pass  # Skip to sexual reproduction below
+                elif parent.regen and self.mode.enable_regen_reproduction:
                     if monitor is not None:
                         parent_adj_before_regen = parent.weighted_adjacency()
                     child = platyregenerate(parent, self.rng, self.innov, intensity=self._regen_intensity())
@@ -1911,19 +1942,33 @@ class ReproPlanaNEATPlus:
                 else:
                     child=parent.copy(); mode='asexual_clone'
                 mother_id=parent.id; father_id=None
-            else:
-                if females and males and self.rng.random()>self.pollen_flow_rate:
-                    mother=females[int(self.rng.integers(len(females)))]; father=males[int(self.rng.integers(len(males)))]; mode='sexual_within'; sp_for_fit=sp.members
+            
+            # Sexual reproduction (or fallthrough from hermaphrodite attempting asexual)
+            if mode is None:
+                # Build mating pools including hermaphrodites
+                # Hermaphrodites can act as either male or female
+                potential_mothers = females + hermaphrodites
+                potential_fathers = males + hermaphrodites
+                
+                if potential_mothers and potential_fathers and self.rng.random()>self.pollen_flow_rate:
+                    mother=potential_mothers[int(self.rng.integers(len(potential_mothers)))]
+                    father=potential_fathers[int(self.rng.integers(len(potential_fathers)))]
+                    mode='sexual_within'; sp_for_fit=sp.members
                 else:
                     if len(species_pool)>1:
                         mother=pool[int(self.rng.integers(len(pool)))]
                         other=species_pool[(sidx+1)%len(species_pool)]
-                        other_pool=[g for g,_ in other.members]; males_other=[g for g,_ in other.members if g.sex=='male']
-                        father = males_other[int(self.rng.integers(len(males_other)))] if males_other else other_pool[int(self.rng.integers(len(other_pool)))]
+                        other_pool=[g for g,_ in other.members]
+                        other_males=[g for g,_ in other.members if g.sex=='male']
+                        other_herm=[g for g,_ in other.members if g.sex=='hermaphrodite']
+                        father_pool = other_males + other_herm if (other_males or other_herm) else other_pool
+                        father = father_pool[int(self.rng.integers(len(father_pool)))]
                         mode='sexual_cross'; sp_for_fit = sp.members + other.members
                     else:
-                        if females and males:
-                            mother=females[int(self.rng.integers(len(females)))]; father=males[int(self.rng.integers(len(males)))]; mode='sexual_within'; sp_for_fit=sp.members
+                        if potential_mothers and potential_fathers:
+                            mother=potential_mothers[int(self.rng.integers(len(potential_mothers)))]
+                            father=potential_fathers[int(self.rng.integers(len(potential_fathers)))]
+                            mode='sexual_within'; sp_for_fit=sp.members
                         else:
                             parent=pool[int(self.rng.integers(len(pool)))]
                             if self.allow_selfing:
@@ -2173,9 +2218,12 @@ class ReproPlanaNEATPlus:
             if verbose:
                 noise = float(self.env.get('noise_std', 0.0))
                 ev=self.event_log[-1] if self.event_log else {'sexual_within':0,'sexual_cross':0,'asexual_regen':0}
+                # Count hermaphrodites in population
+                n_herm = sum(1 for g in self.population if g.sex == 'hermaphrodite')
+                herm_str = f" | herm {n_herm}" if n_herm > 0 else ""
                 print(
                     f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | "
-                    f"sexual {ev.get('sexual_within',0)+ev.get('sexual_cross',0)} | regen {ev.get('asexual_regen',0)}"
+                    f"sexual {ev.get('sexual_within',0)+ev.get('sexual_cross',0)} | regen {ev.get('asexual_regen',0)}{herm_str}"
                 )
             if best_fit > best_ever_fit:
                 best_ever_fit = best_fit; best_ever = self.population[best_idx].copy()
@@ -2817,16 +2865,21 @@ def render_lineage(neat, path="lineage.png", title="Lineage", max_edges: Optiona
             ax.add_patch(arr)
     # nodes (shape encodes sex; size encodes regen)
     reg = getattr(neat, "node_registry", {})
-    xs_f=[]; ys_f=[]; ss_f=[]; xs_m=[]; ys_m=[]; ss_m=[]; xs_u=[]; ys_u=[]; ss_u=[]
+    xs_f=[]; ys_f=[]; ss_f=[]; xs_m=[]; ys_m=[]; ss_m=[]; xs_h=[]; ys_h=[]; ss_h=[]; xs_u=[]; ys_u=[]; ss_u=[]
     for nid,(x,y) in pos.items():
         info = reg.get(nid, {}); sex = info.get('sex', None); regen = bool(info.get('regen', False))
         size = 80*(1.3 if regen else 1.0)
         if sex=='female': xs_f.append(x); ys_f.append(y); ss_f.append(size)
         elif sex=='male': xs_m.append(x); ys_m.append(y); ss_m.append(size)
+        elif sex=='hermaphrodite': xs_h.append(x); ys_h.append(y); ss_h.append(size)
         else: xs_u.append(x); ys_u.append(y); ss_u.append(size)
-    if xs_f: ax.scatter(xs_f, ys_f, s=ss_f, marker='o', alpha=0.95)
-    if xs_m: ax.scatter(xs_m, ys_m, s=ss_m, marker='s', alpha=0.95)
-    if xs_u: ax.scatter(xs_u, ys_u, s=ss_u, marker='^', alpha=0.95)
+    if xs_f: ax.scatter(xs_f, ys_f, s=ss_f, marker='o', alpha=0.95, c='#FF69B4', label='female')
+    if xs_m: ax.scatter(xs_m, ys_m, s=ss_m, marker='s', alpha=0.95, c='#4169E1', label='male')
+    if xs_h: ax.scatter(xs_h, ys_h, s=ss_h, marker='D', alpha=0.95, c='#9370DB', label='hermaphrodite')
+    if xs_u: ax.scatter(xs_u, ys_u, s=ss_u, marker='^', alpha=0.95, c='#808080')
+    # Add legend if there are any sex-typed nodes
+    if xs_f or xs_m or xs_h:
+        ax.legend(loc='best', frameon=False, fontsize=9)
     # highlight ring
     hi = set(highlight or [])
     if hi:
