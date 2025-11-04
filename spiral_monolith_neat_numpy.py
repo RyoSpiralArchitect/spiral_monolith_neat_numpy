@@ -1631,7 +1631,7 @@ class ReproPlanaNEATPlus:
         self.rng = rng if rng is not None else np.random.default_rng()
         self.mode = EvalMode(vanilla=True, enable_regen_reproduction=False)
         self.max_hidden_nodes = 128; self.max_edges = 1024
-        self.complexity_threshold: Optional[float] = 1.0
+        self.complexity_threshold: Optional[float] = 5.0  # 1.0 → 5.0 複雑トポロジー許容のデフォルト値
         # ---- Hardened knobs
         self.grad_clip = 5.0
         self.weight_clip = 12.0
@@ -4079,8 +4079,8 @@ def _apply_stable_neat_defaults(neat: ReproPlanaNEATPlus):
     neat.mutate_weight_prob = 0.8
     neat.regen_mode_mut_rate = 0.05
     neat.mix_asexual_base = 0.10
-    if getattr(neat, "complexity_threshold", None) is None:
-        neat.complexity_threshold = 5.0  # 1.0 → 5.0 に増加して複雑なトポロジーを許容
+    # 常に5.0に設定して複雑なトポロジーを許容
+    neat.complexity_threshold = 5.0
 
 
 def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str = 'identity'):
