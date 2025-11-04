@@ -2139,10 +2139,11 @@ class ReproPlanaNEATPlus:
             # Further decrease from 0.3 to 0.0
             multiplier = 0.3 - 0.3 * (diff - 1.5) / (bonus_threshold - 1.5)
         else:
-            # Bonus for complexity at extreme difficulty (negative penalty)
+            # Bonus for complexity at extreme difficulty (negative penalty = bonus)
             multiplier = bonus_multiplier * (diff - bonus_threshold)
         
         penalty = multiplier * m.complexity_alpha * (m.node_penalty*n_hidden + m.edge_penalty*n_edges)
+        # Only apply threshold cap to positive penalties (not to bonuses)
         threshold = getattr(self, "complexity_threshold", None)
         if threshold is not None and penalty > 0:
             penalty = min(float(threshold), penalty)
@@ -2308,6 +2309,12 @@ class ReproPlanaNEATPlus:
             best_idx=int(np.argmax(fitnesses)); best_fit=float(fitnesses[best_idx]); avg_fit=float(np.mean(fitnesses))
             
             # === Track top-3 diverse topologies ===
+            # Helper function to get genome complexity
+            def genome_complexity(g):
+                n_hidden = sum(1 for n in g.nodes.values() if n.type=='hidden')
+                n_edges = sum(1 for c in g.connections.values() if c.enabled)
+                return (n_hidden, n_edges)
+            
             # Get top candidates sorted by fitness
             sorted_indices = np.argsort(fitnesses)[::-1]
             pool_size = getattr(self, 'top3_candidate_pool_size', 10)
@@ -2317,25 +2324,29 @@ class ReproPlanaNEATPlus:
             for idx in sorted_indices[:pool_size]:  # Check top N to find diverse top-3
                 candidate = self.population[idx].copy()
                 candidate_fit = float(fitnesses[idx])
+                n_hidden_cand, n_edges_cand = genome_complexity(candidate)
+                
                 # Check if this topology is sufficiently different from existing top-3
                 is_diverse = True
                 for existing_genome, _, _ in top3_best:
-                    # Calculate structural difference (simple metric: different node/edge counts)
-                    n_hidden_cand = sum(1 for n in candidate.nodes.values() if n.type=='hidden')
-                    n_edges_cand = sum(1 for c in candidate.connections.values() if c.enabled)
-                    n_hidden_exist = sum(1 for n in existing_genome.nodes.values() if n.type=='hidden')
-                    n_edges_exist = sum(1 for c in existing_genome.connections.values() if c.enabled)
+                    n_hidden_exist, n_edges_exist = genome_complexity(existing_genome)
                     # If very similar in structure, skip
                     if abs(n_hidden_cand - n_hidden_exist) <= node_threshold and abs(n_edges_cand - n_edges_exist) <= edge_threshold:
                         is_diverse = False
                         break
-                if is_diverse or len(top3_best) < 3:
-                    # Add or update top-3
+                
+                # Add if diverse or if we don't have 3 yet
+                if len(top3_best) < 3:
+                    top3_best.append((candidate, candidate_fit, gen))
+                elif is_diverse:
+                    # Only add if diverse and better than the worst in top-3
                     top3_best.append((candidate, candidate_fit, gen))
                     # Sort by fitness and keep only top-3
                     top3_best.sort(key=lambda x: x[1], reverse=True)
                     top3_best = top3_best[:3]
-                if len(top3_best) >= 3:
+                
+                if len(top3_best) >= 3 and not is_diverse:
+                    # Stop if we have 3 and current is not diverse
                     break
             
             # === Snapshots (decimated & bounded) ===
