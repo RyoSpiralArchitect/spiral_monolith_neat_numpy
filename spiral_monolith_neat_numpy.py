@@ -441,13 +441,17 @@ class Genome:
         self.connections[inn2] = ConnectionGene(new_nid, c.out_node, c.weight, True, inn2)
         return True
 
-    def mutate_sex(self, rng: np.random.Generator, hermaphrodite_prob=0.01):
-        """Mutate sex, with low probability of becoming hermaphrodite."""
-        if rng.random() < hermaphrodite_prob:
-            # Can mutate to hermaphrodite from male or female
-            if self.sex in ('male', 'female'):
-                self.sex = 'hermaphrodite'
-                return True
+    def mutate_sex(self, rng: np.random.Generator):
+        """Mutate sex, with low probability of becoming hermaphrodite.
+        
+        The mutation probability is controlled by the NEAT instance's mutate_sex_prob parameter.
+        Only male or female individuals can mutate into hermaphrodites.
+        """
+        # This method is called by _mutate when the mutation is triggered
+        # The probability check is done in _mutate, so we just perform the mutation
+        if self.sex in ('male', 'female'):
+            self.sex = 'hermaphrodite'
+            return True
         return False
 
     # ----- Inference -----
@@ -1707,6 +1711,7 @@ class ReproPlanaNEATPlus:
         self.weight_perturb_chance = 0.9; self.weight_sigma = 0.8; self.weight_reset_range = 2.0
         self.regen_mode_mut_rate = 0.05; self.embryo_bias_mut_rate = 0.03
         self.mutate_sex_prob = 0.005  # Low probability for hermaphrodite emergence
+        self.hermaphrodite_inheritance_rate = 0.05  # Very low inheritance rate (5%)
         self.regen_rate = 0.15; self.allow_selfing = True
         self.sex_fitness_scale = {'female':1.0, 'male':0.9, 'hermaphrodite':1.2}; self.regen_bonus = 0.2
         self.hermaphrodite_mate_bias = 2.5  # Hermaphrodites have high mating preference
@@ -1886,9 +1891,10 @@ class ReproPlanaNEATPlus:
                         child_nodes[nid] = NodeGene(n.id, n.type, n.activation)
         child = Genome(child_nodes, child_conns)
         child.max_hidden_nodes = self.max_hidden_nodes; child.max_edges = self.max_edges
-        # Hermaphrodite trait is very difficult to inherit (only 5% chance if at least one parent is hermaphrodite)
+        # Hermaphrodite trait is very difficult to inherit
+        # Inheritance rate controlled by hermaphrodite_inheritance_rate parameter
         if mother.sex == 'hermaphrodite' or father.sex == 'hermaphrodite':
-            if self.rng.random() < 0.05:  # Very low inheritance rate
+            if self.rng.random() < self.hermaphrodite_inheritance_rate:
                 child.sex = 'hermaphrodite'
             else:
                 child.sex = 'female' if self.rng.random() < 0.5 else 'male'
@@ -1924,27 +1930,32 @@ class ReproPlanaNEATPlus:
             mode=None
             mother_id=None; father_id=None
             parent_adj_before_regen=None
+            use_sexual_reproduction = False  # Explicit flag for sexual reproduction
+            
             # Hermaphrodites have high mating bias - reduce asexual ratio when present
             effective_mix_ratio = mix_ratio
             if hermaphrodites:
                 effective_mix_ratio = mix_ratio / self.hermaphrodite_mate_bias
+            
             if self.rng.random()<effective_mix_ratio:
                 parent=pool[int(self.rng.integers(len(pool)))]
-                # Hermaphrodites CANNOT reproduce parthenogenetically
+                # Hermaphrodites CANNOT reproduce parthenogenetically - force sexual reproduction
                 if parent.sex == 'hermaphrodite':
-                    # Force sexual reproduction for hermaphrodites
-                    pass  # Skip to sexual reproduction below
+                    use_sexual_reproduction = True
                 elif parent.regen and self.mode.enable_regen_reproduction:
                     if monitor is not None:
                         parent_adj_before_regen = parent.weighted_adjacency()
                     child = platyregenerate(parent, self.rng, self.innov, intensity=self._regen_intensity())
                     mode='asexual_regen'
+                    mother_id=parent.id; father_id=None
                 else:
                     child=parent.copy(); mode='asexual_clone'
-                mother_id=parent.id; father_id=None
+                    mother_id=parent.id; father_id=None
+            else:
+                use_sexual_reproduction = True
             
-            # Sexual reproduction (or fallthrough from hermaphrodite attempting asexual)
-            if mode is None:
+            # Sexual reproduction (either forced by hermaphrodite or chosen by mix_ratio)
+            if use_sexual_reproduction:
                 # Build mating pools including hermaphrodites
                 # Hermaphrodites can act as either male or female
                 potential_mothers = females + hermaphrodites
