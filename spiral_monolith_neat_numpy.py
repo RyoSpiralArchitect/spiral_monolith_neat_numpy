@@ -18,6 +18,22 @@ from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
 from collections import deque, defaultdict, OrderedDict
 import math, argparse, os, mimetypes, csv
 import matplotlib
+import warnings
+
+# === Safety & Runtime Preamble ===============================================
+# - BLAS スレッドを 1 に制限して並列評価との過剰スレッド競合を防止
+# - HF cache の非推奨環境変数をブリッジ
+# - 既知の FutureWarning を静音化
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("BLIS_NUM_THREADS", "1")
+if "TRANSFORMERS_CACHE" in os.environ and "HF_HOME" not in os.environ:
+    os.environ["HF_HOME"] = os.environ["TRANSFORMERS_CACHE"]
+warnings.filterwarnings("ignore", category=FutureWarning, message=r".*TRANSFORMERS_CACHE.*")
+warnings.filterwarnings("ignore", category=FutureWarning, message=r".*torch_dtype.*deprecated.*Use `dtype`.*")
 
 
 def _ensure_matplotlib_agg(force: bool = False):
@@ -851,12 +867,157 @@ def _regenerate_split(g: Genome, rng: np.random.Generator, innov: InnovationTrac
             g.connections[inn] = ConnectionGene(dup_id, cout.out_node, cout.weight + float(rng.normal(0,0.1)), True, inn)
     return g
 
+def _reachable_outputs_fraction(g, eps=0.0) -> float:
+    """Fraction of outputs that are reachable from any input via edges with |w|>eps."""
+    adj = g.weighted_adjacency()
+    inputs = [nid for nid, n in g.nodes.items() if n.type in ('input','bias')]
+    outputs = [nid for nid, n in g.nodes.items() if n.type == 'output']
+    if not inputs or not outputs:
+        return 1.0
+    seen = set(inputs)
+    q = deque(inputs)
+    while q:
+        u = q.popleft()
+        for v, w in adj.get(u, []):
+            if abs(w) <= eps:
+                continue
+            if v not in seen:
+                seen.add(v); q.append(v)
+    cnt = sum(1 for o in outputs if o in seen)
+    return float(cnt) / max(1, len(outputs))
+
+def _connectivity_guard(g, innov, rng, min_frac=0.6, max_new_edges=16, eps=0.0):
+    """If reachability falls below min_frac, add safe forward edges."""
+    frac = _reachable_outputs_fraction(g, eps=eps)
+    if frac >= min_frac:
+        return
+    inputs = [nid for nid, n in g.nodes.items() if n.type in ('input','bias')]
+    outputs = [nid for nid, n in g.nodes.items() if n.type == 'output']
+    adj = g.weighted_adjacency()
+    seen = set(inputs); q = deque(inputs)
+    while q:
+        u = q.popleft()
+        for v, w in adj.get(u, []):
+            if abs(w) <= eps: continue
+            if v not in seen:
+                seen.add(v); q.append(v)
+    sources = sorted([nid for nid in seen if g.nodes[nid].type in ('hidden','input','bias')])
+    unreachable = [o for o in outputs if o not in seen]
+    attempts = 0
+    rng_local = rng or np.random.default_rng()
+    while unreachable and attempts < int(max_new_edges):
+        if not sources: break
+        src = int(rng_local.choice(sources))
+        out = int(rng_local.choice(unreachable))
+        if (not g.has_connection(src, out)) and (not g._creates_cycle(src, out)):
+            inn = innov.get_conn_innovation(src, out)
+            g.connections[inn] = ConnectionGene(src, out, float(rng_local.uniform(0.6, 1.6)), True, inn)
+            # 再評価
+            adj = g.weighted_adjacency()
+            seen = set(inputs); q = deque(inputs)
+            while q:
+                u = q.popleft()
+                for v, w in adj.get(u, []):
+                    if abs(w) <= eps: continue
+                    if v not in seen: seen.add(v); q.append(v)
+            unreachable = [o for o in outputs if o not in seen]
+        attempts += 1
+
+def _soft_regenerate_head(g, rng, innov, intensity=0.5):
+    inputs = [nid for nid, n in g.nodes.items() if n.type in ('input','bias')]
+    candidates = [c for c in g.enabled_connections() if c.in_node in inputs]
+    if not candidates: return g
+    rng_local = rng or np.random.default_rng()
+    keep_rate = max(0.65, 1.0 - 0.5 * float(intensity))
+    n = len(candidates)
+    n_disable = int(min(n*(1.0-keep_rate)*0.4, max(1, 0.1*n)))
+    n_atten = int(min(n*(1.0-keep_rate), n - n_disable))
+    idx = np.arange(n); rng_local.shuffle(idx)
+    for k in idx[:n_atten]:
+        c = candidates[k]; c.weight *= float(rng_local.uniform(0.6, 0.9))
+    for k in idx[n_atten:n_atten+n_disable]:
+        c = candidates[k]; c.enabled = False
+    m = int(1 + round(2 * float(intensity)))
+    for _ in range(m):
+        c = candidates[int(rng_local.integers(n))]
+        new_id = innov.get_or_create_split_node(c.in_node, c.out_node)
+        if new_id not in g.nodes:
+            g.nodes[new_id] = NodeGene(new_id, 'hidden', 'tanh')
+        inn1 = innov.get_conn_innovation(c.in_node, new_id)
+        inn2 = innov.get_conn_innovation(new_id, c.out_node)
+        g.connections[inn1] = ConnectionGene(c.in_node, new_id, 1.0, True, inn1)
+        g.connections[inn2] = ConnectionGene(new_id, c.out_node, c.weight, True, inn2)
+    return g
+
+def _soft_regenerate_tail(g, rng, innov, intensity=0.5):
+    outputs = [nid for nid, n in g.nodes.items() if n.type == 'output']
+    sinks = [c for c in g.enabled_connections() if c.out_node in outputs]
+    if not sinks: return g
+    rng_local = rng or np.random.default_rng()
+    k = max(1, int(len(sinks) * (0.15 + 0.45 * float(intensity))))
+    hidden = [nid for nid, n in g.nodes.items() if n.type == 'hidden']
+    choose = sinks if k >= len(sinks) else list(np.random.default_rng().choice(sinks, size=k, replace=False))
+    for c in choose:
+        c.weight = float(rng_local.uniform(-1.8, 1.8))
+        if hidden and rng_local.random() < (0.25 + 0.35 * float(intensity)):
+            new_src = int(rng_local.choice(hidden))
+            if (not g.has_connection(new_src, c.out_node)) and (not g._creates_cycle(new_src, c.out_node)):
+                inn = innov.get_conn_innovation(new_src, c.out_node)
+                g.connections[inn] = ConnectionGene(new_src, c.out_node, float(rng_local.uniform(-1.6, 1.6)), True, inn)
+    return g
+
+def _soft_regenerate_split(g, rng, innov, intensity=0.5):
+    hidden = [nid for nid, n in g.nodes.items() if n.type == 'hidden']
+    rng_local = rng or np.random.default_rng()
+    if not hidden:
+        enabled = [c for c in g.connections.values() if c.enabled]
+        if not enabled: return g
+        c = enabled[int(rng_local.integers(len(enabled)))]
+        c.enabled = False
+        new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
+        if new_nid not in g.nodes:
+            g.nodes[new_nid] = NodeGene(new_nid, 'hidden', 'tanh')
+        inn1 = innov.get_conn_innovation(c.in_node, new_nid)
+        inn2 = innov.get_conn_innovation(new_nid, c.out_node)
+        g.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
+        g.connections[inn2] = ConnectionGene(new_nid, c.out_node, c.weight, True, inn2)
+        return g
+    target = int(rng_local.choice(hidden))
+    dup_id = innov.new_node_id()
+    g.nodes[dup_id] = NodeGene(dup_id, 'hidden', 'tanh')
+    incomings = [c for c in g.enabled_connections() if c.out_node == target]
+    for cin in incomings:
+        inn = innov.get_conn_innovation(cin.in_node, dup_id)
+        g.connections[inn] = ConnectionGene(cin.in_node, dup_id, cin.weight + float(rng_local.normal(0, 0.08)), True, inn)
+    outgoings = [c for c in g.enabled_connections() if c.in_node == target]
+    move_p = min(0.7, 0.25 + 0.45 * float(intensity))
+    for cout in outgoings:
+        if rng_local.random() < move_p:
+            cout.enabled = False
+            inn = innov.get_conn_innovation(dup_id, cout.out_node)
+            g.connections[inn] = ConnectionGene(dup_id, cout.out_node, cout.weight + float(rng_local.normal(0, 0.08)), True, inn)
+    # 少量の並列出力枝を保持
+    if outgoings and rng_local.random() < 0.3:
+        pick = outgoings[int(rng_local.integers(len(outgoings)))]
+        if (not g.has_connection(target, pick.out_node)) and (not g._creates_cycle(target, pick.out_node)):
+            inn = innov.get_conn_innovation(target, pick.out_node)
+            g.connections[inn] = ConnectionGene(target, pick.out_node, pick.weight, True, inn)
+    return g
+
 def platyregenerate(genome: Genome, rng: np.random.Generator, innov: InnovationTracker, intensity=0.5) -> Genome:
+    """Soft regeneration + connectivity guard."""
     g = genome.copy()
     mode = g.regen_mode or 'split'
-    if mode == 'head': g = _regenerate_head(g, rng, innov, intensity)
-    elif mode == 'tail': g = _regenerate_tail(g, rng, innov, intensity)
-    else: g = _regenerate_split(g, rng, innov, intensity)
+    if mode == 'head': g = _soft_regenerate_head(g, rng, innov, intensity)
+    elif mode == 'tail': g = _soft_regenerate_tail(g, rng, innov, intensity)
+    else: g = _soft_regenerate_split(g, rng, innov, intensity)
+    eps = 0.0
+    try:
+        monitor = getattr(getattr(genome, "lcs_monitor", None), "eps", None)  # best-effort
+        eps = float(monitor or 0.0)
+    except Exception:
+        pass
+    _connectivity_guard(g, innov, rng, min_frac=getattr(genome, "min_conn_after_regen", 0.65), eps=eps)
     return g
 
 # ============================================================
@@ -1756,30 +1917,64 @@ def loss_and_output_delta(comp, Z, y, l2, w):
     return loss, delta_out, probs
 
 def backprop_step(comp, X, y, w, lr=1e-2, l2=1e-4):
+    """
+    Hardened backprop with gradient/weight clipping and NaN guards.
+    既存シグネチャ互換（追加引数は train_* から供給）。
+    """
+    import numpy as _np
+    # 追加の安全引数（後方互換のため default をここで拾う）
+    grad_clip = 5.0
+    w_clip = 12.0
     A, Z = forward_batch(comp, X, w)
     loss, delta_out, _ = loss_and_output_delta(comp, Z, y, l2, w)
+    if not _np.isfinite(loss):
+        # ソフト・リセット
+        w = _np.tanh(w) * 0.1
+        loss = float(_np.nan_to_num(loss, nan=1e3, posinf=1e3, neginf=1e3))
     B = X.shape[0]; n = len(comp['order'])
-    grad_w = np.zeros_like(w); delta_z = np.zeros((B, n), dtype=np.float64); delta_a = np.zeros((B, n), dtype=np.float64)
-    for j, oi in enumerate(comp['outputs']): delta_z[:, oi] = delta_out[:, j:j+1].reshape(B)
+    grad_w = _np.zeros_like(w)
+    delta_z = _np.zeros((B, n), dtype=_np.float64)
+    delta_a = _np.zeros((B, n), dtype=_np.float64)
+    for j, oi in enumerate(comp['outputs']):
+        delta_z[:, oi] = delta_out[:, j:j+1].reshape(B)
     for j in reversed(range(n)):
         t = comp['types'][j]
-        if t == 'output': dz = delta_z[:, j]
-        elif t in ('input','bias'): continue
+        if t == 'output':
+            dz = delta_z[:, j]
+        elif t in ('input','bias'):
+            continue
         else:
-            dz = delta_a[:, j] * act_deriv(comp['acts'][j], Z[:, j]); delta_z[:, j] = dz
+            dz = delta_a[:, j] * act_deriv(comp['acts'][j], Z[:, j])
+            delta_z[:, j] = dz
         for e in comp['in_edges'][j]:
             s = comp['src'][e]
-            grad_w[e] += np.dot(A[:, s], dz)
+            grad_w[e] += _np.dot(A[:, s], dz)
             delta_a[:, s] += dz * w[e]
-    grad_w = grad_w / B + l2 * w
-    w_new = w - lr * grad_w
+    grad_w = grad_w / max(1, B) + l2 * w
+    if not _np.all(_np.isfinite(grad_w)):
+        grad_w = _np.nan_to_num(grad_w, nan=0.0, posinf=0.0, neginf=0.0)
+    # global-norm clip
+    if grad_clip and grad_clip > 0:
+        gnorm = float(_np.linalg.norm(grad_w))
+        if _np.isfinite(gnorm) and gnorm > grad_clip:
+            grad_w *= (grad_clip / (gnorm + 1e-12))
+    w_new = w - float(lr) * grad_w
+    if w_clip and w_clip > 0:
+        _np.clip(w_new, -float(w_clip), float(w_clip), out=w_new)
     return w_new, float(loss)
 
-def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=1e-2, l2=1e-4):
+def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=1e-2, l2=1e-4, grad_clip=5.0, w_clip=12.0):
     comp = compile_genome(genome); w = comp['w'].copy(); history=[]
-    for _ in range(steps):
-        w, L = backprop_step(comp, X, y, w, lr=lr, l2=l2); history.append(L)
-    for e_idx, inn in enumerate(comp['eid']): genome.connections[inn].weight = float(w[e_idx])
+    if w.size == 0:
+        return history
+    for _ in range(int(steps)):
+        # backprop_step 側は後方互換だが、将来のため明示引数を付ける
+        w, L = backprop_step(comp, X, y, w, lr=lr, l2=l2)
+        if not np.isfinite(L):
+            L = float(np.nan_to_num(L, nan=1e3, posinf=1e3, neginf=1e3))
+        history.append(L)
+    for e_idx, inn in enumerate(comp['eid']):
+        genome.connections[inn].weight = float(w[e_idx])
     return history
 
 def predict_proba(genome: Genome, X):
