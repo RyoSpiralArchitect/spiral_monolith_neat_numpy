@@ -1702,7 +1702,10 @@ class ReproPlanaNEATPlus:
         self.weight_perturb_chance = 0.9; self.weight_sigma = 0.8; self.weight_reset_range = 2.0
         self.regen_mode_mut_rate = 0.05; self.embryo_bias_mut_rate = 0.03
         self.regen_rate = 0.15; self.allow_selfing = True
-        self.sex_fitness_scale = {'female':1.0, 'male':0.9}; self.regen_bonus = 0.2
+        self.sex_mutation_rate = 0.005  # Low chance to mutate sex to gynandromorph
+        self.gynandromorph_inheritance_rate = 0.05  # Very low inheritance of gynandromorph trait
+        self.sex_fitness_scale = {'female':1.0, 'male':0.9, 'gynandromorph':0.95}; self.regen_bonus = 0.2
+        self.gynandromorph_mating_bias = 2.5  # High mating preference for gynandromorphs
         self.env = {'difficulty':0.0, 'noise_std':0.0}
         self.mix_asexual_base = 0.10; self.mix_asexual_gain = 0.40
         self.injury_intensity_base = 0.25; self.injury_intensity_gain = 0.65
@@ -1716,6 +1719,7 @@ class ReproPlanaNEATPlus:
         self.snapshots_genomes: List[Genome] = []
         self.snapshots_scars: List[Dict[int,'Scar']] = []
         self.node_registry: Dict[int, Dict[str, Any]] = {}
+        self.sex_distribution_history: List[Dict[str, int]] = []  # Track sex distribution over time
 
         # registry for lineage node styling
         for g in self.population:
@@ -1846,6 +1850,9 @@ class ReproPlanaNEATPlus:
             else: genome.regen_mode = self.rng.choice(['split','head','tail'])
         if self.rng.random() < self.embryo_bias_mut_rate:
             genome.embryo_bias = self.rng.choice(['neutral','inputward','outputward'])
+        # Sex mutation to gynandromorph (only if not already gynandromorph)
+        if genome.sex != 'gynandromorph' and self.rng.random() < self.sex_mutation_rate:
+            genome.sex = 'gynandromorph'
         # ---- Diversity push under high difficulty
         if float(self.env.get('difficulty', 0.0)) >= 0.9 and self.rng.random() < getattr(self, "diversity_push", 0.15):
             if self.rng.random() < 0.6:
@@ -1878,7 +1885,11 @@ class ReproPlanaNEATPlus:
                         child_nodes[nid] = NodeGene(n.id, n.type, n.activation)
         child = Genome(child_nodes, child_conns)
         child.max_hidden_nodes = self.max_hidden_nodes; child.max_edges = self.max_edges
-        child.sex = 'female' if self.rng.random() < 0.5 else 'male'
+        # Gynandromorph trait is very difficult to inherit
+        if (mother.sex == 'gynandromorph' or father.sex == 'gynandromorph') and self.rng.random() < self.gynandromorph_inheritance_rate:
+            child.sex = 'gynandromorph'
+        else:
+            child.sex = 'female' if self.rng.random() < 0.5 else 'male'
         p = 0.7 if (mother.regen or father.regen) else 0.2
         child.regen = bool(self.rng.random() < p)
         child.regen_mode = self.rng.choice(['head','tail','split'])
@@ -1895,10 +1906,12 @@ class ReproPlanaNEATPlus:
             self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
         remaining = offspring_counts[sidx]-len(elites)
         k = max(2, int(math.ceil(self.survival_rate * len(sp.members))))
-        females=[g for g,_ in sp.members[:k] if g.sex=='female']; males=[g for g,_ in sp.members[:k] if g.sex=='male']; pool=[g for g,_ in sp.members[:k]]
+        females=[g for g,_ in sp.members[:k] if g.sex=='female']; males=[g for g,_ in sp.members[:k] if g.sex=='male']
+        gynandromorphs=[g for g,_ in sp.members[:k] if g.sex=='gynandromorph']; pool=[g for g,_ in sp.members[:k]]
         if (not females) or (not males):
             females = [g for g,_ in sp.members if g.sex=='female'] or females
             males   = [g for g,_ in sp.members if g.sex=='male'] or males
+            gynandromorphs = [g for g,_ in sp.members if g.sex=='gynandromorph'] or gynandromorphs
         mix_ratio=self._mix_asexual_ratio()
         monitor = getattr(self, "lcs_monitor", None)
         weight_tol = getattr(monitor, "eps", 0.0) if monitor is not None else 0.0
@@ -1908,16 +1921,55 @@ class ReproPlanaNEATPlus:
             parent_adj_before_regen=None
             if self.rng.random()<mix_ratio:
                 parent=pool[int(self.rng.integers(len(pool)))]
-                if parent.regen and self.mode.enable_regen_reproduction:
+                # Gynandromorphs cannot reproduce parthenogenetically (asexually)
+                if parent.sex == 'gynandromorph':
+                    # Force sexual reproduction for gynandromorphs
+                    if females or males or gynandromorphs:
+                        # Gynandromorphs can mate with anyone
+                        if gynandromorphs and self.rng.random() < 0.3:  # Prefer other gynandromorphs
+                            partner_pool = gynandromorphs
+                        else:
+                            partner_pool = [g for g in pool if g.id != parent.id]
+                        if partner_pool:
+                            partner = partner_pool[int(self.rng.integers(len(partner_pool)))]
+                            child = self._crossover_maternal_biased(parent, partner, sp.members)
+                            child.hybrid_scale = self._heterosis_scale(parent, partner)
+                            mother_id = parent.id; father_id = partner.id
+                            mode = 'sexual_within'
+                        else:
+                            # Fallback: clone if no partner available
+                            child = parent.copy(); mode = 'asexual_clone'
+                            mother_id = parent.id; father_id = None
+                    else:
+                        child = parent.copy(); mode = 'asexual_clone'
+                        mother_id = parent.id; father_id = None
+                elif parent.regen and self.mode.enable_regen_reproduction:
                     if monitor is not None:
                         parent_adj_before_regen = parent.weighted_adjacency()
                     child = platyregenerate(parent, self.rng, self.innov, intensity=self._regen_intensity())
                     mode='asexual_regen'
+                    mother_id=parent.id; father_id=None
                 else:
                     child=parent.copy(); mode='asexual_clone'
-                mother_id=parent.id; father_id=None
+                    mother_id=parent.id; father_id=None
             else:
-                if females and males and self.rng.random()>self.pollen_flow_rate:
+                # Gynandromorphs have very high mating bias
+                if gynandromorphs and self.rng.random() < self.gynandromorph_mating_bias * (len(gynandromorphs) / max(1, len(pool))):
+                    # Select gynandromorph as one parent
+                    gyno = gynandromorphs[int(self.rng.integers(len(gynandromorphs)))]
+                    # Select partner (can be any sex)
+                    partner_pool = [g for g in pool if g.id != gyno.id]
+                    if partner_pool:
+                        partner = partner_pool[int(self.rng.integers(len(partner_pool)))]
+                        mother = gyno; father = partner
+                        mode = 'sexual_within'; sp_for_fit = sp.members
+                    else:
+                        # Fallback to normal selection
+                        if females and males and self.rng.random()>self.pollen_flow_rate:
+                            mother=females[int(self.rng.integers(len(females)))]; father=males[int(self.rng.integers(len(males)))]; mode='sexual_within'; sp_for_fit=sp.members
+                        else:
+                            mother=pool[int(self.rng.integers(len(pool)))]; father=pool[int(self.rng.integers(len(pool)))]; mode='sexual_within'; sp_for_fit=sp.members
+                elif females and males and self.rng.random()>self.pollen_flow_rate:
                     mother=females[int(self.rng.integers(len(females)))]; father=males[int(self.rng.integers(len(males)))]; mode='sexual_within'; sp_for_fit=sp.members
                 else:
                     if len(species_pool)>1:
@@ -2173,14 +2225,25 @@ class ReproPlanaNEATPlus:
             try:
                 self.hidden_counts_history.append([sum(1 for n in g.nodes.values() if n.type=='hidden') for g in self.population])
                 self.edge_counts_history.append([sum(1 for c in g.connections.values() if c.enabled) for g in self.population])
+                # Track sex distribution
+                sex_counts = {'female': 0, 'male': 0, 'gynandromorph': 0, 'other': 0}
+                for g in self.population:
+                    sex = getattr(g, 'sex', 'other')
+                    if sex in sex_counts:
+                        sex_counts[sex] += 1
+                    else:
+                        sex_counts['other'] += 1
+                self.sex_distribution_history.append(sex_counts)
             except Exception:
                 self.hidden_counts_history.append([]); self.edge_counts_history.append([])
             if verbose:
                 noise = float(self.env.get('noise_std', 0.0))
                 ev=self.event_log[-1] if self.event_log else {'sexual_within':0,'sexual_cross':0,'asexual_regen':0}
+                gyno_count = sum(1 for g in self.population if getattr(g, 'sex', None) == 'gynandromorph')
+                gyno_str = f" | gynandromorph {gyno_count}" if gyno_count > 0 else ""
                 print(
                     f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | "
-                    f"sexual {ev.get('sexual_within',0)+ev.get('sexual_cross',0)} | regen {ev.get('asexual_regen',0)}"
+                    f"sexual {ev.get('sexual_within',0)+ev.get('sexual_cross',0)} | regen {ev.get('asexual_regen',0)}{gyno_str}"
                 )
             if best_fit > best_ever_fit:
                 best_ever_fit = best_fit; best_ever = self.population[best_idx].copy()
@@ -2822,16 +2885,18 @@ def render_lineage(neat, path="lineage.png", title="Lineage", max_edges: Optiona
             ax.add_patch(arr)
     # nodes (shape encodes sex; size encodes regen)
     reg = getattr(neat, "node_registry", {})
-    xs_f=[]; ys_f=[]; ss_f=[]; xs_m=[]; ys_m=[]; ss_m=[]; xs_u=[]; ys_u=[]; ss_u=[]
+    xs_f=[]; ys_f=[]; ss_f=[]; xs_m=[]; ys_m=[]; ss_m=[]; xs_g=[]; ys_g=[]; ss_g=[]; xs_u=[]; ys_u=[]; ss_u=[]
     for nid,(x,y) in pos.items():
         info = reg.get(nid, {}); sex = info.get('sex', None); regen = bool(info.get('regen', False))
         size = 80*(1.3 if regen else 1.0)
         if sex=='female': xs_f.append(x); ys_f.append(y); ss_f.append(size)
         elif sex=='male': xs_m.append(x); ys_m.append(y); ss_m.append(size)
+        elif sex=='gynandromorph': xs_g.append(x); ys_g.append(y); ss_g.append(size)
         else: xs_u.append(x); ys_u.append(y); ss_u.append(size)
-    if xs_f: ax.scatter(xs_f, ys_f, s=ss_f, marker='o', alpha=0.95)
-    if xs_m: ax.scatter(xs_m, ys_m, s=ss_m, marker='s', alpha=0.95)
-    if xs_u: ax.scatter(xs_u, ys_u, s=ss_u, marker='^', alpha=0.95)
+    if xs_f: ax.scatter(xs_f, ys_f, s=ss_f, marker='o', alpha=0.95, label='female')
+    if xs_m: ax.scatter(xs_m, ys_m, s=ss_m, marker='s', alpha=0.95, label='male')
+    if xs_g: ax.scatter(xs_g, ys_g, s=ss_g, marker='D', alpha=0.95, color='purple', label='gynandromorph')
+    if xs_u: ax.scatter(xs_u, ys_u, s=ss_u, marker='^', alpha=0.95, label='unknown')
     # highlight ring
     hi = set(highlight or [])
     if hi:
@@ -2844,6 +2909,9 @@ def render_lineage(neat, path="lineage.png", title="Lineage", max_edges: Optiona
     if len(nodes) <= 1200:
         for nid,(x,y) in pos.items():
             ax.text(x, y+0.02, str(nid), fontsize=6, ha='center', va='bottom', alpha=0.9)
+    # Add legend
+    if xs_f or xs_m or xs_g:
+        ax.legend(loc='best', fontsize=8, framealpha=0.9)
     fig.tight_layout(); fig.savefig(path, dpi=dpi); plt.close(fig)
 
 # ============================================================
@@ -3292,6 +3360,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         "lcs_ribbon": lcs_ribbon,
         "lcs_timeline": lcs_timeline,
         "history": hist,
+        "sex_distribution": getattr(neat, 'sex_distribution_history', []),
     }
 
 # === backend-agnostic Figure -> RGB helper ===
@@ -4478,6 +4547,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             "has_regen_log": has_regen_log,
             "has_lcs_viz": bool(has_ribbon or has_timeline),
             "has_spiral": has_scars_spiral,
+            "sex_distribution": res.get("sex_distribution", []),
         }
 
     # gallery（--task が無くても実行できるように独立させる）
@@ -4707,6 +4777,29 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 f.write("</ul>")
             else:
                 f.write("<p>No supervised or RL runs were summarised for this report.</p>")
+            
+            # Add gynandromorph statistics if available
+            if sup_meta and sup_meta.get("sex_distribution"):
+                sex_dist = sup_meta["sex_distribution"]
+                if sex_dist and len(sex_dist) > 0:
+                    # Calculate max gynandromorph count across all generations
+                    max_gyno = max(sd.get('gynandromorph', 0) for sd in sex_dist)
+                    final_gyno = sex_dist[-1].get('gynandromorph', 0) if sex_dist else 0
+                    first_gyno_gen = None
+                    for gen_idx, sd in enumerate(sex_dist):
+                        if sd.get('gynandromorph', 0) > 0:
+                            first_gyno_gen = gen_idx
+                            break
+                    
+                    if max_gyno > 0 or final_gyno > 0:
+                        f.write("<p><strong>Gynandromorph Statistics / 両性具有統計:</strong></p>")
+                        f.write("<ul>")
+                        if first_gyno_gen is not None:
+                            f.write(f"<li>First appearance / 初出現: Generation {first_gyno_gen}</li>")
+                        f.write(f"<li>Peak count / 最大個体数: {max_gyno}</li>")
+                        f.write(f"<li>Final count / 最終個体数: {final_gyno}</li>")
+                        f.write("</ul>")
+            
             f.write("</section>")
 
             f.write("<section class='narrative'><h2>Evolution Digest / 進化ダイジェスト</h2>")
