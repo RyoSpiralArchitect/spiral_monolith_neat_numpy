@@ -2204,6 +2204,33 @@ class ReproPlanaNEATPlus:
             self._proc_pool_age = 0
 
 
+    def _compute_topology_metrics(self) -> Dict[str, float]:
+        """Compute average topology metrics for the current population."""
+        hidden_counts = []
+        edge_counts = []
+        
+        for genome in self.population:
+            n_hidden = sum(1 for n in genome.nodes.values() if n.type == 'hidden')
+            n_edges = sum(1 for c in genome.connections.values() if c.enabled)
+            hidden_counts.append(n_hidden)
+            edge_counts.append(n_edges)
+        
+        avg_hidden = float(np.mean(hidden_counts)) if hidden_counts else 0.0
+        avg_edges = float(np.mean(edge_counts)) if edge_counts else 1.0
+        
+        # Compute topology diversity: variance in structure
+        std_hidden = float(np.std(hidden_counts)) if len(hidden_counts) > 1 else 0.0
+        std_edges = float(np.std(edge_counts)) if len(edge_counts) > 1 else 0.0
+        
+        # Combined diversity metric
+        topology_diversity = std_hidden + std_edges / 10.0  # Scale edges appropriately
+        
+        return {
+            'avg_hidden': avg_hidden,
+            'avg_edges': avg_edges,
+            'topology_diversity': topology_diversity,
+        }
+
     def _auto_env_schedule(self, gen: int, history: List[Tuple[float,float]]) -> Dict[str, float]:
         """進捗に応じて difficulty / noise を自動昇圧。高難度で再生を解禁。上限撤廃版。"""
         diff = float(self.env.get('difficulty', 0.0))
@@ -2265,21 +2292,45 @@ class ReproPlanaNEATPlus:
         for gen in range(n_generations):
             self.generation=gen
             prev=history[-1] if history else (None,None)
+            
+            # Compute topology metrics for monodromy schedule
+            topology_metrics = self._compute_topology_metrics()
+            
+            # Get previous metrics from environment history if available
+            if self.env_history:
+                prev_metrics = self.env_history[-1]
+                topology_metrics['prev_avg_hidden'] = prev_metrics.get('avg_hidden', topology_metrics['avg_hidden'])
+                topology_metrics['prev_avg_edges'] = prev_metrics.get('avg_edges', topology_metrics['avg_edges'])
+            
             # === Curriculum ===
+            env_ctx = {
+                'gen': gen,
+                'prev_best': prev[0] if prev else None,
+                'prev_avg': prev[1] if prev else None,
+                **topology_metrics
+            }
+            
             if env_schedule is not None:
-                env = env_schedule(gen, {'gen':gen,'prev_best':prev[0] if prev else None, 'prev_avg':prev[1] if prev else None})
+                env = env_schedule(gen, env_ctx)
             elif getattr(self, "auto_curriculum", True):
                 env = self._auto_env_schedule(gen, history)
             else:
                 env = None
             if env is not None:
-                self.env.update({k: v for k, v in env.items() if k not in {'enable_regen'}})
+                self.env.update({k: v for k, v in env.items() if k not in {'enable_regen', 'prev_avg_hidden', 'prev_avg_edges'}})
                 if 'enable_regen' in env:
                     flag = bool(env['enable_regen'])
                     self.mode.enable_regen_reproduction = flag
                     if flag:
                         self.mix_asexual_base = max(self.mix_asexual_base, 0.30)
-            self.env_history.append({'gen':gen, **self.env, 'regen_enabled': self.mode.enable_regen_reproduction})
+            
+            # Store topology metrics in environment history for next iteration
+            self.env_history.append({
+                'gen': gen,
+                **self.env,
+                'regen_enabled': self.mode.enable_regen_reproduction,
+                **topology_metrics
+            })
             # 難易度に応じた pollen flow
             diff = float(self.env.get('difficulty', 0.0))
             self.pollen_flow_rate = float(min(0.5, max(0.1, 0.1 + 0.35 * diff)))
@@ -3365,7 +3416,7 @@ class PerSampleSequenceStopperPro:
         """Reset all finished samples."""
         self.finished_samples.clear()
 
-def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True, rng_seed: int = 0):
+def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True, rng_seed: int = 0, use_monodromy: bool = False):
     # dataset
     if task=="xor": Xtr,ytr = make_xor(512, noise=0.05, seed=0); Xva,yva = make_xor(256, noise=0.05, seed=1)
     elif task=="spiral": Xtr,ytr = make_spirals(512, noise=0.05, turns=1.5, seed=0); Xva,yva = make_spirals(256, noise=0.05, turns=1.5, seed=1)
@@ -3403,13 +3454,16 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     
     fit = FitnessBackpropShared(steps=steps, lr=5e-3, l2=1e-4, alpha_nodes=1e-3, alpha_edges=5e-4)
     
+    # Select environment schedule based on monodromy flag
+    env_sched = _topology_monodromy_schedule if use_monodromy else _default_difficulty_schedule
+    
     # shm_release_all() は try/finally で evolve 呼び出しを包むと例外でも確実に実行されます
     try:
         best, hist = neat.evolve(
             fit,
             n_generations=gens,
             verbose=True,
-            env_schedule=_default_difficulty_schedule,
+            env_schedule=env_sched,
         )
     finally:
         # SHM cleanup
@@ -4284,6 +4338,91 @@ def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]] = None
     return {"difficulty": diff, "noise_std": noise, "enable_regen": True}
 
 
+def _topology_monodromy_schedule(gen: int, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+    """Topology-aware monodromy environment schedule that adapts to population structural evolution.
+    
+    The environment difficulty and noise dynamically respond to the average topology complexity
+    of the population, creating a feedback loop where structural changes drive environmental changes.
+    This implements a "monodromy" - a path-dependent transformation that follows the topology's
+    evolution through generation space.
+    
+    Parameters via ctx:
+    - avg_hidden: Average number of hidden nodes in population
+    - avg_edges: Average number of enabled edges in population
+    - topology_diversity: Diversity measure of topologies in population
+    - prev_avg_hidden: Previous generation's average hidden nodes
+    - prev_avg_edges: Previous generation's average edges
+    """
+    ctx = ctx or {}
+    
+    # Extract topology metrics from context (provided by evolve method)
+    avg_hidden = float(ctx.get('avg_hidden', 0.0))
+    avg_edges = float(ctx.get('avg_edges', 1.0))
+    topology_diversity = float(ctx.get('topology_diversity', 0.0))
+    
+    # Track changes in topology over time
+    prev_avg_hidden = float(ctx.get('prev_avg_hidden', avg_hidden))
+    prev_avg_edges = float(ctx.get('prev_avg_edges', avg_edges))
+    
+    # Calculate topology change rate (velocity of structural evolution)
+    hidden_velocity = avg_hidden - prev_avg_hidden
+    edge_velocity = avg_edges - prev_avg_edges
+    
+    # Normalize topology complexity (0-1 scale based on typical ranges)
+    # Assume typical ranges: hidden nodes 0-50, edges 0-200
+    normalized_complexity = min(1.0, (avg_hidden / 50.0 + avg_edges / 200.0) / 2.0)
+    
+    # Base difficulty follows topology complexity with a monodromy twist
+    # The environment "spirals" around the topology's evolution
+    base_diff = 0.3 + 1.5 * normalized_complexity
+    
+    # Add monodromy component: periodic oscillation that depends on cumulative topology
+    # This creates a path-dependent difficulty that "remembers" the evolutionary trajectory
+    monodromy_phase = (avg_hidden * 0.1 + avg_edges * 0.02) % (2 * np.pi)
+    monodromy_amplitude = 0.2 + 0.3 * normalized_complexity
+    monodromy_component = monodromy_amplitude * np.sin(monodromy_phase)
+    
+    # Velocity-based component: respond to rate of structural change
+    # Rapid evolution increases difficulty to maintain pressure
+    velocity_magnitude = np.sqrt(hidden_velocity**2 + (edge_velocity / 4.0)**2)
+    velocity_component = 0.15 * np.tanh(velocity_magnitude / 2.0)
+    
+    # Diversity-based modulation: low diversity → increase difficulty to push exploration
+    # High diversity → stabilize to allow consolidation
+    diversity_factor = 1.0 - 0.2 * np.tanh(topology_diversity / 3.0)
+    
+    # Combine all components
+    difficulty = (base_diff + monodromy_component + velocity_component) * diversity_factor
+    
+    # Noise adapts to topology diversity and complexity
+    # More complex topologies get more noise to test robustness
+    # Low diversity gets noise boost to promote exploration
+    noise_base = 0.02 + 0.06 * normalized_complexity
+    noise_diversity_boost = 0.03 * (1.0 - np.tanh(topology_diversity / 2.0))
+    noise_std = noise_base + noise_diversity_boost
+    
+    # Enable regeneration when complexity crosses threshold or velocity is high
+    enable_regen = bool(normalized_complexity > 0.4 or velocity_magnitude > 1.5)
+    
+    # Add generation-based smoothing for early gens
+    if gen < 10:
+        difficulty = max(0.35, min(difficulty, 0.5 + gen * 0.05))
+        noise_std = min(noise_std, 0.02)
+        enable_regen = False
+    elif gen < 20:
+        difficulty = max(0.5, difficulty)
+        enable_regen = enable_regen or (gen > 15)
+    
+    return {
+        "difficulty": float(difficulty),
+        "noise_std": float(noise_std),
+        "enable_regen": enable_regen,
+        # Store metrics for next iteration
+        "prev_avg_hidden": float(avg_hidden),
+        "prev_avg_edges": float(avg_edges),
+    }
+
+
 def _apply_stable_neat_defaults(neat: ReproPlanaNEATPlus):
     """Enhanced defaults for complex topology survival under challenging environments."""
     neat.mode = EvalMode(
@@ -5106,6 +5245,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     ap.add_argument("--pop",  type=int, default=64)
     ap.add_argument("--steps",type=int, default=80)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--monodromy", action="store_true", 
+                    help="Use topology-aware monodromy environment schedule")
     ap.add_argument("--rl-env", type=str)
     ap.add_argument("--rl-gens", type=int, default=20)
     ap.add_argument("--rl-pop",  type=int, default=24)
@@ -5135,6 +5276,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             out_prefix=os.path.join(args.out, args.task),
             make_gifs=args.make_gifs, make_lineage=args.make_lineage,
             rng_seed=args.seed,
+            use_monodromy=args.monodromy,
         )
         figs["図1 学習曲線＋複雑度"] = res.get("learning_curve")
         figs["図2 最良トポロジ"] = res.get("topology")
@@ -5238,11 +5380,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 max_steps=args.rl_max_steps,
                 episodes=args.rl_episodes,
             )
+            # Select environment schedule based on monodromy flag
+            env_sched = _topology_monodromy_schedule if args.monodromy else _default_difficulty_schedule
+            
             best, hist = neat.evolve(
                 fit,
                 n_generations=args.rl_gens,
                 verbose=True,
-                env_schedule=_default_difficulty_schedule,
+                env_schedule=env_sched,
             )
             close_env = getattr(fit, "close_env", None)
             if callable(close_env):
