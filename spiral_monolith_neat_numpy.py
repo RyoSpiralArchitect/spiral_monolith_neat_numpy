@@ -29,7 +29,6 @@ except Exception:
 
 # === Safety & Runtime Preamble ===============================================
 # - BLAS スレッドを 1 に制限して並列評価との過剰スレッド競合を防止
-# - HF cache の非推奨環境変数をブリッジ
 # - 既知の FutureWarning を静音化
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -37,10 +36,6 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("BLIS_NUM_THREADS", "1")
-if "TRANSFORMERS_CACHE" in os.environ and "HF_HOME" not in os.environ:
-    os.environ["HF_HOME"] = os.environ["TRANSFORMERS_CACHE"]
-warnings.filterwarnings("ignore", category=FutureWarning, message=r".*TRANSFORMERS_CACHE.*")
-warnings.filterwarnings("ignore", category=FutureWarning, message=r".*torch_dtype.*deprecated.*Use `dtype`.*")
 
 def _is_picklable(obj) -> bool:
     """Process 並列に切り替える前に picklable かを事前検査（非picklableなら thread に自動フォールバック）"""
