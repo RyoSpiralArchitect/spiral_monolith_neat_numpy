@@ -4440,16 +4440,17 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             "has_spiral": has_scars_spiral,
         }
 
-        if args.gallery:
-            gal = export_task_gallery(
-                tasks=tuple(args.gallery),
-                gens=max(6, args.gens // 2),
-                pop=max(12, args.pop // 2),
-                steps=max(10, args.steps // 2),
-                out_dir=os.path.join(args.out, "gallery"),
-            )
-            for k, v in gal.items():
-                figs[f"ギャラリー {k}"] = v
+    # gallery（--task が無くても実行できるように独立させる）
+    if args.gallery:
+        gal = export_task_gallery(
+            tasks=tuple(args.gallery),
+            gens=max(6, args.gens // 2),
+            pop=max(12, args.pop // 2),
+            steps=max(10, args.steps // 2),
+            out_dir=os.path.join(args.out, "gallery"),
+        )
+        for k, v in gal.items():
+            figs[f"ギャラリー {k}"] = v
 
     # RL
     if args.rl_env:
