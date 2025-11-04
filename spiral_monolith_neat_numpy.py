@@ -3077,7 +3077,15 @@ class PerSampleSequenceStopperPro:
         
         Args:
             cfg: Dictionary with configuration including 'within' list for stage-based windows
+        
+        Raises:
+            KeyError: If 'within' key is missing from cfg
+            TypeError: If 'within' value is not a sequence
         """
+        if "within" not in cfg:
+            raise KeyError("Configuration must include 'within' key")
+        if not hasattr(cfg["within"], '__len__'):
+            raise TypeError("cfg['within'] must be a list or sequence")
         self.cfg = cfg
         self.finished_samples = set()
     
@@ -3096,13 +3104,12 @@ class PerSampleSequenceStopperPro:
         if stage >= 1:
             # ★安全ガード：範囲外アクセス回避 (Safety guard: prevent out-of-bounds access)
             if stage >= len(self.cfg["within"]):
-                return False  # or could use 'continue' in a loop context
+                return False
             
             win = self.cfg["within"][stage]
             if win is not None and win >= 0:
-                # Apply stage-specific window logic here
-                # This is where additional stopping logic would be implemented
-                # based on the window value
+                # Window value is valid - mark sample as finished
+                # (Additional window-based logic can be implemented here as needed)
                 self.finished_samples.add(sample_id)
                 return True
         
