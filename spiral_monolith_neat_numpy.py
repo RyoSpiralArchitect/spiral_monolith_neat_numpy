@@ -1514,6 +1514,24 @@ class ReproPlanaNEATPlus:
         self.mode = EvalMode(vanilla=True, enable_regen_reproduction=False)
         self.max_hidden_nodes = 128; self.max_edges = 1024
         self.complexity_threshold: Optional[float] = 1.0
+        # ---- Hardened knobs
+        self.grad_clip = 5.0
+        self.weight_clip = 12.0
+        self.snapshot_stride = 1 if self.pop_size <= 256 else 2
+        self.snapshot_max = 320
+        self.min_conn_after_regen = 0.65
+        self.diversity_push = 0.15
+        self.max_attempts_guard = 16
+        # Parallel eval
+        try:
+            cpus = int((os.cpu_count() or 2))
+            self.eval_workers = int(os.environ.get("NEAT_EVAL_WORKERS", max(1, cpus - 1)))
+            self.parallel_backend = os.environ.get("NEAT_EVAL_BACKEND", "thread")
+        except Exception:
+            self.eval_workers = 1
+            self.parallel_backend = "thread"
+        # Auto curriculum toggle
+        self.auto_curriculum = True
 
         # Base genome
         nodes = {}
@@ -1610,10 +1628,15 @@ class ReproPlanaNEATPlus:
         return species
 
     def _adapt_compat_threshold(self, num_species: int):
-        if num_species < self.mode.species_low:
-            self.compatibility_threshold *= 0.95
-        elif num_species > self.mode.species_high:
-            self.compatibility_threshold *= 1.05
+        # 攻撃的・目標駆動の適応
+        low = int(self.mode.species_low)
+        high = int(self.mode.species_high)
+        target = float(getattr(self, "species_target", (low + high) * 0.5))
+        if target <= 0:
+            target = (low + high) * 0.5
+        err = (float(num_species) - target) / max(1.0, target)
+        self.compatibility_threshold *= float(np.exp(0.18 * err))
+        self.compatibility_threshold = float(np.clip(self.compatibility_threshold, 0.3, 50.0))
 
     def _mutate(self, genome: Genome):
         if self.rng.random() < self.mutate_toggle_prob: genome.mutate_toggle_enable(self.rng, prob=self.mutate_toggle_prob)
@@ -1625,6 +1648,12 @@ class ReproPlanaNEATPlus:
             else: genome.regen_mode = self.rng.choice(['split','head','tail'])
         if self.rng.random() < self.embryo_bias_mut_rate:
             genome.embryo_bias = self.rng.choice(['neutral','inputward','outputward'])
+        # ---- Diversity push under high difficulty
+        if float(self.env.get('difficulty', 0.0)) >= 0.9 and self.rng.random() < getattr(self, "diversity_push", 0.15):
+            if self.rng.random() < 0.6:
+                genome.mutate_add_connection(self.rng, self.innov)
+            else:
+                genome.mutate_add_node(self.rng, self.innov)
 
     def _crossover_maternal_biased(self, mother: Genome, father: Genome, species_members):
         fit_dict = {g:f for g,f in species_members}
@@ -1775,6 +1804,41 @@ class ReproPlanaNEATPlus:
             penalty = min(float(threshold), penalty)
         return penalty
 
+    def _evaluate_population(self, fitness_fn: Callable[[Genome], float]) -> List[float]:
+        workers = int(getattr(self, "eval_workers", 1))
+        if workers <= 1:
+            return [fitness_fn(g) for g in self.population]
+        try:
+            import concurrent.futures as _cf
+            Executor = _cf.ProcessPoolExecutor if getattr(self, "parallel_backend", "thread") == "process" else _cf.ThreadPoolExecutor
+            with Executor(max_workers=workers) as ex:
+                futs = [ex.submit(fitness_fn, g) for g in self.population]
+                return [f.result() for f in futs]
+        except Exception as e:
+            print("[WARN] parallel evaluation disabled:", e)
+            return [fitness_fn(g) for g in self.population]
+
+    def _auto_env_schedule(self, gen: int, history: List[Tuple[float,float]]) -> Dict[str, float]:
+        """進捗に応じて difficulty / noise を自動昇圧。高難度で再生を解禁。"""
+        diff = float(self.env.get('difficulty', 0.0))
+        best_hist = [b for (b, _a) in history] if history else []
+        bump = 0.0
+        if len(best_hist) >= 10:
+            delta10 = best_hist[-1] - best_hist[-10]
+            if delta10 < 0.01:
+                bump = 0.10
+            elif delta10 < 0.05:
+                bump = 0.05
+        if gen < 10:
+            diff = max(diff, 0.3)
+        elif gen < 25:
+            diff = max(diff, 0.5)
+        else:
+            diff = min(1.0, diff + bump)
+        enable_regen = bool(diff >= 0.85)
+        noise_std = 0.01 + 0.05 * diff
+        return {"difficulty": float(diff), "noise_std": float(noise_std), "enable_regen": enable_regen}
+
     def evolve(self, fitness_fn: Callable[[Genome], float], n_generations=100, target_fitness=None, verbose=True, env_schedule=None):
         history=[]; best_ever=None; best_ever_fit=-1e9
         from math import isnan
@@ -1782,46 +1846,67 @@ class ReproPlanaNEATPlus:
         for gen in range(n_generations):
             self.generation=gen
             prev=history[-1] if history else (None,None)
+            # === Curriculum ===
             if env_schedule is not None:
-                env=env_schedule(gen, {'gen':gen,'prev_best':prev[0] if prev else None, 'prev_avg':prev[1] if prev else None})
-                if env is not None:
-                    self.env.update({k: v for k, v in env.items() if k not in {'enable_regen'}})
-                    if 'enable_regen' in env:
-                        flag = bool(env['enable_regen'])
-                        self.mode.enable_regen_reproduction = flag
-                        if flag:
-                            self.mix_asexual_base = max(self.mix_asexual_base, 0.30)
+                env = env_schedule(gen, {'gen':gen,'prev_best':prev[0] if prev else None, 'prev_avg':prev[1] if prev else None})
+            elif getattr(self, "auto_curriculum", True):
+                env = self._auto_env_schedule(gen, history)
+            else:
+                env = None
+            if env is not None:
+                self.env.update({k: v for k, v in env.items() if k not in {'enable_regen'}})
+                if 'enable_regen' in env:
+                    flag = bool(env['enable_regen'])
+                    self.mode.enable_regen_reproduction = flag
+                    if flag:
+                        self.mix_asexual_base = max(self.mix_asexual_base, 0.30)
             self.env_history.append({'gen':gen, **self.env, 'regen_enabled': self.mode.enable_regen_reproduction})
-            raw=[fitness_fn(g) for g in self.population]
+            # 難易度に応じた pollen flow
+            diff = float(self.env.get('difficulty', 0.0))
+            self.pollen_flow_rate = float(min(0.5, max(0.1, 0.1 + 0.35 * diff)))
+            # === Evaluate (parallel-aware) ===
+            raw = self._evaluate_population(fitness_fn)
             fitnesses=[]
             for g,f in zip(self.population, raw):
-                f2 = f
+                f2 = float(f)
                 if not self.mode.vanilla:
                     f2 *= self.sex_fitness_scale.get(g.sex, 1.0) * (getattr(g,'hybrid_scale',1.0))
                     if g.regen: f2 += self.regen_bonus
                 f2 -= self._complexity_penalty(g)
-                fitnesses.append(float(f2))
+                if not np.isfinite(f2):
+                    f2 = float(np.nan_to_num(f2, nan=-1e6, posinf=-1e6, neginf=-1e6))
+                fitnesses.append(f2)
             best_idx=int(np.argmax(fitnesses)); best_fit=float(fitnesses[best_idx]); avg_fit=float(np.mean(fitnesses))
-            # snapshots for GIFs
-            curr_best = self.population[best_idx].copy()
-            scars = diff_scars(prev_best, curr_best, scars, birth_gen=gen, regen_mode_for_new=getattr(curr_best,'regen_mode','split'))
-            self.snapshots_genomes.append(curr_best); self.snapshots_scars.append(scars)
-            prev_best = curr_best
-
+            # === Snapshots (decimated & bounded) ===
+            try:
+                curr_best = self.population[best_idx].copy()
+                scars = diff_scars(prev_best, curr_best, scars, birth_gen=gen, regen_mode_for_new=getattr(curr_best,'regen_mode','split'))
+                stride = int(getattr(self, "snapshot_stride", 1))
+                if (gen % max(1, stride) == 0) or (gen == n_generations - 1):
+                    if len(self.snapshots_genomes) >= int(getattr(self, "snapshot_max", 320)):
+                        self.snapshots_genomes.pop(0); self.snapshots_scars.pop(0)
+                    self.snapshots_genomes.append(curr_best); self.snapshots_scars.append(scars)
+                prev_best = curr_best
+            except Exception:
+                pass
             history.append((best_fit, avg_fit)); self.best_ids.append(self.population[best_idx].id)
             # complexity traces
-            self.hidden_counts_history.append([sum(1 for n in g.nodes.values() if n.type=='hidden') for g in self.population])
-            self.edge_counts_history.append([sum(1 for c in g.connections.values() if c.enabled) for g in self.population])
+            try:
+                self.hidden_counts_history.append([sum(1 for n in g.nodes.values() if n.type=='hidden') for g in self.population])
+                self.edge_counts_history.append([sum(1 for c in g.connections.values() if c.enabled) for g in self.population])
+            except Exception:
+                self.hidden_counts_history.append([]); self.edge_counts_history.append([])
             if verbose:
-                diff = float(self.env.get('difficulty', 0.0))
                 noise = float(self.env.get('noise_std', 0.0))
                 ev=self.event_log[-1] if self.event_log else {'sexual_within':0,'sexual_cross':0,'asexual_regen':0}
                 print(
                     f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | "
                     f"sexual {ev.get('sexual_within',0)+ev.get('sexual_cross',0)} | regen {ev.get('asexual_regen',0)}"
                 )
-            if best_fit > best_ever_fit: best_ever_fit = best_fit; best_ever = self.population[best_idx].copy()
-            if target_fitness is not None and best_fit >= target_fitness: break
+            if best_fit > best_ever_fit:
+                best_ever_fit = best_fit; best_ever = self.population[best_idx].copy()
+            if target_fitness is not None and best_fit >= target_fitness:
+                break
             species=self.speciate(fitnesses)
             self._adapt_compat_threshold(len(species))
             self.reproduce(species, fitnesses)
