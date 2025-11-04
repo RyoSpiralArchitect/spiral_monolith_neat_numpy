@@ -353,6 +353,69 @@ class Genome:
                 stack.append(w)
         return False
 
+    def remove_cycles(self):
+        """Remove cycles by disabling connections until the genome is acyclic.
+        Returns True if any connections were disabled."""
+        disabled_any = False
+        max_iterations = len(self.connections) + 1  # Safety limit
+        iterations = 0
+        
+        while iterations < max_iterations:
+            iterations += 1
+            # Try to get topological order using Kahn's algorithm
+            in_edges_count = {nid:0 for nid in self.nodes}
+            for c in self.enabled_connections():
+                in_edges_count[c.out_node] += 1
+            queue = [nid for nid in self.nodes if in_edges_count[nid]==0]
+            order = []
+            adj = self.adjacency()
+            while queue:
+                nid = queue.pop(0)
+                order.append(nid)
+                for m in adj.get(nid, []):
+                    in_edges_count[m] -= 1
+                    if in_edges_count[m]==0:
+                        queue.append(m)
+            
+            # If we got all nodes, no cycle exists
+            if len(order) == len(self.nodes):
+                break
+            
+            # There's a cycle. Find nodes that are in the cycle (not in topological order)
+            nodes_in_order = set(order)
+            cycle_nodes = set(self.nodes.keys()) - nodes_in_order
+            
+            # Disable one connection that involves only cycle nodes (both in and out)
+            # This ensures we're breaking the actual cycle, not just cutting off descendants
+            # Prefer connections with higher innovation numbers (newer connections)
+            disabled_one = False
+            for c in sorted(self.enabled_connections(), key=lambda x: x.innovation, reverse=True):
+                if c.enabled and (c.in_node in cycle_nodes and c.out_node in cycle_nodes):
+                    c.enabled = False
+                    disabled_any = True
+                    disabled_one = True
+                    break
+            
+            # If we didn't find a connection within the cycle, fall back to any connection involving cycle nodes
+            if not disabled_one:
+                for c in sorted(self.enabled_connections(), key=lambda x: x.innovation, reverse=True):
+                    if c.enabled and (c.in_node in cycle_nodes or c.out_node in cycle_nodes):
+                        c.enabled = False
+                        disabled_any = True
+                        disabled_one = True
+                        break
+            
+            if not disabled_one:
+                # Final fallback: disable any enabled connection
+                for c in self.enabled_connections():
+                    if c.enabled:
+                        c.enabled = False
+                        disabled_any = True
+                        break
+                break
+        
+        return disabled_any
+
     def node_depths(self):
         order = self.topological_order()
         inputs = [nid for nid,n in self.nodes.items() if n.type in ('input','bias')]
@@ -1891,6 +1954,8 @@ class ReproPlanaNEATPlus:
                         child_nodes[nid] = NodeGene(n.id, n.type, n.activation)
         child = Genome(child_nodes, child_conns)
         child.max_hidden_nodes = self.max_hidden_nodes; child.max_edges = self.max_edges
+        # Remove any cycles that may have been introduced by crossover
+        child.remove_cycles()
         # Hermaphrodite trait is very difficult to inherit
         # Inheritance rate controlled by hermaphrodite_inheritance_rate parameter
         if mother.sex == 'hermaphrodite' or father.sex == 'hermaphrodite':
@@ -2423,12 +2488,18 @@ def complexity_penalty(genome: Genome, alpha_nodes=1e-3, alpha_edges=5e-4):
 def fitness_backprop_classifier(genome: Genome, Xtr, ytr, Xva, yva,
                                 steps=40, lr=5e-3, l2=1e-4,
                                 alpha_nodes=1e-3, alpha_edges=5e-4):
-    gg = genome.copy()
-    train_with_backprop_numpy(gg, Xtr, ytr, steps=steps, lr=lr, l2=l2)
-    pred = predict(gg, Xva)
-    acc = (pred == (yva if yva.ndim==1 else np.argmax(yva,1))).mean()
-    pen = complexity_penalty(gg, alpha_nodes=alpha_nodes, alpha_edges=alpha_edges)
-    return float(acc - pen)
+    try:
+        gg = genome.copy()
+        train_with_backprop_numpy(gg, Xtr, ytr, steps=steps, lr=lr, l2=l2)
+        pred = predict(gg, Xva)
+        acc = (pred == (yva if yva.ndim==1 else np.argmax(yva,1))).mean()
+        pen = complexity_penalty(gg, alpha_nodes=alpha_nodes, alpha_edges=alpha_edges)
+        return float(acc - pen)
+    except RuntimeError as e:
+        if "Cycle detected" in str(e):
+            # Return very low fitness for cyclic genomes
+            return -1.0
+        raise
 
 # ============================================================
 # 5) Visualization utilities
