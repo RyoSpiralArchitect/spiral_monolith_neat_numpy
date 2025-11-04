@@ -1712,6 +1712,13 @@ class ReproPlanaNEATPlus:
             self.parallel_backend = "thread"
         # Auto curriculum toggle
         self.auto_curriculum = True
+        # ---- Top-3 diversity tracking parameters
+        self.top3_diversity_node_threshold = 1  # Min difference in hidden node count for diversity
+        self.top3_diversity_edge_threshold = 2  # Min difference in edge count for diversity
+        self.top3_candidate_pool_size = 10  # Number of top candidates to check for diversity
+        # ---- Complexity penalty adaptation parameters
+        self.complexity_bonus_multiplier = -0.1  # Bonus strength at extreme difficulty (negative = bonus)
+        self.complexity_bonus_threshold = 2.5  # Difficulty level where bonus starts
         # ---- Speciation target learning (dynamic)
         self.species_target = None  # set lazily around (species_low+species_high)/2
         self.species_target_min = 2.0
@@ -2118,19 +2125,22 @@ class ReproPlanaNEATPlus:
         # Adaptive penalty: decreases with difficulty, becomes bonus at very high difficulty
         # At low difficulty (< 0.5): normal penalty
         # At medium difficulty (0.5-1.5): reduced penalty
-        # At high difficulty (1.5-2.5): minimal penalty
-        # At extreme difficulty (> 2.5): bonus for complexity
+        # At high difficulty (1.5-threshold): minimal penalty
+        # At extreme difficulty (> threshold): bonus for complexity
+        bonus_threshold = getattr(self, 'complexity_bonus_threshold', 2.5)
+        bonus_multiplier = getattr(self, 'complexity_bonus_multiplier', -0.1)
+        
         if diff < 0.5:
             multiplier = 1.0
         elif diff < 1.5:
             # Linear decrease from 1.0 to 0.3
             multiplier = 1.0 - 0.7 * (diff - 0.5) / 1.0
-        elif diff < 2.5:
+        elif diff < bonus_threshold:
             # Further decrease from 0.3 to 0.0
-            multiplier = 0.3 - 0.3 * (diff - 1.5) / 1.0
+            multiplier = 0.3 - 0.3 * (diff - 1.5) / (bonus_threshold - 1.5)
         else:
             # Bonus for complexity at extreme difficulty (negative penalty)
-            multiplier = -0.1 * (diff - 2.5)
+            multiplier = bonus_multiplier * (diff - bonus_threshold)
         
         penalty = multiplier * m.complexity_alpha * (m.node_penalty*n_hidden + m.edge_penalty*n_edges)
         threshold = getattr(self, "complexity_threshold", None)
@@ -2300,7 +2310,11 @@ class ReproPlanaNEATPlus:
             # === Track top-3 diverse topologies ===
             # Get top candidates sorted by fitness
             sorted_indices = np.argsort(fitnesses)[::-1]
-            for idx in sorted_indices[:10]:  # Check top 10 to find diverse top-3
+            pool_size = getattr(self, 'top3_candidate_pool_size', 10)
+            node_threshold = getattr(self, 'top3_diversity_node_threshold', 1)
+            edge_threshold = getattr(self, 'top3_diversity_edge_threshold', 2)
+            
+            for idx in sorted_indices[:pool_size]:  # Check top N to find diverse top-3
                 candidate = self.population[idx].copy()
                 candidate_fit = float(fitnesses[idx])
                 # Check if this topology is sufficiently different from existing top-3
@@ -2312,7 +2326,7 @@ class ReproPlanaNEATPlus:
                     n_hidden_exist = sum(1 for n in existing_genome.nodes.values() if n.type=='hidden')
                     n_edges_exist = sum(1 for c in existing_genome.connections.values() if c.enabled)
                     # If very similar in structure, skip
-                    if abs(n_hidden_cand - n_hidden_exist) <= 1 and abs(n_edges_cand - n_edges_exist) <= 2:
+                    if abs(n_hidden_cand - n_hidden_exist) <= node_threshold and abs(n_edges_cand - n_edges_exist) <= edge_threshold:
                         is_diverse = False
                         break
                 if is_diverse or len(top3_best) < 3:
@@ -4213,7 +4227,23 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
-    """Multi-phase complex curriculum with diverse environmental challenges to promote complex topology survival."""
+    """Multi-phase complex curriculum with diverse environmental challenges to promote complex topology survival.
+    
+    Parameters can be customized via _ctx if needed:
+    - chaos_amp1, chaos_freq1: First chaotic component amplitude and frequency
+    - chaos_amp2, chaos_freq2: Second chaotic component amplitude and frequency
+    - cyclic_amp, cyclic_freq: Cyclic noise amplitude and frequency
+    """
+    # Extract customizable parameters from context
+    ctx = _ctx or {}
+    chaos_amp1 = ctx.get('chaos_amp1', 0.2)
+    chaos_freq1_sin = ctx.get('chaos_freq1_sin', 0.4)
+    chaos_freq1_cos = ctx.get('chaos_freq1_cos', 0.15)
+    chaos_amp2 = ctx.get('chaos_amp2', 0.15)
+    chaos_freq2 = ctx.get('chaos_freq2', 0.6)
+    cyclic_amp = ctx.get('cyclic_amp', 0.15)
+    cyclic_freq = ctx.get('cyclic_freq', 0.25)
+    
     # Phase 1: Early exploration (0-15) - moderate difficulty, low noise
     if gen < 15:
         return {"difficulty": 0.4, "noise_std": 0.01, "enable_regen": False}
@@ -4226,7 +4256,7 @@ def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]] = None
     if gen < 50:
         # Multi-faceted difficulty: base + cyclic + linear growth
         base_diff = 1.0 + (gen - 30) * 0.04
-        cyclic_component = 0.15 * np.sin((gen - 30) * 0.25)  # Environmental fluctuation
+        cyclic_component = cyclic_amp * np.sin((gen - 30) * cyclic_freq)  # Environmental fluctuation
         diff = base_diff + cyclic_component
         # Variable noise with spikes
         noise = 0.04 + (gen - 30) * 0.002 + 0.03 * np.abs(np.sin((gen - 30) * 0.5))
@@ -4235,8 +4265,8 @@ def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]] = None
     # Exponentially increasing difficulty with chaotic noise
     base_diff = 1.8 + (gen - 50) * 0.05
     # Add chaotic components to force topology diversity
-    chaos1 = 0.2 * np.sin((gen - 50) * 0.4) * np.cos((gen - 50) * 0.15)
-    chaos2 = 0.15 * np.cos((gen - 50) * 0.6)
+    chaos1 = chaos_amp1 * np.sin((gen - 50) * chaos_freq1_sin) * np.cos((gen - 50) * chaos_freq1_cos)
+    chaos2 = chaos_amp2 * np.cos((gen - 50) * chaos_freq2)
     diff = base_diff + chaos1 + chaos2
     # High variable noise
     noise = 0.08 + (gen - 50) * 0.003 + 0.05 * np.abs(np.sin((gen - 50) * 0.7))
