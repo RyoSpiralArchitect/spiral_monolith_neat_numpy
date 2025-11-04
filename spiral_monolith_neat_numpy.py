@@ -1712,6 +1712,13 @@ class ReproPlanaNEATPlus:
             self.parallel_backend = "thread"
         # Auto curriculum toggle
         self.auto_curriculum = True
+        # ---- Top-3 diversity tracking parameters
+        self.top3_diversity_node_threshold = 1  # Min difference in hidden node count for diversity
+        self.top3_diversity_edge_threshold = 2  # Min difference in edge count for diversity
+        self.top3_candidate_pool_size = 10  # Number of top candidates to check for diversity
+        # ---- Complexity penalty adaptation parameters
+        self.complexity_bonus_multiplier = -0.1  # Bonus strength at extreme difficulty (negative = bonus)
+        self.complexity_bonus_threshold = 2.5  # Difficulty level where bonus starts
         # ---- Speciation target learning (dynamic)
         self.species_target = None  # set lazily around (species_low+species_high)/2
         self.species_target_min = 2.0
@@ -1790,6 +1797,7 @@ class ReproPlanaNEATPlus:
         self.snapshots_genomes: List[Genome] = []
         self.snapshots_scars: List[Dict[int,'Scar']] = []
         self.node_registry: Dict[int, Dict[str, Any]] = {}
+        self.top3_best_topologies = []  # Track top-3 diverse best topologies
 
         # registry for lineage node styling
         for g in self.population:
@@ -2106,12 +2114,38 @@ class ReproPlanaNEATPlus:
         for g in new_pop: self.lineage_edges.append((g.parents[0], g.parents[1], g.id, g.birth_gen, 'birth'))
 
     def _complexity_penalty(self, g: Genome) -> float:
+        """Adaptive complexity penalty that encourages complex topologies under high difficulty."""
         n_hidden = sum(1 for n in g.nodes.values() if n.type=='hidden')
         n_edges  = sum(1 for c in g.connections.values() if c.enabled)
         m = self.mode
-        penalty = m.complexity_alpha * (m.node_penalty*n_hidden + m.edge_penalty*n_edges)
+        
+        # Get current difficulty level
+        diff = float(self.env.get('difficulty', 0.0))
+        
+        # Adaptive penalty: decreases with difficulty, becomes bonus at very high difficulty
+        # At low difficulty (< 0.5): normal penalty
+        # At medium difficulty (0.5-1.5): reduced penalty
+        # At high difficulty (1.5-threshold): minimal penalty
+        # At extreme difficulty (> threshold): bonus for complexity
+        bonus_threshold = getattr(self, 'complexity_bonus_threshold', 2.5)
+        bonus_multiplier = getattr(self, 'complexity_bonus_multiplier', -0.1)
+        
+        if diff < 0.5:
+            multiplier = 1.0
+        elif diff < 1.5:
+            # Linear decrease from 1.0 to 0.3
+            multiplier = 1.0 - 0.7 * (diff - 0.5) / 1.0
+        elif diff < bonus_threshold:
+            # Further decrease from 0.3 to 0.0
+            multiplier = 0.3 - 0.3 * (diff - 1.5) / (bonus_threshold - 1.5)
+        else:
+            # Bonus for complexity at extreme difficulty (negative penalty = bonus)
+            multiplier = bonus_multiplier * (diff - bonus_threshold)
+        
+        penalty = multiplier * m.complexity_alpha * (m.node_penalty*n_hidden + m.edge_penalty*n_edges)
+        # Only apply threshold cap to positive penalties (not to bonuses)
         threshold = getattr(self, "complexity_threshold", None)
-        if threshold is not None:
+        if threshold is not None and penalty > 0:
             penalty = min(float(threshold), penalty)
         return penalty
 
@@ -2224,6 +2258,8 @@ class ReproPlanaNEATPlus:
 
     def evolve(self, fitness_fn: Callable[[Genome], float], n_generations=100, target_fitness=None, verbose=True, env_schedule=None):
         history=[]; best_ever=None; best_ever_fit=-1e9
+        # Track top-3 best topologies for diversity
+        top3_best = []  # List of (genome, fitness, gen) tuples
         from math import isnan
         scars=None; prev_best=None
         for gen in range(n_generations):
@@ -2271,6 +2307,48 @@ class ReproPlanaNEATPlus:
             except Exception:
                 pass
             best_idx=int(np.argmax(fitnesses)); best_fit=float(fitnesses[best_idx]); avg_fit=float(np.mean(fitnesses))
+            
+            # === Track top-3 diverse topologies ===
+            # Helper function to get genome complexity
+            def genome_complexity(g):
+                n_hidden = sum(1 for n in g.nodes.values() if n.type=='hidden')
+                n_edges = sum(1 for c in g.connections.values() if c.enabled)
+                return (n_hidden, n_edges)
+            
+            # Get top candidates sorted by fitness
+            sorted_indices = np.argsort(fitnesses)[::-1]
+            pool_size = getattr(self, 'top3_candidate_pool_size', 10)
+            node_threshold = getattr(self, 'top3_diversity_node_threshold', 1)
+            edge_threshold = getattr(self, 'top3_diversity_edge_threshold', 2)
+            
+            for idx in sorted_indices[:pool_size]:  # Check top N to find diverse top-3
+                candidate = self.population[idx].copy()
+                candidate_fit = float(fitnesses[idx])
+                n_hidden_cand, n_edges_cand = genome_complexity(candidate)
+                
+                # Check if this topology is sufficiently different from existing top-3
+                is_diverse = True
+                for existing_genome, _, _ in top3_best:
+                    n_hidden_exist, n_edges_exist = genome_complexity(existing_genome)
+                    # If very similar in structure, skip
+                    if abs(n_hidden_cand - n_hidden_exist) <= node_threshold and abs(n_edges_cand - n_edges_exist) <= edge_threshold:
+                        is_diverse = False
+                        break
+                
+                # Add if diverse or if we don't have 3 yet
+                if len(top3_best) < 3:
+                    top3_best.append((candidate, candidate_fit, gen))
+                elif is_diverse:
+                    # Only add if diverse and better than the worst in top-3
+                    top3_best.append((candidate, candidate_fit, gen))
+                    # Sort by fitness and keep only top-3
+                    top3_best.sort(key=lambda x: x[1], reverse=True)
+                    top3_best = top3_best[:3]
+                
+                if len(top3_best) >= 3 and not is_diverse:
+                    # Stop if we have 3 and current is not diverse
+                    break
+            
             # === Snapshots (decimated & bounded) ===
             try:
                 curr_best = self.population[best_idx].copy()
@@ -2296,9 +2374,18 @@ class ReproPlanaNEATPlus:
                 # Count hermaphrodites in population
                 n_herm = sum(1 for g in self.population if g.sex == 'hermaphrodite')
                 herm_str = f" | herm {n_herm}" if n_herm > 0 else ""
+                # Show top-3 complexity info
+                top3_str = ""
+                if len(top3_best) >= 3:
+                    complexities = [
+                        (sum(1 for n in g.nodes.values() if n.type=='hidden'),
+                         sum(1 for c in g.connections.values() if c.enabled))
+                        for g, _, _ in top3_best
+                    ]
+                    top3_str = f" | top3: [{complexities[0][0]}n,{complexities[0][1]}e] [{complexities[1][0]}n,{complexities[1][1]}e] [{complexities[2][0]}n,{complexities[2][1]}e]"
                 print(
                     f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | "
-                    f"sexual {ev.get('sexual_within',0)+ev.get('sexual_cross',0)} | regen {ev.get('asexual_regen',0)}{herm_str}"
+                    f"sexual {ev.get('sexual_within',0)+ev.get('sexual_cross',0)} | regen {ev.get('asexual_regen',0)}{herm_str}{top3_str}"
                 )
             if best_fit > best_ever_fit:
                 best_ever_fit = best_fit; best_ever = self.population[best_idx].copy()
@@ -2315,6 +2402,8 @@ class ReproPlanaNEATPlus:
         # Champion across all generations
         if best_ever is None and self.population:
             best_ever = self.population[0].copy()
+        # Store top-3 for later access
+        self.top3_best_topologies = top3_best
         # 持ち回りプールがあれば閉じる
         try:
             self._close_pool()
@@ -3413,6 +3502,24 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     summary_dir = f"{out_prefix}_decisions"
     summary_paths = export_decision_boundaries_all(best, summary_dir, steps=steps, seed=0)
     
+    # Export top-3 diverse topologies
+    top3_paths = []
+    if hasattr(neat, 'top3_best_topologies') and len(neat.top3_best_topologies) > 0:
+        for idx, (genome, fitness, gen) in enumerate(neat.top3_best_topologies[:3]):
+            n_hidden = sum(1 for n in genome.nodes.values() if n.type=='hidden')
+            n_edges = sum(1 for c in genome.connections.values() if c.enabled)
+            top_path = f"{out_prefix}_top{idx+1}_topology.png"
+            top_scars = diff_scars(None, genome, None, birth_gen=gen, regen_mode_for_new="split")
+            draw_genome_png(
+                genome, top_scars, top_path, 
+                title=f"Top-{idx+1} Topology (Gen {gen}, fit={fitness:.4f}, {n_hidden}h+{n_edges}e)"
+            )
+            top3_paths.append(top_path)
+            # Also save decision boundary for top-3
+            top_db_path = f"{out_prefix}_top{idx+1}_decision_boundary.png"
+            plot_decision_boundary(genome, Xtr, ytr, top_db_path, steps=steps, **style)
+            print(f"[INFO] Top-{idx+1}: {n_hidden} hidden nodes, {n_edges} edges, fitness={fitness:.4f} (gen {gen})")
+    
     # Convert genome snapshots to Cytoscape format for interactive report
     genomes_cyto = []
     if hasattr(neat, 'snapshots_genomes') and neat.snapshots_genomes:
@@ -3423,6 +3530,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         "learning_curve": lc_path,
         "decision_boundary": db_path,
         "topology": topo_path,
+        "top3_topologies": top3_paths,
         "regen_gif": regen_gif,
         "morph_gif": morph_gif,
         "lineage": lineage_path,
@@ -4130,35 +4238,74 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
-    """Three-phase curriculum with a late-game regeneration surge. 上限撤廃版。"""
-    if gen < 25:
-        return {"difficulty": 0.3, "noise_std": 0.0, "enable_regen": False}
-    if gen < 40:
-        return {"difficulty": 0.6, "noise_std": 0.02, "enable_regen": False}
-    # 上限撤廃: gen >= 40 では difficulty を世代数に応じて線形増加
-    diff = 1.0 + (gen - 40) * 0.02  # 40世代以降は0.02ずつ増加
-    noise = 0.05 + (gen - 40) * 0.001  # noiseも緩やかに増加
+    """Multi-phase complex curriculum with diverse environmental challenges to promote complex topology survival.
+    
+    Parameters can be customized via _ctx if needed:
+    - chaos_amp1, chaos_freq1: First chaotic component amplitude and frequency
+    - chaos_amp2, chaos_freq2: Second chaotic component amplitude and frequency
+    - cyclic_amp, cyclic_freq: Cyclic noise amplitude and frequency
+    """
+    # Extract customizable parameters from context
+    ctx = _ctx or {}
+    chaos_amp1 = ctx.get('chaos_amp1', 0.2)
+    chaos_freq1_sin = ctx.get('chaos_freq1_sin', 0.4)
+    chaos_freq1_cos = ctx.get('chaos_freq1_cos', 0.15)
+    chaos_amp2 = ctx.get('chaos_amp2', 0.15)
+    chaos_freq2 = ctx.get('chaos_freq2', 0.6)
+    cyclic_amp = ctx.get('cyclic_amp', 0.15)
+    cyclic_freq = ctx.get('cyclic_freq', 0.25)
+    
+    # Phase 1: Early exploration (0-15) - moderate difficulty, low noise
+    if gen < 15:
+        return {"difficulty": 0.4, "noise_std": 0.01, "enable_regen": False}
+    # Phase 2: Initial pressure (15-30) - increasing difficulty with fluctuating noise
+    if gen < 30:
+        # Fluctuating noise to promote diverse topologies
+        noise_cycle = 0.03 + 0.02 * np.sin((gen - 15) * 0.3)
+        return {"difficulty": 0.5 + (gen - 15) * 0.03, "noise_std": max(0.01, noise_cycle), "enable_regen": False}
+    # Phase 3: Complex environment (30-50) - high difficulty with multiple stressors
+    if gen < 50:
+        # Multi-faceted difficulty: base + cyclic + linear growth
+        base_diff = 1.0 + (gen - 30) * 0.04
+        cyclic_component = cyclic_amp * np.sin((gen - 30) * cyclic_freq)  # Environmental fluctuation
+        diff = base_diff + cyclic_component
+        # Variable noise with spikes
+        noise = 0.04 + (gen - 30) * 0.002 + 0.03 * np.abs(np.sin((gen - 30) * 0.5))
+        return {"difficulty": diff, "noise_std": noise, "enable_regen": True}
+    # Phase 4: Extreme diversity pressure (50+) - maximum complexity challenge
+    # Exponentially increasing difficulty with chaotic noise
+    base_diff = 1.8 + (gen - 50) * 0.05
+    # Add chaotic components to force topology diversity
+    chaos1 = chaos_amp1 * np.sin((gen - 50) * chaos_freq1_sin) * np.cos((gen - 50) * chaos_freq1_cos)
+    chaos2 = chaos_amp2 * np.cos((gen - 50) * chaos_freq2)
+    diff = base_diff + chaos1 + chaos2
+    # High variable noise
+    noise = 0.08 + (gen - 50) * 0.003 + 0.05 * np.abs(np.sin((gen - 50) * 0.7))
     return {"difficulty": diff, "noise_std": noise, "enable_regen": True}
 
 
 def _apply_stable_neat_defaults(neat: ReproPlanaNEATPlus):
-    """Thesis-grade defaults: calm search, regen gated until curriculum lifts it. 複雑トポロジー保持版。"""
+    """Enhanced defaults for complex topology survival under challenging environments."""
     neat.mode = EvalMode(
         vanilla=True,
         enable_regen_reproduction=False,
         complexity_alpha=neat.mode.complexity_alpha,
-        node_penalty=0.3,  # 緩和: 複雑なトポロジーが残りやすく
-        edge_penalty=0.15,  # 緩和: エッジも保持
+        node_penalty=0.15,  # Further reduced: encourage more hidden nodes
+        edge_penalty=0.08,  # Further reduced: encourage more connections
         species_low=neat.mode.species_low,
         species_high=neat.mode.species_high,
     )
-    neat.mutate_add_conn_prob = 0.05
-    neat.mutate_add_node_prob = 0.03
+    # Increase mutation rates to promote diversity and complexity
+    neat.mutate_add_conn_prob = 0.08  # Increased from 0.05
+    neat.mutate_add_node_prob = 0.05  # Increased from 0.03
     neat.mutate_weight_prob = 0.8
-    neat.regen_mode_mut_rate = 0.05
+    neat.regen_mode_mut_rate = 0.08  # Increased from 0.05
     neat.mix_asexual_base = 0.10
-    # 常に5.0に設定して複雑なトポロジーを許容
-    neat.complexity_threshold = 5.0
+    # Higher threshold to allow very complex topologies
+    neat.complexity_threshold = 8.0  # Increased from 5.0
+    # Increase max capacity for complex topologies
+    neat.max_hidden_nodes = 256  # Increased from 128
+    neat.max_edges = 2048  # Increased from 1024
 
 
 def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str = 'identity'):
