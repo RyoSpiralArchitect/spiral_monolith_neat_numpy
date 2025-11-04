@@ -3477,6 +3477,24 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     summary_dir = f"{out_prefix}_decisions"
     summary_paths = export_decision_boundaries_all(best, summary_dir, steps=steps, seed=0)
     
+    # Export top-3 diverse topologies
+    top3_paths = []
+    if hasattr(neat, 'top3_best_topologies') and len(neat.top3_best_topologies) > 0:
+        for idx, (genome, fitness, gen) in enumerate(neat.top3_best_topologies[:3]):
+            n_hidden = sum(1 for n in genome.nodes.values() if n.type=='hidden')
+            n_edges = sum(1 for c in genome.connections.values() if c.enabled)
+            top_path = f"{out_prefix}_top{idx+1}_topology.png"
+            top_scars = diff_scars(None, genome, None, birth_gen=gen, regen_mode_for_new="split")
+            draw_genome_png(
+                genome, top_scars, top_path, 
+                title=f"Top-{idx+1} Topology (Gen {gen}, fit={fitness:.4f}, {n_hidden}h+{n_edges}e)"
+            )
+            top3_paths.append(top_path)
+            # Also save decision boundary for top-3
+            top_db_path = f"{out_prefix}_top{idx+1}_decision_boundary.png"
+            plot_decision_boundary(genome, Xtr, ytr, top_db_path, steps=steps, **style)
+            print(f"[INFO] Top-{idx+1}: {n_hidden} hidden nodes, {n_edges} edges, fitness={fitness:.4f} (gen {gen})")
+    
     # Convert genome snapshots to Cytoscape format for interactive report
     genomes_cyto = []
     if hasattr(neat, 'snapshots_genomes') and neat.snapshots_genomes:
@@ -3487,6 +3505,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         "learning_curve": lc_path,
         "decision_boundary": db_path,
         "topology": topo_path,
+        "top3_topologies": top3_paths,
         "regen_gif": regen_gif,
         "morph_gif": morph_gif,
         "lineage": lineage_path,
