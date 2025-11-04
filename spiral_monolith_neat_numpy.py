@@ -19,6 +19,7 @@ from collections import deque, defaultdict, OrderedDict
 import math, argparse, os, mimetypes, csv
 import matplotlib
 import warnings
+import pickle as _pickle
 
 # === Safety & Runtime Preamble ===============================================
 # - BLAS スレッドを 1 に制限して並列評価との過剰スレッド競合を防止
@@ -34,6 +35,14 @@ if "TRANSFORMERS_CACHE" in os.environ and "HF_HOME" not in os.environ:
     os.environ["HF_HOME"] = os.environ["TRANSFORMERS_CACHE"]
 warnings.filterwarnings("ignore", category=FutureWarning, message=r".*TRANSFORMERS_CACHE.*")
 warnings.filterwarnings("ignore", category=FutureWarning, message=r".*torch_dtype.*deprecated.*Use `dtype`.*")
+
+def _is_picklable(obj) -> bool:
+    """Process 並列に切り替える前に picklable かを事前検査（非picklableなら thread に自動フォールバック）"""
+    try:
+        _pickle.dumps(obj)
+        return True
+    except Exception:
+        return False
 
 
 def _ensure_matplotlib_agg(force: bool = False):
@@ -1532,6 +1541,13 @@ class ReproPlanaNEATPlus:
             self.parallel_backend = "thread"
         # Auto curriculum toggle
         self.auto_curriculum = True
+        # ---- Speciation target learning (dynamic)
+        self.species_target = None  # set lazily around (species_low+species_high)/2
+        self.species_target_min = 2.0
+        self.species_target_max = max(float(self.mode.species_high), float(self.pop_size) / 3.0)
+        self.species_target_step = 0.5            # hill-climb step
+        self.species_target_update_every = 5      # generations
+        self._spec_learn = {"dir": 1.0, "last_best": None, "last_tgt": None, "last_reward": None}
 
         # Base genome
         nodes = {}
@@ -1631,12 +1647,55 @@ class ReproPlanaNEATPlus:
         # 攻撃的・目標駆動の適応
         low = int(self.mode.species_low)
         high = int(self.mode.species_high)
-        target = float(getattr(self, "species_target", (low + high) * 0.5))
+        # lazy init target（学習で更新される）
+        if getattr(self, "species_target", None) is None:
+            self.species_target = float((low + high) * 0.5)
+        target = float(self.species_target)
         if target <= 0:
             target = (low + high) * 0.5
         err = (float(num_species) - target) / max(1.0, target)
         self.compatibility_threshold *= float(np.exp(0.18 * err))
         self.compatibility_threshold = float(np.clip(self.compatibility_threshold, 0.3, 50.0))
+
+    def _learn_species_target(self, num_species: int, best_fit: float, gen: int) -> None:
+        """
+        species_target を"学習"：簡易ヒルクライム＋誤差バイアス。
+        - reward: 直近 best_fit の増分
+        - dir: target を上げる(探索↑) / 下げる(収束↑) の向き
+        """
+        low, high = int(self.mode.species_low), int(self.mode.species_high)
+        if self.species_target is None:
+            self.species_target = float((low + high) * 0.5)
+            self._spec_learn["last_best"] = float(best_fit)
+            self._spec_learn["last_tgt"]  = float(self.species_target)
+            self._spec_learn["last_reward"] = 0.0
+            return
+        # 更新間隔
+        if gen % int(self.species_target_update_every) != 0:
+            return
+        last_best = self._spec_learn.get("last_best", None)
+        if last_best is None:
+            self._spec_learn["last_best"] = float(best_fit)
+            return
+        reward = float(best_fit) - float(last_best)
+        dir_ = float(self._spec_learn.get("dir", 1.0))
+        last_reward = float(self._spec_learn.get("last_reward") or 0.0)
+        # 報酬が悪化したら向きを反転
+        if reward < (last_reward - 1e-6):
+            dir_ = -dir_
+        # 誤差（現在の種数との差）も少し混ぜて暴走防止
+        err = float(num_species) - float(self.species_target)
+        if err != 0.0:
+            dir_ = 0.7*dir_ + 0.3*np.sign(err)
+        step = float(self.species_target_step)
+        new_t = float(self.species_target) + step * dir_
+        new_t = float(np.clip(new_t, float(self.species_target_min), float(self.species_target_max)))
+        self.species_target = new_t
+        # 状態更新
+        self._spec_learn["dir"] = dir_
+        self._spec_learn["last_best"] = float(best_fit)
+        self._spec_learn["last_tgt"]  = float(new_t)
+        self._spec_learn["last_reward"] = float(reward)
 
     def _mutate(self, genome: Genome):
         if self.rng.random() < self.mutate_toggle_prob: genome.mutate_toggle_enable(self.rng, prob=self.mutate_toggle_prob)
@@ -1805,15 +1864,40 @@ class ReproPlanaNEATPlus:
         return penalty
 
     def _evaluate_population(self, fitness_fn: Callable[[Genome], float]) -> List[float]:
+        """並列評価：thread / process の自動切替（processは picklable 検査・spawn/forkserver 対応）。"""
         workers = int(getattr(self, "eval_workers", 1))
         if workers <= 1:
             return [fitness_fn(g) for g in self.population]
+        backend = getattr(self, "parallel_backend", "thread")
+        if backend == "process" and not _is_picklable(fitness_fn):
+            print("[WARN] fitness_fn is not picklable; falling back to threads")
+            backend = "thread"
         try:
             import concurrent.futures as _cf
-            Executor = _cf.ProcessPoolExecutor if getattr(self, "parallel_backend", "thread") == "process" else _cf.ThreadPoolExecutor
-            with Executor(max_workers=workers) as ex:
-                futs = [ex.submit(fitness_fn, g) for g in self.population]
-                return [f.result() for f in futs]
+            if backend == "process":
+                import multiprocessing as _mp
+                start = os.environ.get("NEAT_PROCESS_START_METHOD", "spawn")
+                try:
+                    ctx = _mp.get_context(start)
+                except ValueError:
+                    ctx = _mp.get_context("spawn")
+                def _init_worker():
+                    # ワーカー内でもBLASを単スレに固定
+                    os.environ["OMP_NUM_THREADS"]="1"
+                    os.environ["OPENBLAS_NUM_THREADS"]="1"
+                    os.environ["MKL_NUM_THREADS"]="1"
+                    os.environ["VECLIB_MAXIMUM_THREADS"]="1"
+                    os.environ["NUMEXPR_NUM_THREADS"]="1"
+                with _cf.ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=ctx,
+                    initializer=_init_worker,
+                ) as ex:
+                    # chunksize は ProcessPool に有効、ThreadPool でも無害
+                    return list(ex.map(fitness_fn, self.population, chunksize=max(1, len(self.population)//workers)))
+            else:
+                with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
+                    return list(ex.map(fitness_fn, self.population))
         except Exception as e:
             print("[WARN] parallel evaluation disabled:", e)
             return [fitness_fn(g) for g in self.population]
@@ -1908,6 +1992,11 @@ class ReproPlanaNEATPlus:
             if target_fitness is not None and best_fit >= target_fitness:
                 break
             species=self.speciate(fitnesses)
+            # 学習した target を先に更新 → それに追従する形で compat を調整
+            try:
+                self._learn_species_target(len(species), best_fit, gen)
+            except Exception as _spe:
+                print("[WARN] species target learning skipped:", _spe)
             self._adapt_compat_threshold(len(species))
             self.reproduce(species, fitnesses)
         # Champion across all generations
