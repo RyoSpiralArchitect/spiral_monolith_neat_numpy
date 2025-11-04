@@ -357,7 +357,8 @@ class Genome:
         """Remove cycles by disabling connections until the genome is acyclic.
         Returns True if any connections were disabled."""
         disabled_any = False
-        max_iterations = len(self.connections) + 1  # Safety limit
+        # In the worst case, we only need to disable as many connections as there are enabled
+        max_iterations = len(list(self.enabled_connections())) + 1
         iterations = 0
         
         while iterations < max_iterations:
@@ -390,7 +391,7 @@ class Genome:
             # Prefer connections with higher innovation numbers (newer connections)
             disabled_one = False
             for c in sorted(self.enabled_connections(), key=lambda x: x.innovation, reverse=True):
-                if c.enabled and (c.in_node in cycle_nodes and c.out_node in cycle_nodes):
+                if c.in_node in cycle_nodes and c.out_node in cycle_nodes:
                     c.enabled = False
                     disabled_any = True
                     disabled_one = True
@@ -399,7 +400,7 @@ class Genome:
             # If we didn't find a connection within the cycle, fall back to any connection involving cycle nodes
             if not disabled_one:
                 for c in sorted(self.enabled_connections(), key=lambda x: x.innovation, reverse=True):
-                    if c.enabled and (c.in_node in cycle_nodes or c.out_node in cycle_nodes):
+                    if c.in_node in cycle_nodes or c.out_node in cycle_nodes:
                         c.enabled = False
                         disabled_any = True
                         disabled_one = True
@@ -408,11 +409,9 @@ class Genome:
             if not disabled_one:
                 # Final fallback: disable any enabled connection
                 for c in self.enabled_connections():
-                    if c.enabled:
-                        c.enabled = False
-                        disabled_any = True
-                        break
-                break
+                    c.enabled = False
+                    disabled_any = True
+                    break
         
         return disabled_any
 
