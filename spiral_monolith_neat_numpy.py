@@ -1147,8 +1147,8 @@ class EvalMode:
     vanilla: bool = True                      # True -> pure NEAT fitness (no sex/regen bonuses)
     enable_regen_reproduction: bool = False   # allow asexual_regen in reproduction
     complexity_alpha: float = 0.01
-    node_penalty: float = 1.0
-    edge_penalty: float = 0.5
+    node_penalty: float = 0.3  # 1.0 → 0.3 に緩和（複雑なトポロジーを保持）
+    edge_penalty: float = 0.15  # 0.5 → 0.15 に緩和
     species_low: int = 3
     species_high: int = 8
 
@@ -2107,7 +2107,7 @@ class ReproPlanaNEATPlus:
 
 
     def _auto_env_schedule(self, gen: int, history: List[Tuple[float,float]]) -> Dict[str, float]:
-        """進捗に応じて difficulty / noise を自動昇圧。高難度で再生を解禁。"""
+        """進捗に応じて difficulty / noise を自動昇圧。高難度で再生を解禁。上限撤廃版。"""
         diff = float(self.env.get('difficulty', 0.0))
         best_hist = [b for (b, _a) in history] if history else []
         bump = 0.0
@@ -2122,8 +2122,10 @@ class ReproPlanaNEATPlus:
         elif gen < 25:
             diff = max(diff, 0.5)
         else:
-            diff = min(1.0, diff + bump)
+            # 上限撤廃: min(1.0, ...) を削除してdiffを無制限に増加可能に
+            diff = diff + bump
         enable_regen = bool(diff >= 0.85)
+        # noise_stdも無制限に増加可能に
         noise_std = 0.01 + 0.05 * diff
         return {"difficulty": float(diff), "noise_std": float(noise_std), "enable_regen": enable_regen}
 
@@ -2846,7 +2848,7 @@ def _fallback_lineage_layout(nodes: List[int], gen_map: Dict[int,int]):
         if n not in pos: pos[n] = (0.5, 0.5)
     return pos
 
-def render_lineage(neat, path="lineage.png", title="Lineage", max_edges: Optional[int]=2500,
+def render_lineage(neat, path="lineage.png", title="Lineage", max_edges: Optional[int]=10000,
                    highlight: Optional[Iterable[int]]=None, dpi=200):
     edges = getattr(neat, "lineage_edges", None)
     if not edges:
@@ -3053,7 +3055,7 @@ def export_task_gallery(
             steps=steps,
             out_prefix=os.path.join(out_dir, tag),
             make_gifs=False,
-            make_lineage=False,
+            make_lineage=True,  # False → True に変更してlineageを生成
             rng_seed=seed,
         )
         lc = res.get("learning_curve")
@@ -3078,6 +3080,10 @@ def export_task_gallery(
         topo = res.get("topology")
         if topo:
             outputs[f"{idx:02d} {task.upper()} トポロジ"] = topo
+        # lineageも追加
+        lineage = res.get("lineage")
+        if lineage and os.path.exists(lineage):
+            outputs[f"{idx:02d} {task.upper()} 系統図"] = lineage
     return outputs
 
 # ============================================================
@@ -4046,22 +4052,25 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
-    """Three-phase curriculum with a late-game regeneration surge."""
+    """Three-phase curriculum with a late-game regeneration surge. 上限撤廃版。"""
     if gen < 25:
         return {"difficulty": 0.3, "noise_std": 0.0, "enable_regen": False}
     if gen < 40:
         return {"difficulty": 0.6, "noise_std": 0.02, "enable_regen": False}
-    return {"difficulty": 1.0, "noise_std": 0.05, "enable_regen": True}
+    # 上限撤廃: gen >= 40 では difficulty を世代数に応じて線形増加
+    diff = 1.0 + (gen - 40) * 0.02  # 40世代以降は0.02ずつ増加
+    noise = 0.05 + (gen - 40) * 0.001  # noiseも緩やかに増加
+    return {"difficulty": diff, "noise_std": noise, "enable_regen": True}
 
 
 def _apply_stable_neat_defaults(neat: ReproPlanaNEATPlus):
-    """Thesis-grade defaults: calm search, regen gated until curriculum lifts it."""
+    """Thesis-grade defaults: calm search, regen gated until curriculum lifts it. 複雑トポロジー保持版。"""
     neat.mode = EvalMode(
         vanilla=True,
         enable_regen_reproduction=False,
         complexity_alpha=neat.mode.complexity_alpha,
-        node_penalty=neat.mode.node_penalty,
-        edge_penalty=neat.mode.edge_penalty,
+        node_penalty=0.3,  # 緩和: 複雑なトポロジーが残りやすく
+        edge_penalty=0.15,  # 緩和: エッジも保持
         species_low=neat.mode.species_low,
         species_high=neat.mode.species_high,
     )
@@ -4071,7 +4080,7 @@ def _apply_stable_neat_defaults(neat: ReproPlanaNEATPlus):
     neat.regen_mode_mut_rate = 0.05
     neat.mix_asexual_base = 0.10
     if getattr(neat, "complexity_threshold", None) is None:
-        neat.complexity_threshold = 1.0
+        neat.complexity_threshold = 5.0  # 1.0 → 5.0 に増加して複雑なトポロジーを許容
 
 
 def setup_neat_for_env(env_id: str, population: int = 48, output_activation: str = 'identity'):
