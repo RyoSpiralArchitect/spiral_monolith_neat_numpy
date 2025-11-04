@@ -20,6 +20,12 @@ import math, argparse, os, mimetypes, csv
 import matplotlib
 import warnings
 import pickle as _pickle
+import json as _json
+
+try:  # Python 3.8+
+    from multiprocessing import shared_memory as _shm
+except Exception:
+    _shm = None
 
 # === Safety & Runtime Preamble ===============================================
 # - BLAS スレッドを 1 に制限して並列評価との過剰スレッド競合を防止
@@ -44,6 +50,79 @@ def _is_picklable(obj) -> bool:
     except Exception:
         return False
 
+# === Shared-memory datasets (for process-parallel, zero-copy) =================
+_SHM_LOCAL = {}   # parent-owned SharedMemory objects (for cleanup)
+_SHM_META  = {}   # {label -> {'name','shape','dtype','readonly'}}
+_SHM_CACHE = {}   # worker-attached numpy views
+
+def shm_register_dataset(label: str, arr: "np.ndarray", readonly: bool = True) -> dict:
+    """Create shared memory for arr (parent), return metadata dict."""
+    if _shm is None:
+        raise RuntimeError("shared_memory is unavailable on this Python.")
+    arr = np.asarray(arr)
+    size = int(arr.nbytes)
+    # unique name
+    name = f"sm_{label}_{np.random.randint(1, 1<<30):08x}"
+    shm = _shm.SharedMemory(create=True, size=size, name=name)
+    buf = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
+    buf[:] = arr
+    _SHM_LOCAL[label] = (shm, arr.shape, str(arr.dtype), bool(readonly))
+    meta = {"name": name, "shape": tuple(arr.shape), "dtype": str(arr.dtype), "readonly": bool(readonly)}
+    _SHM_META[label] = meta
+    return meta
+
+def shm_set_worker_meta(meta: dict | None):
+    """Install metadata in worker; views are attached lazily on demand."""
+    global _SHM_META, _SHM_CACHE
+    _SHM_META = dict(meta or {})
+    _SHM_CACHE = {}
+
+def get_shared_dataset(label: str) -> "np.ndarray":
+    """Worker-side: return cached numpy view to shared dataset by label."""
+    if label in _SHM_CACHE:
+        return _SHM_CACHE[label]
+    meta = _SHM_META.get(label)
+    if not meta:
+        raise KeyError(f"Shared dataset '{label}' not found.")
+    if _shm is None:
+        raise RuntimeError("shared_memory is unavailable in worker.")
+    shm = _shm.SharedMemory(name=meta["name"])
+    arr = np.ndarray(tuple(meta["shape"]), dtype=np.dtype(meta["dtype"]), buffer=shm.buf)
+    if bool(meta.get("readonly", True)):
+        try:
+            arr.setflags(write=False)
+        except Exception:
+            pass
+    _SHM_CACHE[label] = arr
+    return arr
+
+def shm_release_all():
+    """Parent-side: close & unlink all owned segments."""
+    if not _SHM_LOCAL:
+        return
+    for _label, (shm, _shape, _dtype, _ro) in list(_SHM_LOCAL.items()):
+        try:
+            shm.close()
+        except Exception:
+            pass
+        try:
+            shm.unlink()
+        except Exception:
+            pass
+    _SHM_LOCAL.clear()
+
+def _proc_init_worker(meta: dict | None = None):
+    """ProcessPool initializer: cap BLAS threads and install SHM metadata."""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    if meta:
+        try:
+            shm_set_worker_meta(meta)
+        except Exception:
+            pass
 
 def _ensure_matplotlib_agg(force: bool = False):
     """Select Agg backend even if pyplot was already imported elsewhere."""
@@ -1548,6 +1627,17 @@ class ReproPlanaNEATPlus:
         self.species_target_step = 0.5            # hill-climb step
         self.species_target_update_every = 5      # generations
         self._spec_learn = {"dir": 1.0, "last_best": None, "last_tgt": None, "last_reward": None}
+        # PID controller & bandit switching
+        self.species_target_mode = "auto"         # "pid" | "hill" | "auto"
+        self.pid_kp = 0.35; self.pid_ki = 0.02; self.pid_kd = 0.10
+        self.pid_i_clip = 50.0
+        self._spec_learn.update({"pid_i": 0.0, "pid_prev_err": None, "score_pid": 0.0, "score_hill": 0.0, "eps": 0.10, "last_method": "pid"})
+        # Process pool "rolling restart"
+        self.pool_keepalive = int(os.environ.get("NEAT_POOL_KEEPALIVE", "0"))
+        self.pool_restart_every = int(os.environ.get("NEAT_POOL_RESTART_EVERY", "25"))
+        self._proc_pool = None
+        self._proc_pool_age = 0
+        self._shm_meta = None
 
         # Base genome
         nodes = {}
@@ -1658,11 +1748,7 @@ class ReproPlanaNEATPlus:
         self.compatibility_threshold = float(np.clip(self.compatibility_threshold, 0.3, 50.0))
 
     def _learn_species_target(self, num_species: int, best_fit: float, gen: int) -> None:
-        """
-        species_target を"学習"：簡易ヒルクライム＋誤差バイアス。
-        - reward: 直近 best_fit の増分
-        - dir: target を上げる(探索↑) / 下げる(収束↑) の向き
-        """
+        """species_target の"学習"：PID と Hill-Climb をバンディット切換（auto）。"""
         low, high = int(self.mode.species_low), int(self.mode.species_high)
         if self.species_target is None:
             self.species_target = float((low + high) * 0.5)
@@ -1673,29 +1759,61 @@ class ReproPlanaNEATPlus:
         # 更新間隔
         if gen % int(self.species_target_update_every) != 0:
             return
-        last_best = self._spec_learn.get("last_best", None)
+        st = self._spec_learn
+        last_best = st.get("last_best", None)
         if last_best is None:
-            self._spec_learn["last_best"] = float(best_fit)
+            st["last_best"] = float(best_fit)
             return
         reward = float(best_fit) - float(last_best)
-        dir_ = float(self._spec_learn.get("dir", 1.0))
-        last_reward = float(self._spec_learn.get("last_reward") or 0.0)
-        # 報酬が悪化したら向きを反転
-        if reward < (last_reward - 1e-6):
-            dir_ = -dir_
-        # 誤差（現在の種数との差）も少し混ぜて暴走防止
-        err = float(num_species) - float(self.species_target)
-        if err != 0.0:
-            dir_ = 0.7*dir_ + 0.3*np.sign(err)
-        step = float(self.species_target_step)
-        new_t = float(self.species_target) + step * dir_
-        new_t = float(np.clip(new_t, float(self.species_target_min), float(self.species_target_max)))
-        self.species_target = new_t
-        # 状態更新
-        self._spec_learn["dir"] = dir_
-        self._spec_learn["last_best"] = float(best_fit)
-        self._spec_learn["last_tgt"]  = float(new_t)
-        self._spec_learn["last_reward"] = float(reward)
+        mode = getattr(self, "species_target_mode", "auto")
+        # choose method
+        method = "pid"
+        if mode == "hill":
+            method = "hill"
+        elif mode == "auto":
+            eps = float(st.get("eps", 0.10))
+            # epsilon-greedy over 2 arms
+            if self.rng.random() < eps:
+                method = "pid" if (self.rng.random() < 0.5) else "hill"
+            else:
+                method = "pid" if (st.get("score_pid", 0.0) >= st.get("score_hill", 0.0)) else "hill"
+        # run update
+        if method == "pid":
+            # error = actual - target  （種数が多すぎれば target を上げにくく/下げやすく）
+            err = float(num_species) - float(self.species_target)
+            prev = st.get("pid_prev_err", 0.0) or 0.0
+            itg  = float(st.get("pid_i", 0.0)) + err
+            itg  = float(np.clip(itg, -float(self.pid_i_clip), float(self.pid_i_clip)))
+            de   = err - prev
+            delta = float(self.pid_kp)*err + float(self.pid_ki)*itg + float(self.pid_kd)*de
+            step_max = max(0.5, 0.75)  # 1ステップで動かし過ぎない
+            new_t = float(self.species_target) + float(np.clip(delta, -step_max, step_max))
+            new_t = float(np.clip(new_t, float(self.species_target_min), float(self.species_target_max)))
+            self.species_target = new_t
+            st["pid_prev_err"] = err
+            st["pid_i"] = itg
+            # EWMA reward
+            st["score_pid"] = 0.85*float(st.get("score_pid", 0.0)) + 0.15*reward
+            st["score_hill"] = 0.98*float(st.get("score_hill", 0.0))
+        else:
+            dir_ = float(st.get("dir", 1.0))
+            last_reward = float(st.get("last_reward") or 0.0)
+            if reward < (last_reward - 1e-6):
+                dir_ = -dir_
+            err_s = float(num_species) - float(self.species_target)
+            if err_s != 0.0:
+                dir_ = 0.7*dir_ + 0.3*np.sign(err_s)
+            step = float(self.species_target_step)
+            new_t = float(self.species_target) + step * dir_
+            new_t = float(np.clip(new_t, float(self.species_target_min), float(self.species_target_max)))
+            self.species_target = new_t
+            st["dir"] = dir_
+            st["score_hill"] = 0.85*float(st.get("score_hill", 0.0)) + 0.15*reward
+            st["score_pid"] = 0.98*float(st.get("score_pid", 0.0))
+        st["last_best"] = float(best_fit)
+        st["last_tgt"]  = float(self.species_target)
+        st["last_reward"] = float(reward)
+
 
     def _mutate(self, genome: Genome):
         if self.rng.random() < self.mutate_toggle_prob: genome.mutate_toggle_enable(self.rng, prob=self.mutate_toggle_prob)
@@ -1864,7 +1982,7 @@ class ReproPlanaNEATPlus:
         return penalty
 
     def _evaluate_population(self, fitness_fn: Callable[[Genome], float]) -> List[float]:
-        """並列評価：thread / process の自動切替（processは picklable 検査・spawn/forkserver 対応）。"""
+        """並列評価（thread/process）。process は SHM メタを初期化し、必要なら持ち回りプールを再起動。"""
         workers = int(getattr(self, "eval_workers", 1))
         if workers <= 1:
             return [fitness_fn(g) for g in self.population]
@@ -1881,26 +1999,42 @@ class ReproPlanaNEATPlus:
                     ctx = _mp.get_context(start)
                 except ValueError:
                     ctx = _mp.get_context("spawn")
-                def _init_worker():
-                    # ワーカー内でもBLASを単スレに固定
-                    os.environ["OMP_NUM_THREADS"]="1"
-                    os.environ["OPENBLAS_NUM_THREADS"]="1"
-                    os.environ["MKL_NUM_THREADS"]="1"
-                    os.environ["VECLIB_MAXIMUM_THREADS"]="1"
-                    os.environ["NUMEXPR_NUM_THREADS"]="1"
-                with _cf.ProcessPoolExecutor(
-                    max_workers=workers,
-                    mp_context=ctx,
-                    initializer=_init_worker,
-                ) as ex:
-                    # chunksize は ProcessPool に有効、ThreadPool でも無害
-                    return list(ex.map(fitness_fn, self.population, chunksize=max(1, len(self.population)//workers)))
+                initargs = (getattr(self, "_shm_meta", None),)
+                # persistent pool?
+                if int(getattr(self, "pool_keepalive", 0)) > 0:
+                    need_new = (self._proc_pool is None) or (int(getattr(self, "_proc_pool_age", 0)) >= int(getattr(self, "pool_restart_every", 25)))
+                    if need_new:
+                        self._close_pool()
+                        self._proc_pool = _cf.ProcessPoolExecutor(
+                            max_workers=workers, mp_context=ctx, initializer=_proc_init_worker, initargs=initargs
+                        )
+                        self._proc_pool_age = 0
+                    ex = self._proc_pool
+                    out = list(ex.map(fitness_fn, self.population, chunksize=max(1, len(self.population)//workers)))
+                    self._proc_pool_age += 1
+                    return out
+                else:
+                    with _cf.ProcessPoolExecutor(
+                        max_workers=workers, mp_context=ctx, initializer=_proc_init_worker, initargs=initargs
+                    ) as ex:
+                        return list(ex.map(fitness_fn, self.population, chunksize=max(1, len(self.population)//workers)))
             else:
                 with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
                     return list(ex.map(fitness_fn, self.population))
         except Exception as e:
             print("[WARN] parallel evaluation disabled:", e)
             return [fitness_fn(g) for g in self.population]
+
+    def _close_pool(self):
+        ex = getattr(self, "_proc_pool", None)
+        if ex is not None:
+            try:
+                ex.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
+            self._proc_pool = None
+            self._proc_pool_age = 0
+
 
     def _auto_env_schedule(self, gen: int, history: List[Tuple[float,float]]) -> Dict[str, float]:
         """進捗に応じて difficulty / noise を自動昇圧。高難度で再生を解禁。"""
@@ -1922,6 +2056,35 @@ class ReproPlanaNEATPlus:
         enable_regen = bool(diff >= 0.85)
         noise_std = 0.01 + 0.05 * diff
         return {"difficulty": float(diff), "noise_std": float(noise_std), "enable_regen": enable_regen}
+
+    def _adaptive_refine_fitness(self, fitnesses: List[float], fitness_fn: Callable[[Genome], float]) -> List[float]:
+        """上位個体にだけ backprop ステップを追加して再評価（軽量な二段評価）。"""
+        if not hasattr(fitness_fn, "refine_raw"):
+            return fitnesses
+        n = len(fitnesses)
+        if n == 0:
+            return fitnesses
+        k = max(1, int(0.10 * n))
+        idxs = np.argsort(fitnesses)[-k:]
+        improved = list(fitnesses)
+        best_now = float(np.max(fitnesses))
+        for i in map(int, idxs):
+            try:
+                gap = best_now - float(fitnesses[i])
+                factor = 2.0 if gap > 0.02 else 1.5
+                raw2 = float(fitness_fn.refine_raw(self.population[i], factor=factor))
+                f2 = raw2
+                if not self.mode.vanilla:
+                    g = self.population[i]
+                    f2 *= self.sex_fitness_scale.get(g.sex, 1.0) * (getattr(g, 'hybrid_scale', 1.0))
+                    if g.regen:
+                        f2 += self.regen_bonus
+                f2 -= self._complexity_penalty(self.population[i])
+                if np.isfinite(f2):
+                    improved[i] = f2
+            except Exception:
+                pass
+        return improved
 
     def evolve(self, fitness_fn: Callable[[Genome], float], n_generations=100, target_fitness=None, verbose=True, env_schedule=None):
         history=[]; best_ever=None; best_ever_fit=-1e9
@@ -1948,6 +2111,12 @@ class ReproPlanaNEATPlus:
             # 難易度に応じた pollen flow
             diff = float(self.env.get('difficulty', 0.0))
             self.pollen_flow_rate = float(min(0.5, max(0.1, 0.1 + 0.35 * diff)))
+            # fitness インスタンスに noise を伝播（プロセスでも都度 pickled）
+            if hasattr(fitness_fn, "set_noise_std"):
+                try:
+                    fitness_fn.set_noise_std(float(self.env.get("noise_std", 0.0)))
+                except Exception:
+                    pass
             # === Evaluate (parallel-aware) ===
             raw = self._evaluate_population(fitness_fn)
             fitnesses=[]
@@ -1960,6 +2129,11 @@ class ReproPlanaNEATPlus:
                 if not np.isfinite(f2):
                     f2 = float(np.nan_to_num(f2, nan=-1e6, posinf=-1e6, neginf=-1e6))
                 fitnesses.append(f2)
+            # Adaptive refine for elites
+            try:
+                fitnesses = self._adaptive_refine_fitness(fitnesses, fitness_fn)
+            except Exception:
+                pass
             best_idx=int(np.argmax(fitnesses)); best_fit=float(fitnesses[best_idx]); avg_fit=float(np.mean(fitnesses))
             # === Snapshots (decimated & bounded) ===
             try:
@@ -2002,6 +2176,11 @@ class ReproPlanaNEATPlus:
         # Champion across all generations
         if best_ever is None and self.population:
             best_ever = self.population[0].copy()
+        # 持ち回りプールがあれば閉じる
+        try:
+            self._close_pool()
+        except Exception:
+            pass
         return best_ever, history
 
 # ============================================================
@@ -2850,6 +3029,41 @@ def make_spirals(n=512, noise=0.1, turns=1.5, seed=0):
     y = np.concatenate([np.zeros(n2, dtype=np.int32), np.ones(n2, dtype=np.int32)])
     return X, y
 
+# === Shared-memory aware fitness =============================================
+class FitnessBackpropShared:
+    """
+    Picklable callable that reads datasets from shared memory by label.
+    Also provides refine_raw(genome, factor) for adaptive extra-steps.
+    """
+    def __init__(self, keys=("Xtr","ytr","Xva","yva"), steps=40, lr=5e-3, l2=1e-4, alpha_nodes=1e-3, alpha_edges=5e-4):
+        self.keys = tuple(keys)
+        self.steps = int(steps); self.lr=float(lr); self.l2=float(l2)
+        self.alpha_nodes=float(alpha_nodes); self.alpha_edges=float(alpha_edges)
+        self.noise_std = 0.0
+    def set_noise_std(self, s: float):
+        self.noise_std = float(max(0.0, s))
+    def _load(self):
+        Xtr = get_shared_dataset(self.keys[0]); ytr = get_shared_dataset(self.keys[1])
+        Xva = get_shared_dataset(self.keys[2]); yva = get_shared_dataset(self.keys[3])
+        return Xtr, ytr, Xva, yva
+    def _aug(self, X):
+        s = float(self.noise_std)
+        if s <= 0.0:
+            return X
+        rng = np.random.default_rng()
+        return X + rng.normal(0.0, s, size=X.shape)
+    def __call__(self, g: "Genome") -> float:
+        Xtr, ytr, Xva, yva = self._load()
+        return fitness_backprop_classifier(g, self._aug(Xtr), ytr, self._aug(Xva), yva,
+                                           steps=self.steps, lr=self.lr, l2=self.l2,
+                                           alpha_nodes=self.alpha_nodes, alpha_edges=self.alpha_edges)
+    def refine_raw(self, g: "Genome", factor: float = 2.0) -> float:
+        Xtr, ytr, Xva, yva = self._load()
+        steps = int(max(1, round(self.steps * float(factor))))
+        return fitness_backprop_classifier(g, self._aug(Xtr), ytr, self._aug(Xva), yva,
+                                           steps=steps, lr=self.lr, l2=self.l2,
+                                           alpha_nodes=self.alpha_nodes, alpha_edges=self.alpha_edges)
+
 def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True, rng_seed: int = 0):
     # dataset
     if task=="xor": Xtr,ytr = make_xor(512, noise=0.05, seed=0); Xva,yva = make_xor(256, noise=0.05, seed=1)
@@ -2865,32 +3079,28 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         if os.path.exists(regen_log_path):
             os.remove(regen_log_path)
 
-    def fit(g):
-        noise_std = float(neat.env.get('noise_std', 0.0))
-        if noise_std > 0.0:
-            Xtr_aug = Xtr + neat.rng.normal(0.0, noise_std, size=Xtr.shape)
-            Xva_aug = Xva + neat.rng.normal(0.0, noise_std, size=Xva.shape)
-        else:
-            Xtr_aug = Xtr
-            Xva_aug = Xva
-        return fitness_backprop_classifier(
-            g,
-            Xtr_aug,
-            ytr,
-            Xva_aug,
-            yva,
-            steps=steps,
-            lr=5e-3,
-            l2=1e-4,
-            alpha_nodes=1e-3,
-            alpha_edges=5e-4,
-        )
+    # --- Shared memory registration for process-parallel zero-copy
+    shm_meta = {}
+    try:
+        shm_meta["Xtr"] = shm_register_dataset("Xtr", Xtr, readonly=True)
+        shm_meta["ytr"] = shm_register_dataset("ytr", ytr, readonly=True)
+        shm_meta["Xva"] = shm_register_dataset("Xva", Xva, readonly=True)
+        shm_meta["yva"] = shm_register_dataset("yva", yva, readonly=True)
+        neat._shm_meta = shm_meta
+    except Exception:
+        neat._shm_meta = None
+    fit = FitnessBackpropShared(steps=steps, lr=5e-3, l2=1e-4, alpha_nodes=1e-3, alpha_edges=5e-4)
     best, hist = neat.evolve(
         fit,
         n_generations=gens,
         verbose=True,
         env_schedule=_default_difficulty_schedule,
     )
+    # SHM cleanup
+    try:
+        shm_release_all()
+    except Exception:
+        pass
     lcs_rows = load_lcs_log(regen_log_path) if os.path.exists(regen_log_path) else []
     lcs_series = _prepare_lcs_series(lcs_rows) if lcs_rows else None
     # Outputs
