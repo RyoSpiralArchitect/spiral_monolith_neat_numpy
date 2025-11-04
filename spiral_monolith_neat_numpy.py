@@ -956,7 +956,7 @@ def _soft_regenerate_tail(g, rng, innov, intensity=0.5):
     rng_local = rng or np.random.default_rng()
     k = max(1, int(len(sinks) * (0.15 + 0.45 * float(intensity))))
     hidden = [nid for nid, n in g.nodes.items() if n.type == 'hidden']
-    choose = sinks if k >= len(sinks) else list(np.random.default_rng().choice(sinks, size=k, replace=False))
+    choose = sinks if k >= len(sinks) else list(rng_local.choice(sinks, size=k, replace=False))
     for c in choose:
         c.weight = float(rng_local.uniform(-1.8, 1.8))
         if hidden and rng_local.random() < (0.25 + 0.35 * float(intensity)):
