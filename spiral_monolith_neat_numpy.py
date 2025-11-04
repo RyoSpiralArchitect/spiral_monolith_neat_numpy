@@ -226,6 +226,7 @@ __all__ = [
     "export_decision_boundaries_all","render_lineage","export_scars_spiral_map",
     "output_dim_from_space","build_action_mapper","eval_with_node_activations","run_policy_in_env","run_gym_neat_experiment",
     "LCSMonitor","summarize_graph_changes","load_lcs_log","export_lcs_ribbon_png","export_lcs_timeline_gif",
+    "PerSampleSequenceStopperPro",
 ]
 
 @dataclass
@@ -3084,6 +3085,64 @@ class FitnessBackpropShared:
                                            steps=steps, lr=self.lr, l2=self.l2,
                                            alpha_nodes=self.alpha_nodes, alpha_edges=self.alpha_edges)
 
+# === Per-Sample Sequence Stopper (with safety guards) ========================
+class PerSampleSequenceStopperPro:
+    """
+    Stopper for per-sample sequence processing with stage-based termination logic.
+    Includes safety guards to prevent IndexError when stage counter exceeds configuration bounds.
+    """
+    def __init__(self, cfg: dict):
+        """
+        Initialize stopper with configuration.
+        
+        Args:
+            cfg: Dictionary with configuration including 'within' list for stage-based windows
+        
+        Raises:
+            KeyError: If 'within' key is missing from cfg
+            TypeError: If 'within' value is not a sequence
+        """
+        if "within" not in cfg:
+            raise KeyError("Configuration must include 'within' key")
+        if not hasattr(cfg["within"], '__len__'):
+            raise TypeError("cfg['within'] must be a list or sequence")
+        self.cfg = cfg
+        self.finished_samples = set()
+    
+    def update_finished(self, sample_id: int, stage: int) -> bool:
+        """
+        Update finished status for a sample based on current stage.
+        
+        Args:
+            sample_id: Identifier for the sample being processed
+            stage: Current stage number (0-indexed or 1-indexed depending on usage)
+        
+        Returns:
+            bool: True if sample should be marked as finished, False otherwise
+        """
+        # Check stage-based stopping conditions
+        if stage >= 1:
+            # ★安全ガード：範囲外アクセス回避 (Safety guard: prevent out-of-bounds access)
+            if stage >= len(self.cfg["within"]):
+                return False
+            
+            win = self.cfg["within"][stage]
+            if win is not None and win >= 0:
+                # Window value is valid - mark sample as finished
+                # (Additional window-based logic can be implemented here as needed)
+                self.finished_samples.add(sample_id)
+                return True
+        
+        return False
+    
+    def is_finished(self, sample_id: int) -> bool:
+        """Check if a sample has been marked as finished."""
+        return sample_id in self.finished_samples
+    
+    def reset(self):
+        """Reset all finished samples."""
+        self.finished_samples.clear()
+
 def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefix="out/exp", make_gifs: bool = True, make_lineage: bool = True, rng_seed: int = 0):
     # dataset
     if task=="xor": Xtr,ytr = make_xor(512, noise=0.05, seed=0); Xva,yva = make_xor(256, noise=0.05, seed=1)
@@ -4421,16 +4480,17 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             "has_spiral": has_scars_spiral,
         }
 
-        if args.gallery:
-            gal = export_task_gallery(
-                tasks=tuple(args.gallery),
-                gens=max(6, args.gens // 2),
-                pop=max(12, args.pop // 2),
-                steps=max(10, args.steps // 2),
-                out_dir=os.path.join(args.out, "gallery"),
-            )
-            for k, v in gal.items():
-                figs[f"ギャラリー {k}"] = v
+    # gallery（--task が無くても実行できるように独立させる）
+    if args.gallery:
+        gal = export_task_gallery(
+            tasks=tuple(args.gallery),
+            gens=max(6, args.gens // 2),
+            pop=max(12, args.pop // 2),
+            steps=max(10, args.steps // 2),
+            out_dir=os.path.join(args.out, "gallery"),
+        )
+        for k, v in gal.items():
+            figs[f"ギャラリー {k}"] = v
 
     # RL
     if args.rl_env:
