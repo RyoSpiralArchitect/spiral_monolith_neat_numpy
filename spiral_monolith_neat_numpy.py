@@ -2222,8 +2222,9 @@ class ReproPlanaNEATPlus:
         std_hidden = float(np.std(hidden_counts)) if len(hidden_counts) > 1 else 0.0
         std_edges = float(np.std(edge_counts)) if len(edge_counts) > 1 else 0.0
         
-        # Combined diversity metric
-        topology_diversity = std_hidden + std_edges / 10.0  # Scale edges appropriately
+        # Combined diversity metric: scale edges by 1/10 since edges typically ~10x more than nodes
+        EDGE_TO_NODE_SCALE = 10.0
+        topology_diversity = std_hidden + std_edges / EDGE_TO_NODE_SCALE
         
         return {
             'avg_hidden': avg_hidden,
@@ -2296,18 +2297,22 @@ class ReproPlanaNEATPlus:
             # Compute topology metrics for monodromy schedule
             topology_metrics = self._compute_topology_metrics()
             
-            # Get previous metrics from environment history if available
+            # Add previous metrics from environment history if available (for velocity calculation)
+            prev_avg_hidden = topology_metrics['avg_hidden']
+            prev_avg_edges = topology_metrics['avg_edges']
             if self.env_history:
                 prev_metrics = self.env_history[-1]
-                topology_metrics['prev_avg_hidden'] = prev_metrics.get('avg_hidden', topology_metrics['avg_hidden'])
-                topology_metrics['prev_avg_edges'] = prev_metrics.get('avg_edges', topology_metrics['avg_edges'])
+                prev_avg_hidden = prev_metrics.get('avg_hidden', prev_avg_hidden)
+                prev_avg_edges = prev_metrics.get('avg_edges', prev_avg_edges)
             
             # === Curriculum ===
             env_ctx = {
                 'gen': gen,
                 'prev_best': prev[0] if prev else None,
                 'prev_avg': prev[1] if prev else None,
-                **topology_metrics
+                **topology_metrics,
+                'prev_avg_hidden': prev_avg_hidden,
+                'prev_avg_edges': prev_avg_edges,
             }
             
             if env_schedule is not None:
@@ -2317,7 +2322,9 @@ class ReproPlanaNEATPlus:
             else:
                 env = None
             if env is not None:
-                self.env.update({k: v for k, v in env.items() if k not in {'enable_regen', 'prev_avg_hidden', 'prev_avg_edges'}})
+                # Filter out state variables that shouldn't be in environment settings
+                state_keys = {'enable_regen', 'prev_avg_hidden', 'prev_avg_edges'}
+                self.env.update({k: v for k, v in env.items() if k not in state_keys})
                 if 'enable_regen' in env:
                     flag = bool(env['enable_regen'])
                     self.mode.enable_regen_reproduction = flag
@@ -4352,8 +4359,16 @@ def _topology_monodromy_schedule(gen: int, ctx: Optional[Dict[str, Any]] = None)
     - topology_diversity: Diversity measure of topologies in population
     - prev_avg_hidden: Previous generation's average hidden nodes
     - prev_avg_edges: Previous generation's average edges
+    
+    Configuration constants (can be customized via ctx):
+    - max_hidden_norm: Expected maximum hidden nodes for normalization (default: 50)
+    - max_edges_norm: Expected maximum edges for normalization (default: 200)
     """
     ctx = ctx or {}
+    
+    # Normalization ranges for topology complexity (configurable via context)
+    MAX_HIDDEN_NORM = float(ctx.get('max_hidden_norm', 50.0))
+    MAX_EDGES_NORM = float(ctx.get('max_edges_norm', 200.0))
     
     # Extract topology metrics from context (provided by evolve method)
     avg_hidden = float(ctx.get('avg_hidden', 0.0))
@@ -4368,9 +4383,8 @@ def _topology_monodromy_schedule(gen: int, ctx: Optional[Dict[str, Any]] = None)
     hidden_velocity = avg_hidden - prev_avg_hidden
     edge_velocity = avg_edges - prev_avg_edges
     
-    # Normalize topology complexity (0-1 scale based on typical ranges)
-    # Assume typical ranges: hidden nodes 0-50, edges 0-200
-    normalized_complexity = min(1.0, (avg_hidden / 50.0 + avg_edges / 200.0) / 2.0)
+    # Normalize topology complexity (0-1 scale based on expected ranges)
+    normalized_complexity = min(1.0, (avg_hidden / MAX_HIDDEN_NORM + avg_edges / MAX_EDGES_NORM) / 2.0)
     
     # Base difficulty follows topology complexity with a monodromy twist
     # The environment "spirals" around the topology's evolution
@@ -4417,9 +4431,6 @@ def _topology_monodromy_schedule(gen: int, ctx: Optional[Dict[str, Any]] = None)
         "difficulty": float(difficulty),
         "noise_std": float(noise_std),
         "enable_regen": enable_regen,
-        # Store metrics for next iteration
-        "prev_avg_hidden": float(avg_hidden),
-        "prev_avg_edges": float(avg_edges),
     }
 
 
