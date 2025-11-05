@@ -4269,6 +4269,8 @@ def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]] = None
     chaos_freq3 = ctx.get('chaos_freq3', 0.67)
     spike_prob = ctx.get('spike_prob', 0.12)  # Probability of random spike
     spike_amp = ctx.get('spike_amp', 0.8)
+    spike_threshold_phase3 = spike_prob * 100  # Precompute for efficiency
+    spike_threshold_phase4 = spike_prob * 100  # Precompute for efficiency
     
     # Phase 1: Early exploration (0-15) - stable moderate difficulty
     if gen < 15:
@@ -4297,8 +4299,8 @@ def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]] = None
         wave3 = 0.15 * np.sin((gen - 30) * 0.61)
         # Occasional sudden drops (negative spikes)
         drop_component = -0.4 if (gen - 30) % 17 < 2 else 0.0
-        # Random difficulty spike
-        spike_component = spike_amp if (gen * 7) % 100 < spike_prob * 100 else 0.0
+        # Random difficulty spike (precomputed threshold for efficiency)
+        spike_component = spike_amp if (gen * 7) % 100 < spike_threshold_phase3 else 0.0
         
         diff = base_diff + wave1 + wave2 + wave3 + drop_component + spike_component
         # Very stable noise for monotonous environment
@@ -4320,8 +4322,8 @@ def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]] = None
     # Sudden drops: periodic large decreases
     drop_component = -0.7 if (gen - 60) % 19 < 2 else 0.0
     
-    # Random spikes based on generation number (pseudo-random but deterministic)
-    spike_component = spike_amp if (gen * 13) % 100 < spike_prob * 100 else 0.0
+    # Random spikes based on generation number (pseudo-random but deterministic, precomputed threshold)
+    spike_component = spike_amp if (gen * 13) % 100 < spike_threshold_phase4 else 0.0
     
     # Combine all components
     diff = base_diff + chaos1 + chaos2 + chaos3 + jump_component + drop_component + spike_component
