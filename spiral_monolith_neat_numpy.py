@@ -455,7 +455,13 @@ class Genome:
         enabled = [c for c in self.connections.values() if c.enabled]
         if not enabled: return None
         if bias == 'neutral': return enabled[int(rng.integers(len(enabled)))]
-        depth = self.node_depths()
+        # Remove cycles before computing node depths to prevent RuntimeError
+        self.remove_cycles()
+        try:
+            depth = self.node_depths()
+        except RuntimeError:
+            # If cycles still exist after removal attempt, fall back to neutral selection
+            return enabled[int(rng.integers(len(enabled)))]
         scores = []
         for c in enabled:
             din = depth.get(c.in_node, 0)
@@ -4238,50 +4244,92 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
     raise ValueError(f"Unsupported action space: {type(space)}")
 
 def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
-    """Multi-phase complex curriculum with diverse environmental challenges to promote complex topology survival.
+    """Enhanced curriculum with chaotic difficulty fluctuations and environmental monotony.
+    
+    Creates a challenging environment with:
+    - Non-linear difficulty progression with sudden jumps and drops
+    - Multiple overlapping oscillations for unpredictability
+    - Occasional difficulty spikes and valleys
+    - More stable (monotonous) noise levels for consistent environmental conditions
     
     Parameters can be customized via _ctx if needed:
     - chaos_amp1, chaos_freq1: First chaotic component amplitude and frequency
     - chaos_amp2, chaos_freq2: Second chaotic component amplitude and frequency
-    - cyclic_amp, cyclic_freq: Cyclic noise amplitude and frequency
+    - spike_prob: Probability of difficulty spikes
+    - spike_amp: Amplitude of difficulty spikes
     """
     # Extract customizable parameters from context
     ctx = _ctx or {}
-    chaos_amp1 = ctx.get('chaos_amp1', 0.2)
-    chaos_freq1_sin = ctx.get('chaos_freq1_sin', 0.4)
-    chaos_freq1_cos = ctx.get('chaos_freq1_cos', 0.15)
-    chaos_amp2 = ctx.get('chaos_amp2', 0.15)
-    chaos_freq2 = ctx.get('chaos_freq2', 0.6)
-    cyclic_amp = ctx.get('cyclic_amp', 0.15)
-    cyclic_freq = ctx.get('cyclic_freq', 0.25)
+    chaos_amp1 = ctx.get('chaos_amp1', 0.35)  # Increased for more fluctuation
+    chaos_freq1_sin = ctx.get('chaos_freq1_sin', 0.28)
+    chaos_freq1_cos = ctx.get('chaos_freq1_cos', 0.11)
+    chaos_amp2 = ctx.get('chaos_amp2', 0.25)  # Increased for more fluctuation
+    chaos_freq2 = ctx.get('chaos_freq2', 0.45)
+    chaos_amp3 = ctx.get('chaos_amp3', 0.18)  # New third chaotic component
+    chaos_freq3 = ctx.get('chaos_freq3', 0.67)
+    spike_prob = ctx.get('spike_prob', 0.12)  # Probability of random spike
+    spike_amp = ctx.get('spike_amp', 0.8)
     
-    # Phase 1: Early exploration (0-15) - moderate difficulty, low noise
+    # Phase 1: Early exploration (0-15) - stable moderate difficulty
     if gen < 15:
-        return {"difficulty": 0.4, "noise_std": 0.01, "enable_regen": False}
-    # Phase 2: Initial pressure (15-30) - increasing difficulty with fluctuating noise
+        # Add slight random variation even in early phase
+        micro_var = 0.05 * np.sin(gen * 0.8)
+        return {"difficulty": 0.4 + micro_var, "noise_std": 0.01, "enable_regen": False}
+    
+    # Phase 2: Initial pressure (15-30) - introducing fluctuations
     if gen < 30:
-        # Fluctuating noise to promote diverse topologies
-        noise_cycle = 0.03 + 0.02 * np.sin((gen - 15) * 0.3)
-        return {"difficulty": 0.5 + (gen - 15) * 0.03, "noise_std": max(0.01, noise_cycle), "enable_regen": False}
-    # Phase 3: Complex environment (30-50) - high difficulty with multiple stressors
-    if gen < 50:
-        # Multi-faceted difficulty: base + cyclic + linear growth
-        base_diff = 1.0 + (gen - 30) * 0.04
-        cyclic_component = cyclic_amp * np.sin((gen - 30) * cyclic_freq)  # Environmental fluctuation
-        diff = base_diff + cyclic_component
-        # Variable noise with spikes
-        noise = 0.04 + (gen - 30) * 0.002 + 0.03 * np.abs(np.sin((gen - 30) * 0.5))
-        return {"difficulty": diff, "noise_std": noise, "enable_regen": True}
-    # Phase 4: Extreme diversity pressure (50+) - maximum complexity challenge
-    # Exponentially increasing difficulty with chaotic noise
-    base_diff = 1.8 + (gen - 50) * 0.05
-    # Add chaotic components to force topology diversity
-    chaos1 = chaos_amp1 * np.sin((gen - 50) * chaos_freq1_sin) * np.cos((gen - 50) * chaos_freq1_cos)
-    chaos2 = chaos_amp2 * np.cos((gen - 50) * chaos_freq2)
-    diff = base_diff + chaos1 + chaos2
-    # High variable noise
-    noise = 0.08 + (gen - 50) * 0.003 + 0.05 * np.abs(np.sin((gen - 50) * 0.7))
-    return {"difficulty": diff, "noise_std": noise, "enable_regen": True}
+        # Start introducing chaotic elements
+        base_diff = 0.5 + (gen - 15) * 0.04
+        wave1 = 0.15 * np.sin((gen - 15) * 0.35)
+        wave2 = 0.10 * np.cos((gen - 15) * 0.52)
+        diff = base_diff + wave1 + wave2
+        # Stable low noise for environmental monotony
+        noise = 0.02
+        return {"difficulty": max(0.3, diff), "noise_std": noise, "enable_regen": False}
+    
+    # Phase 3: Complex environment (30-60) - high fluctuation with drops and spikes
+    if gen < 60:
+        # More complex difficulty with sudden changes
+        base_diff = 1.0 + (gen - 30) * 0.045
+        # Multiple overlapping waves create unpredictable pattern
+        wave1 = 0.25 * np.sin((gen - 30) * 0.22)
+        wave2 = 0.20 * np.cos((gen - 30) * 0.38)
+        wave3 = 0.15 * np.sin((gen - 30) * 0.61)
+        # Occasional sudden drops (negative spikes)
+        drop_component = -0.4 if (gen - 30) % 17 < 2 else 0.0
+        # Random difficulty spike
+        spike_component = spike_amp if (gen * 7) % 100 < spike_prob * 100 else 0.0
+        
+        diff = base_diff + wave1 + wave2 + wave3 + drop_component + spike_component
+        # Very stable noise for monotonous environment
+        noise = 0.03
+        return {"difficulty": max(0.5, diff), "noise_std": noise, "enable_regen": True}
+    
+    # Phase 4: Extreme diversity pressure (60+) - maximum chaos with sudden shifts
+    # Base trend with continued growth but slower
+    base_diff = 2.0 + (gen - 60) * 0.03
+    
+    # Multiple chaotic oscillations with different frequencies and amplitudes
+    chaos1 = chaos_amp1 * np.sin((gen - 60) * chaos_freq1_sin) * np.cos((gen - 60) * chaos_freq1_cos)
+    chaos2 = chaos_amp2 * np.cos((gen - 60) * chaos_freq2)
+    chaos3 = chaos_amp3 * np.sin((gen - 60) * chaos_freq3)
+    
+    # Sudden jumps: periodic large increases
+    jump_component = 0.6 if (gen - 60) % 23 < 3 else 0.0
+    
+    # Sudden drops: periodic large decreases
+    drop_component = -0.7 if (gen - 60) % 19 < 2 else 0.0
+    
+    # Random spikes based on generation number (pseudo-random but deterministic)
+    spike_component = spike_amp if (gen * 13) % 100 < spike_prob * 100 else 0.0
+    
+    # Combine all components
+    diff = base_diff + chaos1 + chaos2 + chaos3 + jump_component + drop_component + spike_component
+    
+    # Keep noise very stable for environmental monotony (consistent conditions)
+    noise = 0.04
+    
+    return {"difficulty": max(0.3, diff), "noise_std": noise, "enable_regen": True}
 
 
 def _apply_stable_neat_defaults(neat: ReproPlanaNEATPlus):
