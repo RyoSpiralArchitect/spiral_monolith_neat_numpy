@@ -21,6 +21,7 @@ import matplotlib
 import warnings
 import pickle as _pickle
 import json as _json
+import traceback
 
 try:  # Python 3.8+
     from multiprocessing import shared_memory as _shm
@@ -270,6 +271,7 @@ class Genome:
                  sex: Optional[str] = None, regen: bool = False, regen_mode: Optional[str] = None,
                  embryo_bias: Optional[str] = None, gid: Optional[int] = None, birth_gen: int = 0,
                  hybrid_scale: float = 1.0, parents: Optional[Tuple[Optional[int], Optional[int]]] = None):
+        self.origin_mode = 'initial'
         self.nodes = nodes
         self.connections = connections
         # Initialize sex as male or female (hermaphrodites only emerge through mutation)
@@ -281,6 +283,7 @@ class Genome:
         self.birth_gen = int(birth_gen)
         self.hybrid_scale = float(hybrid_scale)
         self.parents = parents if parents is not None else (None, None)
+        self.origin_mode = getattr(self, 'origin_mode', 'initial')
         # Optional capacity limits
         self.max_hidden_nodes: Optional[int] = None
         self.max_edges: Optional[int] = None
@@ -291,6 +294,7 @@ class Genome:
                  for innov, c in self.connections.items()}
         g = Genome(nodes, conns, self.sex, self.regen, self.regen_mode, self.embryo_bias,
                    self.id, self.birth_gen, self.hybrid_scale, self.parents)
+        g.origin_mode = getattr(self, 'origin_mode', 'initial')
         g.max_hidden_nodes = self.max_hidden_nodes
         g.max_edges = self.max_edges
         return g
@@ -1656,10 +1660,16 @@ class LCSMonitor:
             updated.append(row)
         return updated
 
-    def log_step(self, G_prev, G_post, changed_nodes, lineage_id, gen, mut_id, changed_edges=0):
+    def log_step(self, G_prev, G_post, changed_nodes, lineage_id, gen, mut_id, changed_edges=0, birth_mode=None, is_regen_child=None):
         rows = self._compute_metrics(G_prev, G_post, set(changed_nodes), changed_edges, lineage_id, gen, mut_id)
         rows = self._update_heal_flags(gen, rows)
+        # attach meta
+        for _r in rows:
+            _r["birth_mode"] = birth_mode or ""
+            _r["is_regen_child"] = int(bool(is_regen_child)) if is_regen_child is not None else 0
         header = [
+            "birth_mode",
+            "is_regen_child",
             "gen",
             "lineage_id",
             "mut_id",
@@ -1698,7 +1708,7 @@ class ReproPlanaNEATPlus:
         self.num_inputs = num_inputs; self.num_outputs = num_outputs; self.pop_size = population_size
         self.rng = rng if rng is not None else np.random.default_rng()
         self.mode = EvalMode(vanilla=True, enable_regen_reproduction=False)
-        self.max_hidden_nodes = 128; self.max_edges = 1024
+        self.max_hidden_nodes = 192; self.max_edges = 2048
         self.complexity_threshold: Optional[float] = 5.0  # 1.0 → 5.0 複雑トポロジー許容のデフォルト値
         # ---- Hardened knobs
         self.grad_clip = 5.0
@@ -1719,9 +1729,9 @@ class ReproPlanaNEATPlus:
         # Auto curriculum toggle
         self.auto_curriculum = True
         # ---- Top-3 diversity tracking parameters
-        self.top3_diversity_node_threshold = 1  # Min difference in hidden node count for diversity
-        self.top3_diversity_edge_threshold = 2  # Min difference in edge count for diversity
-        self.top3_candidate_pool_size = 10  # Number of top candidates to check for diversity
+        self.top3_diversity_node_threshold = 2  # Min difference in hidden node count for diversity (stricter)
+        self.top3_diversity_edge_threshold = 4  # Min difference in edge count for diversity (stricter)
+        self.top3_candidate_pool_size = 24  # Number of top candidates to check for diversity (wider pool)
         # ---- Complexity penalty adaptation parameters
         self.complexity_bonus_multiplier = -0.1  # Bonus strength at extreme difficulty (negative = bonus)
         self.complexity_bonus_threshold = 2.5  # Difficulty level where bonus starts
@@ -1743,6 +1753,9 @@ class ReproPlanaNEATPlus:
         self._proc_pool = None
         self._proc_pool_age = 0
         self._shm_meta = None
+
+        # Refine ratio (smaller is faster & safer)
+        self.refine_topk_ratio = float(os.environ.get("NEAT_REFINE_TOPK_RATIO", "0.08"))
 
         # Base genome
         nodes = {}
@@ -1781,7 +1794,7 @@ class ReproPlanaNEATPlus:
         self.compatibility_threshold = 3.0
         self.c1=self.c2=1.0; self.c3=0.4
         self.elitism = 1; self.survival_rate = 0.2
-        self.mutate_add_conn_prob = 0.10; self.mutate_add_node_prob = 0.10
+        self.mutate_add_conn_prob = 0.12; self.mutate_add_node_prob = 0.12
         self.mutate_weight_prob = 0.8; self.mutate_toggle_prob = 0.01
         self.weight_perturb_chance = 0.9; self.weight_sigma = 0.8; self.weight_reset_range = 2.0
         self.regen_mode_mut_rate = 0.05; self.embryo_bias_mut_rate = 0.03
@@ -1789,6 +1802,10 @@ class ReproPlanaNEATPlus:
         self.hermaphrodite_inheritance_rate = 0.05  # Very low inheritance rate (5%)
         self.regen_rate = 0.15; self.allow_selfing = True
         self.sex_fitness_scale = {'female':1.0, 'male':0.9, 'hermaphrodite':1.2}; self.regen_bonus = 0.2
+        self.regen_mut_rate_boost = 1.8
+        self.non_elite_mating_rate = 0.5
+        self.lcs_reward_weight = 0.02
+        self.diversity_weight = 0.02
         self.hermaphrodite_mate_bias = 2.5  # Hermaphrodites have high mating preference
         self.env = {'difficulty':0.0, 'noise_std':0.0}
         self.mix_asexual_base = 0.10; self.mix_asexual_gain = 0.40
@@ -1924,23 +1941,36 @@ class ReproPlanaNEATPlus:
         st["last_reward"] = float(reward)
 
 
-    def _mutate(self, genome: Genome):
-        if self.rng.random() < self.mutate_toggle_prob: genome.mutate_toggle_enable(self.rng, prob=self.mutate_toggle_prob)
-        if self.rng.random() < self.mutate_add_node_prob: genome.mutate_add_node(self.rng, self.innov)
-        if self.rng.random() < self.mutate_add_conn_prob: genome.mutate_add_connection(self.rng, self.innov)
-        if self.rng.random() < self.mutate_weight_prob: genome.mutate_weights(self.rng, self.weight_perturb_chance, self.weight_sigma, self.weight_reset_range)
-        if self.rng.random() < self.mutate_sex_prob: genome.mutate_sex(self.rng)
-        if self.rng.random() < self.regen_mode_mut_rate:
-            if self.env['difficulty'] > 0.6: genome.regen_mode = self.rng.choice(['split','head','tail'], p=[0.6,0.25,0.15])
-            else: genome.regen_mode = self.rng.choice(['split','head','tail'])
-        if self.rng.random() < self.embryo_bias_mut_rate:
+    def _mutate(self, genome: Genome, context: str = None):
+        # regen-specific mutation boost (why: make regen meaningful)
+        boost = 1.0
+        if context == 'regen':
+            boost = float(getattr(self, 'regen_mut_rate_boost', 1.5))
+        add_conn_prob = min(1.0, float(self.mutate_add_conn_prob) * boost)
+        add_node_prob = min(1.0, float(self.mutate_add_node_prob) * boost)
+        toggle_prob   = float(getattr(self, 'mutate_toggle_prob', 0.05))
+        weight_prob   = float(getattr(self, 'mutate_weight_prob', 0.8))
+        # toggles
+        if self.rng.random() < toggle_prob:
+            genome.mutate_toggle_enable(self.rng, prob=toggle_prob)
+        # add node/conn
+        if self.rng.random() < add_node_prob:
+            genome.mutate_add_node(self.rng, self.innov)
+        if self.rng.random() < add_conn_prob:
+            genome.mutate_add_connection(self.rng, self.innov)
+        # weight perturbations
+        if self.rng.random() < weight_prob:
+            genome.mutate_weights(self.rng)
+        # embryo-bias jitter (rare)
+        if self.rng.random() < float(getattr(self, 'embryo_bias_mut_rate', 0.03)):
             genome.embryo_bias = self.rng.choice(['neutral','inputward','outputward'])
-        # ---- Diversity push under high difficulty
+        # Diversity push (why: escape stagnation on hard env)
         if float(self.env.get('difficulty', 0.0)) >= 0.9 and self.rng.random() < getattr(self, "diversity_push", 0.15):
             if self.rng.random() < 0.6:
                 genome.mutate_add_connection(self.rng, self.innov)
             else:
                 genome.mutate_add_node(self.rng, self.innov)
+
 
     def _crossover_maternal_biased(self, mother: Genome, father: Genome, species_members):
         fit_dict = {g:f for g,f in species_members}
@@ -1997,6 +2027,9 @@ class ReproPlanaNEATPlus:
         females=[g for g,_ in sp.members[:k] if g.sex=='female']; males=[g for g,_ in sp.members[:k] if g.sex=='male']
         hermaphrodites=[g for g,_ in sp.members[:k] if g.sex=='hermaphrodite']
         pool=[g for g,_ in sp.members[:k]]
+        # Anti-elitist mate forcing (why: break top-3 lock-in)
+        non_elite_ids = set(getattr(self, '_last_top3_ids', set()))
+
         if (not females) or (not males):
             females = [g for g,_ in sp.members if g.sex=='female'] or females
             males   = [g for g,_ in sp.members if g.sex=='male'] or males
@@ -2039,7 +2072,15 @@ class ReproPlanaNEATPlus:
                 
                 if potential_mothers and potential_fathers and self.rng.random()>self.pollen_flow_rate:
                     mother=potential_mothers[int(self.rng.integers(len(potential_mothers)))]
-                    father=potential_fathers[int(self.rng.integers(len(potential_fathers)))]
+                    # choose father outside recent top-3 with some probability
+                    if potential_fathers:
+                        if self.rng.random() < float(getattr(self, 'non_elite_mating_rate', 0.5)):
+                            cand = [f for f in potential_fathers if f.id not in non_elite_ids] or potential_fathers
+                            father = cand[int(self.rng.integers(len(cand)))]
+                        else:
+                            father=potential_fathers[int(self.rng.integers(len(potential_fathers)))]
+                    else:
+                        father = mother
                     mode='sexual_within'; sp_for_fit=sp.members
                 else:
                     if len(species_pool)>1:
@@ -2065,14 +2106,14 @@ class ReproPlanaNEATPlus:
                                 mother_id=parent.id; father_id=None
                 if mode in ('sexual_within','sexual_cross'):
                     child=self._crossover_maternal_biased(mother,father,sp_for_fit); child.hybrid_scale=self._heterosis_scale(mother,father); mother_id=mother.id; father_id=father.id
-            child.id=self.next_gid; self.next_gid+=1; child.parents=(mother_id,father_id); child.birth_gen=self.generation+1
+            child.id=self.next_gid; self.next_gid+=1; child.parents=(mother_id,father_id); child.birth_gen=self.generation+1; child.origin_mode=mode
             self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
             if monitor is not None and parent_adj_before_regen is not None:
                 regen_adj = child.weighted_adjacency()
                 changed_nodes, changed_edges = summarize_graph_changes(parent_adj_before_regen, regen_adj, weight_tol)
                 monitor.log_step(parent_adj_before_regen, regen_adj, changed_nodes, child.id, self.generation+1, f"{child.id}_regen", changed_edges=changed_edges)
             pre_adj = child.weighted_adjacency() if monitor is not None else None
-            self._mutate(child)
+            self._mutate(child, context='regen' if mode=='asexual_regen' else None)
             if monitor is not None and pre_adj is not None:
                 post_adj = child.weighted_adjacency()
                 changed_nodes, changed_edges = summarize_graph_changes(pre_adj, post_adj, weight_tol)
@@ -2159,7 +2200,15 @@ class ReproPlanaNEATPlus:
         """並列評価（thread/process）。process は SHM メタを初期化し、必要なら持ち回りプールを再起動。"""
         workers = int(getattr(self, "eval_workers", 1))
         if workers <= 1:
-            return [fitness_fn(g) for g in self.population]
+            out = []
+            for g in self.population:
+                try:
+                    out.append(float(fitness_fn(g)))
+                except Exception as _e:
+                    _tb = traceback.format_exc()
+                    print(f"[ERROR] fitness exception gid={getattr(g,'id','?')}: {_e}\n{_tb}")
+                    out.append(float(-1e9))
+            return out
         backend = getattr(self, "parallel_backend", "thread")
         if backend == "process" and not _is_picklable(fitness_fn):
             print("[WARN] fitness_fn is not picklable; falling back to threads")
@@ -2184,7 +2233,15 @@ class ReproPlanaNEATPlus:
                         )
                         self._proc_pool_age = 0
                     ex = self._proc_pool
-                    out = list(ex.map(fitness_fn, self.population, chunksize=max(1, len(self.population)//workers)))
+                    futs = [ex.submit(fitness_fn, g) for g in self.population]
+                    out = []
+                    for fut, g in zip(futs, self.population):
+                        try:
+                            out.append(float(fut.result()))
+                        except Exception as _e:
+                            _tb = traceback.format_exc()
+                            print(f"[ERROR] fitness exception (proc) gid={getattr(g,'id','?')}: {_e}\n{_tb}")
+                            out.append(float(-1e9))
                     self._proc_pool_age += 1
                     return out
                 else:
@@ -2194,10 +2251,27 @@ class ReproPlanaNEATPlus:
                         return list(ex.map(fitness_fn, self.population, chunksize=max(1, len(self.population)//workers)))
             else:
                 with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
-                    return list(ex.map(fitness_fn, self.population))
+                    futs = [ex.submit(fitness_fn, g) for g in self.population]
+                    out = []
+                    for fut, g in zip(futs, self.population):
+                        try:
+                            out.append(float(fut.result()))
+                        except Exception as _e:
+                            _tb = traceback.format_exc()
+                            print(f"[ERROR] fitness exception (thread) gid={getattr(g,'id','?')}: {_e}\n{_tb}")
+                            out.append(float(-1e9))
+                    return out
         except Exception as e:
             print("[WARN] parallel evaluation disabled:", e)
-            return [fitness_fn(g) for g in self.population]
+            out = []
+            for g in self.population:
+                try:
+                    out.append(float(fitness_fn(g)))
+                except Exception as _e:
+                    _tb = traceback.format_exc()
+                    print(f"[ERROR] fitness exception gid={getattr(g,'id','?')}: {_e}\n{_tb}")
+                    out.append(float(-1e9))
+            return out
 
     def _close_pool(self):
         ex = getattr(self, "_proc_pool", None)
@@ -2240,7 +2314,7 @@ class ReproPlanaNEATPlus:
         n = len(fitnesses)
         if n == 0:
             return fitnesses
-        k = max(1, int(0.10 * n))
+        k = max(1, int(float(getattr(self, 'refine_topk_ratio', 0.08)) * n))
         idxs = np.argsort(fitnesses)[-k:]
         improved = list(fitnesses)
         best_now = float(np.max(fitnesses))
@@ -2268,8 +2342,10 @@ class ReproPlanaNEATPlus:
         top3_best = []  # List of (genome, fitness, gen) tuples
         from math import isnan
         scars=None; prev_best=None
-        for gen in range(n_generations):
-            self.generation=gen
+        start_gen = int(getattr(self, "generation", 0))
+        for step in range(n_generations):
+            gen = start_gen + step
+            self.generation = gen
             prev=history[-1] if history else (None,None)
             # === Curriculum ===
             if env_schedule is not None:
@@ -2355,7 +2431,11 @@ class ReproPlanaNEATPlus:
                     # Stop if we have 3 and current is not diverse
                     break
             
-            # === Snapshots (decimated & bounded) ===
+            
+            # cache for next generation (why: drive diversity bonus and mate forcing)
+            self._last_top3_ids = [g.id for (g, _fit, _gen) in top3_best]
+            self._last_top3_complexities = [genome_complexity(g) for (g, _fit, _gen) in top3_best]
+# === Snapshots (decimated & bounded) ===
             try:
                 curr_best = self.population[best_idx].copy()
                 scars = diff_scars(prev_best, curr_best, scars, birth_gen=gen, regen_mode_for_new=getattr(curr_best,'regen_mode','split'))
@@ -2551,6 +2631,12 @@ def backprop_step(comp, X, y, w, lr=1e-2, l2=1e-4):
     return w_new, float(loss)
 
 def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=1e-2, l2=1e-4, grad_clip=5.0, w_clip=12.0):
+    # Ensuring float32 for speed/safety
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+    np.nan_to_num(X, copy=False)
+    np.nan_to_num(y, copy=False)
+
     comp = compile_genome(genome); w = comp['w'].copy(); history=[]
     if w.size == 0:
         return history
@@ -3378,7 +3464,8 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     else: Xtr,ytr = make_circles(512, r=0.6, noise=0.05, seed=0); Xva,yva = make_circles(256, r=0.6, noise=0.05, seed=1)
     # NEAT
     rng = np.random.default_rng(rng_seed)
-    neat = ReproPlanaNEATPlus(num_inputs=2, num_outputs=1, population_size=pop, output_activation='identity', rng=rng)
+    out_dim = 2  # use 2-output softmax for binary stability
+    neat = ReproPlanaNEATPlus(num_inputs=2, num_outputs=out_dim, population_size=pop, output_activation='identity', rng=rng)
     _apply_stable_neat_defaults(neat)
     regen_log_path = f"{out_prefix}_regen_log.csv"
     if hasattr(neat, "lcs_monitor") and neat.lcs_monitor is not None:
