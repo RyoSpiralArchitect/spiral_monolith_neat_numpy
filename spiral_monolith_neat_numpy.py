@@ -18,6 +18,7 @@ from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
 from collections import deque, defaultdict, OrderedDict
 import math, argparse, os, mimetypes, csv
 import sys
+import time
 import matplotlib
 import warnings
 import pickle as _pickle
@@ -1578,6 +1579,9 @@ class ReproPlanaNEATPlus:
         self._proc_pool = None
         self._proc_pool_age = 0
         self._shm_meta = None
+        self._resilience_failures = deque(maxlen=16)
+        self._resilience_eval_guard = 0
+        self._resilience_history = []
         self.refine_topk_ratio = float(os.environ.get('NEAT_REFINE_TOPK_RATIO', '0.08'))
         nodes = {}
         for i in range(num_inputs):
@@ -2241,122 +2245,151 @@ class ReproPlanaNEATPlus:
         for step in range(n_generations):
             gen = start_gen + step
             self.generation = gen
-            prev = history[-1] if history else (None, None)
-            if env_schedule is not None:
-                env = env_schedule(gen, {'gen': gen, 'prev_best': prev[0] if prev else None, 'prev_avg': prev[1] if prev else None})
-            elif getattr(self, 'auto_curriculum', True):
-                env = self._auto_env_schedule(gen, history)
-            else:
-                env = None
-            if env is not None:
-                self.env.update({k: v for k, v in env.items() if k not in {'enable_regen'}})
-                if 'enable_regen' in env:
-                    flag = bool(env['enable_regen'])
-                    self.mode.enable_regen_reproduction = flag
-                    if flag:
-                        self.mix_asexual_base = max(self.mix_asexual_base, 0.3)
-            self.env_history.append({'gen': gen, **self.env, 'regen_enabled': self.mode.enable_regen_reproduction})
-            diff = float(self.env.get('difficulty', 0.0))
-            self.pollen_flow_rate = float(min(0.5, max(0.1, 0.1 + 0.35 * diff)))
-            if hasattr(fitness_fn, 'set_noise_std'):
+            try:
+                prev = history[-1] if history else (None, None)
+                if env_schedule is not None:
+                    env = env_schedule(gen, {'gen': gen, 'prev_best': prev[0] if prev else None, 'prev_avg': prev[1] if prev else None})
+                elif getattr(self, 'auto_curriculum', True):
+                    env = self._auto_env_schedule(gen, history)
+                else:
+                    env = None
+                if env is not None:
+                    self.env.update({k: v for k, v in env.items() if k not in {'enable_regen'}})
+                    if 'enable_regen' in env:
+                        flag = bool(env['enable_regen'])
+                        self.mode.enable_regen_reproduction = flag
+                        if flag:
+                            self.mix_asexual_base = max(self.mix_asexual_base, 0.3)
+                self.env_history.append({'gen': gen, **self.env, 'regen_enabled': self.mode.enable_regen_reproduction})
+                diff = float(self.env.get('difficulty', 0.0))
+                self.pollen_flow_rate = float(min(0.5, max(0.1, 0.1 + 0.35 * diff)))
+                if hasattr(fitness_fn, 'set_noise_std'):
+                    try:
+                        fitness_fn.set_noise_std(float(self.env.get('noise_std', 0.0)))
+                    except Exception:
+                        pass
+                raw = self._evaluate_population(fitness_fn)
+                fitnesses = []
+                for g, f in zip(self.population, raw):
+                    f2 = float(f)
+                    if not self.mode.vanilla:
+                        f2 *= self.sex_fitness_scale.get(g.sex, 1.0) * getattr(g, 'hybrid_scale', 1.0)
+                        if g.regen:
+                            f2 += self.regen_bonus
+                    f2 -= self._complexity_penalty(g)
+                    if not np.isfinite(f2):
+                        f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
+                    fitnesses.append(f2)
                 try:
-                    fitness_fn.set_noise_std(float(self.env.get('noise_std', 0.0)))
+                    fitnesses = self._adaptive_refine_fitness(fitnesses, fitness_fn)
                 except Exception:
                     pass
-            raw = self._evaluate_population(fitness_fn)
-            fitnesses = []
-            for g, f in zip(self.population, raw):
-                f2 = float(f)
-                if not self.mode.vanilla:
-                    f2 *= self.sex_fitness_scale.get(g.sex, 1.0) * getattr(g, 'hybrid_scale', 1.0)
-                    if g.regen:
-                        f2 += self.regen_bonus
-                f2 -= self._complexity_penalty(g)
-                if not np.isfinite(f2):
-                    f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
-                fitnesses.append(f2)
-            try:
-                fitnesses = self._adaptive_refine_fitness(fitnesses, fitness_fn)
-            except Exception:
-                pass
-            best_idx = int(np.argmax(fitnesses))
-            best_fit = float(fitnesses[best_idx])
-            avg_fit = float(np.mean(fitnesses))
+                best_idx = int(np.argmax(fitnesses))
+                best_fit = float(fitnesses[best_idx])
+                avg_fit = float(np.mean(fitnesses))
 
-            def genome_complexity(g):
-                n_hidden = sum((1 for n in g.nodes.values() if n.type == 'hidden'))
-                n_edges = sum((1 for c in g.connections.values() if c.enabled))
-                return (n_hidden, n_edges)
-            sorted_indices = np.argsort(fitnesses)[::-1]
-            pool_size = getattr(self, 'top3_candidate_pool_size', 10)
-            node_threshold = getattr(self, 'top3_diversity_node_threshold', 1)
-            edge_threshold = getattr(self, 'top3_diversity_edge_threshold', 2)
-            for idx in sorted_indices[:pool_size]:
-                candidate = self.population[idx].copy()
-                candidate_fit = float(fitnesses[idx])
-                n_hidden_cand, n_edges_cand = genome_complexity(candidate)
-                is_diverse = True
-                for existing_genome, _, _ in top3_best:
-                    n_hidden_exist, n_edges_exist = genome_complexity(existing_genome)
-                    if abs(n_hidden_cand - n_hidden_exist) <= node_threshold and abs(n_edges_cand - n_edges_exist) <= edge_threshold:
-                        is_diverse = False
+                def genome_complexity(g):
+                    n_hidden = sum((1 for n in g.nodes.values() if n.type == 'hidden'))
+                    n_edges = sum((1 for c in g.connections.values() if c.enabled))
+                    return (n_hidden, n_edges)
+                sorted_indices = np.argsort(fitnesses)[::-1]
+                pool_size = getattr(self, 'top3_candidate_pool_size', 10)
+                node_threshold = getattr(self, 'top3_diversity_node_threshold', 1)
+                edge_threshold = getattr(self, 'top3_diversity_edge_threshold', 2)
+                for idx in sorted_indices[:pool_size]:
+                    candidate = self.population[idx].copy()
+                    candidate_fit = float(fitnesses[idx])
+                    n_hidden_cand, n_edges_cand = genome_complexity(candidate)
+                    is_diverse = True
+                    for existing_genome, _, _ in top3_best:
+                        n_hidden_exist, n_edges_exist = genome_complexity(existing_genome)
+                        if abs(n_hidden_cand - n_hidden_exist) <= node_threshold and abs(n_edges_cand - n_edges_exist) <= edge_threshold:
+                            is_diverse = False
+                            break
+                    if len(top3_best) < 3:
+                        top3_best.append((candidate, candidate_fit, gen))
+                    elif is_diverse:
+                        top3_best.append((candidate, candidate_fit, gen))
+                        top3_best.sort(key=lambda x: x[1], reverse=True)
+                        top3_best = top3_best[:3]
+                    if len(top3_best) >= 3 and (not is_diverse):
                         break
-                if len(top3_best) < 3:
-                    top3_best.append((candidate, candidate_fit, gen))
-                elif is_diverse:
-                    top3_best.append((candidate, candidate_fit, gen))
-                    top3_best.sort(key=lambda x: x[1], reverse=True)
-                    top3_best = top3_best[:3]
-                if len(top3_best) >= 3 and (not is_diverse):
+                self._last_top3_ids = [g.id for g, _fit, _gen in top3_best]
+                self._last_top3_complexities = [genome_complexity(g) for g, _fit, _gen in top3_best]
+                try:
+                    curr_best = self.population[best_idx].copy()
+                    scars = diff_scars(prev_best, curr_best, scars, birth_gen=gen, regen_mode_for_new=getattr(curr_best, 'regen_mode', 'split'))
+                    stride = int(getattr(self, 'snapshot_stride', 1))
+                    if gen % max(1, stride) == 0 or gen == n_generations - 1:
+                        if len(self.snapshots_genomes) >= int(getattr(self, 'snapshot_max', 320)):
+                            self.snapshots_genomes.pop(0)
+                            self.snapshots_scars.pop(0)
+                        self.snapshots_genomes.append(curr_best)
+                        self.snapshots_scars.append(scars)
+                    prev_best = curr_best
+                except Exception:
+                    pass
+                history.append((best_fit, avg_fit))
+                self.best_ids.append(self.population[best_idx].id)
+                try:
+                    self.hidden_counts_history.append([sum((1 for n in g.nodes.values() if n.type == 'hidden')) for g in self.population])
+                    self.edge_counts_history.append([sum((1 for c in g.connections.values() if c.enabled)) for g in self.population])
+                except Exception:
+                    self.hidden_counts_history.append([])
+                    self.edge_counts_history.append([])
+                if verbose:
+                    noise = float(self.env.get('noise_std', 0.0))
+                    ev = self.event_log[-1] if self.event_log else {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0}
+                    n_herm = sum((1 for g in self.population if g.sex == 'hermaphrodite'))
+                    herm_str = f' | herm {n_herm}' if n_herm > 0 else ''
+                    top3_str = ''
+                    if len(top3_best) >= 3:
+                        complexities = [(sum((1 for n in g.nodes.values() if n.type == 'hidden')), sum((1 for c in g.connections.values() if c.enabled))) for g, _, _ in top3_best]
+                        top3_str = f' | top3: [{complexities[0][0]}n,{complexities[0][1]}e] [{complexities[1][0]}n,{complexities[1][1]}e] [{complexities[2][0]}n,{complexities[2][1]}e]'
+                    print(f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}")
+                if best_fit > best_ever_fit:
+                    best_ever_fit = best_fit
+                    best_ever = self.population[best_idx].copy()
+                if target_fitness is not None and best_fit >= target_fitness:
+                    self._resilience_eval_guard = 0
+                    self._resilience_history = list(history)
                     break
-            self._last_top3_ids = [g.id for g, _fit, _gen in top3_best]
-            self._last_top3_complexities = [genome_complexity(g) for g, _fit, _gen in top3_best]
-            try:
-                curr_best = self.population[best_idx].copy()
-                scars = diff_scars(prev_best, curr_best, scars, birth_gen=gen, regen_mode_for_new=getattr(curr_best, 'regen_mode', 'split'))
-                stride = int(getattr(self, 'snapshot_stride', 1))
-                if gen % max(1, stride) == 0 or gen == n_generations - 1:
-                    if len(self.snapshots_genomes) >= int(getattr(self, 'snapshot_max', 320)):
-                        self.snapshots_genomes.pop(0)
-                        self.snapshots_scars.pop(0)
-                    self.snapshots_genomes.append(curr_best)
-                    self.snapshots_scars.append(scars)
-                prev_best = curr_best
-            except Exception:
-                pass
-            history.append((best_fit, avg_fit))
-            self.best_ids.append(self.population[best_idx].id)
-            try:
-                self.hidden_counts_history.append([sum((1 for n in g.nodes.values() if n.type == 'hidden')) for g in self.population])
-                self.edge_counts_history.append([sum((1 for c in g.connections.values() if c.enabled)) for g in self.population])
-            except Exception:
-                self.hidden_counts_history.append([])
-                self.edge_counts_history.append([])
-            if verbose:
-                noise = float(self.env.get('noise_std', 0.0))
-                ev = self.event_log[-1] if self.event_log else {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0}
-                n_herm = sum((1 for g in self.population if g.sex == 'hermaphrodite'))
-                herm_str = f' | herm {n_herm}' if n_herm > 0 else ''
-                top3_str = ''
-                if len(top3_best) >= 3:
-                    complexities = [(sum((1 for n in g.nodes.values() if n.type == 'hidden')), sum((1 for c in g.connections.values() if c.enabled))) for g, _, _ in top3_best]
-                    top3_str = f' | top3: [{complexities[0][0]}n,{complexities[0][1]}e] [{complexities[1][0]}n,{complexities[1][1]}e] [{complexities[2][0]}n,{complexities[2][1]}e]'
-                print(f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}")
-            if best_fit > best_ever_fit:
-                best_ever_fit = best_fit
-                best_ever = self.population[best_idx].copy()
-            if target_fitness is not None and best_fit >= target_fitness:
-                break
-            species = self.speciate(fitnesses)
-            try:
-                self._learn_species_target(len(species), best_fit, gen)
-            except Exception as _spe:
-                print('[WARN] species target learning skipped:', _spe)
-            self._adapt_compat_threshold(len(species))
-            self.reproduce(species, fitnesses)
+                species = self.speciate(fitnesses)
+                try:
+                    self._learn_species_target(len(species), best_fit, gen)
+                except Exception as _spe:
+                    print('[WARN] species target learning skipped:', _spe)
+                self._adapt_compat_threshold(len(species))
+                self.reproduce(species, fitnesses)
+                self._resilience_eval_guard = 0
+                self._resilience_history = list(history)
+            except Exception as gen_err:
+                _tb = traceback.format_exc()
+                try:
+                    self._resilience_failures.append({'gen': int(gen), 'error': repr(gen_err), 'traceback': _tb})
+                except Exception:
+                    pass
+                self._resilience_eval_guard = getattr(self, '_resilience_eval_guard', 0) + 1
+                if self._resilience_eval_guard == 1:
+                    print(f"[WARN] Generation {gen} failed with {gen_err!r}; switching to single-thread fallback and continuing.")
+                    self.parallel_backend = 'thread'
+                    self.eval_workers = 1
+                    self.pool_keepalive = 0
+                elif self._resilience_eval_guard == 2:
+                    print('[WARN] Multiple generation failures detected; disabling regenerative reproduction for stability.')
+                    self.mode.enable_regen_reproduction = False
+                else:
+                    print(f"[WARN] Generation {gen} failed again ({gen_err!r}); continuing with resilience guard (attempt {self._resilience_eval_guard}).")
+                try:
+                    self._close_pool()
+                except Exception:
+                    pass
+                self._resilience_history = list(history)
+                continue
         if best_ever is None and self.population:
             best_ever = self.population[0].copy()
         self.top3_best_topologies = top3_best
+        self._resilience_history = list(history)
         try:
             self._close_pool()
         except Exception:
@@ -3451,7 +3484,17 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     if hasattr(neat, 'snapshots_genomes') and neat.snapshots_genomes:
         for g in neat.snapshots_genomes:
             genomes_cyto.append(_genome_to_cyto(g))
-    return {'learning_curve': lc_path, 'decision_boundary': db_path, 'topology': topo_path, 'top3_topologies': top3_paths, 'regen_gif': regen_gif, 'morph_gif': morph_gif, 'lineage': lineage_path, 'scars_spiral': scars_spiral, 'summary_decisions': summary_paths, 'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None, 'lcs_ribbon': lcs_ribbon, 'lcs_timeline': lcs_timeline, 'history': hist, 'genomes_cyto': genomes_cyto}
+    resilience_log = None
+    failures = list(getattr(neat, '_resilience_failures', [])) if hasattr(neat, '_resilience_failures') else []
+    if failures:
+        resilience_log = f'{out_prefix}_resilience_log.json'
+        try:
+            with open(resilience_log, 'w', encoding='utf-8') as fh:
+                json.dump({'failures': failures, 'eval_guard': getattr(neat, '_resilience_eval_guard', 0), 'history': getattr(neat, '_resilience_history', [])}, fh, indent=2, ensure_ascii=False)
+        except Exception as log_err:
+            print('[WARN] Resilience log write failed:', log_err)
+            resilience_log = None
+    return {'learning_curve': lc_path, 'decision_boundary': db_path, 'topology': topo_path, 'top3_topologies': top3_paths, 'regen_gif': regen_gif, 'morph_gif': morph_gif, 'lineage': lineage_path, 'scars_spiral': scars_spiral, 'summary_decisions': summary_paths, 'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None, 'lcs_ribbon': lcs_ribbon, 'lcs_timeline': lcs_timeline, 'history': hist, 'genomes_cyto': genomes_cyto, 'resilience_log': resilience_log}
 
 def _fig_to_rgb(fig):
     """
@@ -4404,8 +4447,44 @@ def export_interactive_html_report(path: str, title: str, history, genomes, *, m
         f.write(html)
     print('[REPORT]', path)
 
+def _run_default_fractal_demo() -> int:
+    """Execute the fractal spinor showcase with polished logging and layout."""
+    _ensure_matplotlib_agg(force=True)
+    root = os.environ.get('SPINOR_DEFAULT_ROOT', os.path.join('out', 'fractal_default'))
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    out_prefix = os.path.join(root, timestamp, 'spinor_demo')
+    out_dir = os.path.dirname(out_prefix) or '.'
+    os.makedirs(out_dir, exist_ok=True)
+    print('[INFO] No CLI arguments supplied; running default fractal spinor environment demo.')
+    print(f'[INFO] Artifacts will be stored under: {out_dir}')
+    try:
+        artifacts = run_spinor_monolith(out_prefix=out_prefix)
+    except Exception as exc:
+        print('[ERROR] Fractal spinor environment demo failed.', file=sys.stderr)
+        traceback.print_exc()
+        return 1
+    if not artifacts:
+        print('[WARN] Demo completed but did not report any artifacts.')
+        return 0
+    key_width = max(len(k) for k in artifacts)
+    print('[OK] Fractal spinor environment demo completed. Generated artifacts:')
+    for key in sorted(artifacts):
+        print(f'  - {key.ljust(key_width)} : {artifacts[key]}')
+    summary_path = os.path.join(out_dir, 'artifact_manifest.json')
+    try:
+        with open(summary_path, 'w', encoding='utf-8') as fh:
+            json.dump(artifacts, fh, indent=2, ensure_ascii=False)
+        print(f'[INFO] Artifact manifest saved to {summary_path}')
+    except Exception:
+        print('[WARN] Unable to persist artifact manifest to disk.')
+    return 0
+
+
 def main(argv: Optional[Iterable[str]]=None) -> int:
     """Command-line interface entrypoint."""
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if not argv_list:
+        return _run_default_fractal_demo()
     _ensure_matplotlib_agg(force=True)
     ap = argparse.ArgumentParser(description='Spiral-NEAT NumPy | built-in CLI')
     ap.add_argument('--task', choices=['xor', 'circles', 'spiral'])
@@ -4427,7 +4506,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--gallery', nargs='*', default=[])
     ap.add_argument('--gallery-analysis-only', action='store_true', help='compose gallery from current run without rerun')
     ap.add_argument('--report', action='store_true')
-    args = ap.parse_args(None if argv is None else list(argv))
+    args = ap.parse_args(argv_list)
     script_name = os.path.basename(__file__) if '__file__' in globals() else 'spiral_monolith_neat_numpy.py'
     os.makedirs(args.out, exist_ok=True)
     figs: Dict[str, Optional[str]] = {}
@@ -4470,12 +4549,16 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
         has_timeline = bool(timeline and os.path.exists(timeline))
         if has_timeline:
             figs['LCS Timeline'] = timeline
+        resilience_log = res.get('resilience_log')
+        has_resilience_log = bool(resilience_log and os.path.exists(resilience_log))
+        if has_resilience_log:
+            figs['Resilience Tracebacks'] = resilience_log
         history = res.get('history') or []
         best_fit = max((b for b, _a in history), default=None)
         final_best = history[-1][0] if history else None
         final_avg = history[-1][1] if history else None
         initial_best = history[0][0] if history else None
-        report_meta['supervised'] = {'task': args.task, 'gens': args.gens, 'pop': args.pop, 'steps': args.steps, 'best_fit': best_fit, 'final_best': final_best, 'final_avg': final_avg, 'initial_best': initial_best, 'has_lineage': has_lineage, 'has_regen_log': has_regen_log, 'has_lcs_viz': bool(has_ribbon or has_timeline), 'has_spiral': has_scars_spiral}
+        report_meta['supervised'] = {'task': args.task, 'gens': args.gens, 'pop': args.pop, 'steps': args.steps, 'best_fit': best_fit, 'final_best': final_best, 'final_avg': final_avg, 'initial_best': initial_best, 'has_lineage': has_lineage, 'has_regen_log': has_regen_log, 'has_lcs_viz': bool(has_ribbon or has_timeline), 'has_spiral': has_scars_spiral, 'has_resilience': has_resilience_log}
 
         # If analysis-only gallery is requested, compose from current run and skip rerun
     if args.gallery and args.gallery_analysis_only and args.task:
@@ -4510,6 +4593,16 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                     os.remove(regen_log_path)
             fit = gym_fitness_factory(args.rl_env, stochastic=args.rl_stochastic, temp=args.rl_temp, max_steps=args.rl_max_steps, episodes=args.rl_episodes)
             best, hist = neat.evolve(fit, n_generations=args.rl_gens, verbose=True, env_schedule=_default_difficulty_schedule)
+            rl_resilience_log = None
+            rl_failures = list(getattr(neat, '_resilience_failures', [])) if hasattr(neat, '_resilience_failures') else []
+            if rl_failures:
+                rl_resilience_log = os.path.join(args.out, f"{args.rl_env.replace(':', '_')}_resilience_log.json")
+                try:
+                    with open(rl_resilience_log, 'w', encoding='utf-8') as fh:
+                        json.dump({'failures': rl_failures, 'eval_guard': getattr(neat, '_resilience_eval_guard', 0), 'history': getattr(neat, '_resilience_history', [])}, fh, indent=2, ensure_ascii=False)
+                except Exception as log_err:
+                    print('[WARN] RL resilience log write failed:', log_err)
+                    rl_resilience_log = None
             close_env = getattr(fit, 'close_env', None)
             if callable(close_env):
                 close_env()
@@ -4528,6 +4621,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             plt.savefig(rc_png, dpi=150)
             plt.close()
             figs['RL 平均エピソード報酬'] = rc_png
+            if rl_resilience_log and os.path.exists(rl_resilience_log):
+                figs['RL Resilience Tracebacks'] = rl_resilience_log
             lcs_rows = load_lcs_log(regen_log_path) if os.path.exists(regen_log_path) else []
             lcs_series = _prepare_lcs_series(lcs_rows) if lcs_rows else None
             if os.path.exists(regen_log_path):
@@ -4557,7 +4652,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             rl_best = max((b for b, _a in hist), default=None)
             rl_final_best = hist[-1][0] if hist else None
             rl_final_avg = hist[-1][1] if hist else None
-            report_meta['rl'] = {'env': args.rl_env, 'gens': args.rl_gens, 'pop': args.rl_pop, 'episodes': args.rl_episodes, 'best_reward': rl_best, 'final_best': rl_final_best, 'final_avg': rl_final_avg, 'has_lcs_log': bool(os.path.exists(regen_log_path)), 'has_lcs_viz': bool(lcs_rows), 'has_gameplay': bool(gif and os.path.exists(gif))}
+            report_meta['rl'] = {'env': args.rl_env, 'gens': args.rl_gens, 'pop': args.rl_pop, 'episodes': args.rl_episodes, 'best_reward': rl_best, 'final_best': rl_final_best, 'final_avg': rl_final_avg, 'has_lcs_log': bool(os.path.exists(regen_log_path)), 'has_lcs_viz': bool(lcs_rows), 'has_gameplay': bool(gif and os.path.exists(gif)), 'has_resilience': bool(rl_resilience_log and os.path.exists(rl_resilience_log))}
         except Exception as e:
             print('[WARN] RL branch skipped:', e)
     if args.report:
@@ -4622,6 +4717,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                         extras.append('lineage')
                     if sup_meta.get('has_spiral'):
                         extras.append('scar map')
+                    if sup_meta.get('has_resilience'):
+                        extras.append('resilience log')
                     extra_txt = f" [{', '.join(extras)}]" if extras else ''
                     summary_items.append(f"<li><strong>Supervised ({htmllib.escape(sup_meta['task'].upper())})</strong> — best {_fmt_float(sup_meta.get('best_fit'))} | final {_fmt_float(sup_meta.get('final_best'))} / avg {_fmt_float(sup_meta.get('final_avg'))}{extra_txt}</li>")
                 rl_meta = report_meta.get('rl')
@@ -4633,6 +4730,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                         extras.append('LCS visuals')
                     if rl_meta.get('has_gameplay'):
                         extras.append('gameplay gif')
+                    if rl_meta.get('has_resilience'):
+                        extras.append('resilience log')
                     extra_txt = f" [{', '.join(extras)}]" if extras else ''
                     summary_items.append(f"<li><strong>RL ({htmllib.escape(rl_meta['env'])})</strong> — best {_fmt_float(rl_meta.get('best_reward'))} | final {_fmt_float(rl_meta.get('final_best'))} / avg {_fmt_float(rl_meta.get('final_avg'))}{extra_txt}</li>")
                 f.write("<section class='summary'><h2>Overview / 概要</h2>")
@@ -4743,12 +4842,51 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     controller.update_for_generation(0, shmem=False)
     fit = SpinorNomologyFitness(controller=controller, get_generation=lambda: neat_inst.generation, steps=40, lr=0.005, l2=0.0001, alpha_nodes=0.001, alpha_edges=0.0005)
     hist = neat_inst.evolve(fit, n_generations=gens, target_fitness=None, verbose=True, env_schedule=None)
-    tel_arr = np.genfromtxt(tel.tel_csv, delimiter=',', names=True)
-    g = tel_arr['gen']
-    theta4 = tel_arr['theta_mod_4pi']
-    parity = tel_arr['parity']
+    resilience_log = None
+    failures = list(getattr(neat_inst, '_resilience_failures', [])) if hasattr(neat_inst, '_resilience_failures') else []
+    if failures:
+        resilience_log = f'{out_prefix}_resilience_log.json'
+        try:
+            with open(resilience_log, 'w', encoding='utf-8') as fh:
+                json.dump({'failures': failures, 'eval_guard': getattr(neat_inst, '_resilience_eval_guard', 0), 'history': getattr(neat_inst, '_resilience_history', [])}, fh, indent=2, ensure_ascii=False)
+        except Exception as log_err:
+            print('[WARN] Resilience log write failed:', log_err)
+            resilience_log = None
+
+    def _load_csv_rows(path: str) -> List[Dict[str, str]]:
+        if not os.path.exists(path):
+            return []
+        with open(path, newline='') as fh:
+            reader = csv.DictReader(fh)
+            return [row for row in reader]
+
+    tele_rows = _load_csv_rows(tel.tel_csv)
+    reg_rows = _load_csv_rows(tel.reg_csv)
+
+    def _float_col(rows: List[Dict[str, str]], key: str) -> np.ndarray:
+        return np.array([float(row.get(key, 'nan')) for row in rows], dtype=np.float64)
+
+    def _int_col(rows: List[Dict[str, str]], key: str) -> np.ndarray:
+        out = []
+        for row in rows:
+            try:
+                out.append(int(float(row.get(key, '0'))))
+            except ValueError:
+                out.append(0)
+        return np.array(out, dtype=np.int32)
+
+    g = _int_col(tele_rows, 'gen') if tele_rows else np.array([], dtype=np.int32)
+    theta4 = _float_col(tele_rows, 'theta_mod_4pi') if tele_rows else np.array([], dtype=np.float64)
+    parity = _int_col(tele_rows, 'parity') if tele_rows else np.array([], dtype=np.int32)
+    theta_raw = _float_col(tele_rows, 'theta') if tele_rows else np.array([], dtype=np.float64)
+    noise_seq = _float_col(tele_rows, 'noise') if tele_rows else np.array([], dtype=np.float64)
+    turns_seq = _float_col(tele_rows, 'turns') if tele_rows else np.array([], dtype=np.float64)
+    rot_bias_seq = _float_col(tele_rows, 'rot_bias') if tele_rows else np.array([], dtype=np.float64)
+    regime_ids = _int_col(tele_rows, 'regime_id') if tele_rows else np.array([], dtype=np.int32)
+
     plt.figure()
-    plt.plot(g, theta4)
+    if g.size:
+        plt.plot(g, theta4)
     plt.xlabel('generation')
     plt.ylabel('theta mod 4π')
     fig1 = f'{out_prefix}_phase.png'
@@ -4756,7 +4894,8 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     plt.savefig(fig1, dpi=160)
     plt.close()
     plt.figure()
-    plt.step(g, parity, where='post')
+    if g.size:
+        plt.step(g, parity, where='post')
     plt.xlabel('generation')
     plt.ylabel('parity (2π branch)')
     fig2 = f'{out_prefix}_parity.png'
@@ -4764,22 +4903,136 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     plt.savefig(fig2, dpi=160)
     plt.close()
     plt.figure()
-    plt.plot(g, theta4)
-    try:
-        reg_arr = np.genfromtxt(tel.reg_csv, delimiter=',', names=True)
-        if reg_arr.size > 0:
-            xs = [int(v) for v in np.atleast_1d(reg_arr['gen'])]
-            for x in xs:
-                plt.axvline(x=x, linestyle='--')
-    except Exception:
-        pass
+    if g.size:
+        plt.plot(g, theta4)
+    if reg_rows and g.size:
+        for row in reg_rows:
+            try:
+                x = int(float(row.get('gen', 'nan')))
+            except (TypeError, ValueError):
+                continue
+            plt.axvline(x=x, linestyle='--')
     plt.xlabel('generation')
     plt.ylabel('theta mod 4π (regimes)')
     fig3 = f'{out_prefix}_regimes.png'
     plt.tight_layout()
     plt.savefig(fig3, dpi=160)
     plt.close()
-    return {'telemetry_csv': tel.tel_csv, 'regimes_csv': tel.reg_csv, 'phase_png': fig1, 'parity_png': fig2, 'regimes_png': fig3}
+
+    spinor_grid_png: Optional[str] = None
+    spinor_transition_gif: Optional[str] = None
+
+    if tele_rows and g.size:
+        gen_to_idx: Dict[int, int] = {}
+        for idx, gen_val in enumerate(g):
+            gen_to_idx.setdefault(int(gen_val), idx)
+
+        picks: Set[int] = {0, max(0, len(g) - 1)}
+        for row in reg_rows:
+            try:
+                event_gen = int(float(row.get('gen', 'nan')))
+            except (TypeError, ValueError):
+                continue
+            idx = gen_to_idx.get(event_gen)
+            if idx is not None:
+                picks.add(idx)
+        target = min(6, len(g))
+        if target:
+            for frac in np.linspace(0.0, 1.0, num=target):
+                if len(g) == 1:
+                    idx = 0
+                else:
+                    idx = int(round(frac * (len(g) - 1)))
+                picks.add(int(np.clip(idx, 0, len(g) - 1)))
+        snapshots = sorted({idx for idx in picks if 0 <= idx < len(g)})
+
+        def _synth_snapshot(idx: int) -> Tuple[np.ndarray, np.ndarray]:
+            theta = float(theta_raw[idx])
+            noise = float(noise_seq[idx])
+            turns = float(turns_seq[idx])
+            rot_bias = float(rot_bias_seq[idx])
+            gen_val = int(g[idx])
+            local_rng = np.random.default_rng((seed + gen_val * 7919) % (1 << 32))
+            spiral_seed = int(local_rng.integers(1 << 31))
+            X, y = make_spirals(n=240, noise=noise, turns=turns, seed=spiral_seed)
+            X_rot = rotate_2d(X, theta + rot_bias)
+            return (X_rot, y)
+
+        if snapshots:
+            ncols = min(3, len(snapshots))
+            nrows = int(math.ceil(len(snapshots) / float(ncols)))
+            fig, axes = plt.subplots(nrows, ncols, figsize=(4.0 * ncols, 4.0 * nrows))
+            axes_arr = np.atleast_1d(axes).ravel()
+            for ax, idx in zip(axes_arr, snapshots):
+                X_vis, y_vis = _synth_snapshot(idx)
+                ax.scatter(X_vis[:, 0], X_vis[:, 1], c=y_vis, cmap='coolwarm', s=12, alpha=0.7, edgecolors='none')
+                ax.set_title(f'gen {int(g[idx])} | regime {int(regime_ids[idx])} | parity {int(parity[idx])}')
+                ax.add_patch(FancyArrowPatch((0.0, 0.0), (math.cos(theta_raw[idx] + rot_bias_seq[idx]), math.sin(theta_raw[idx] + rot_bias_seq[idx])), arrowstyle='->', mutation_scale=12, lw=1.5, color='#444444'))
+                ax.set_xlim(-1.6, 1.6)
+                ax.set_ylim(-1.6, 1.6)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_aspect('equal', 'box')
+                ax.grid(False)
+            for ax in axes_arr[len(snapshots):]:
+                ax.axis('off')
+            plt.tight_layout()
+            spinor_grid_png = f'{out_prefix}_spinor_transition_grid.png'
+            plt.savefig(spinor_grid_png, dpi=170)
+            plt.close(fig)
+
+        step = max(1, len(g) // 60)
+        frames: List[np.ndarray] = []
+        for idx in range(0, len(g), step):
+            X_vis, y_vis = _synth_snapshot(idx)
+            fig, axs = plt.subplots(1, 2, figsize=(7.0, 3.6))
+            ax_data, ax_spin = axs
+            ax_data.scatter(X_vis[:, 0], X_vis[:, 1], c=y_vis, cmap='coolwarm', s=14, alpha=0.75, edgecolors='none')
+            ax_data.set_xlim(-1.6, 1.6)
+            ax_data.set_ylim(-1.6, 1.6)
+            ax_data.set_aspect('equal', 'box')
+            ax_data.set_xticks([])
+            ax_data.set_yticks([])
+            ax_data.set_title(f'gen {int(g[idx])} | regime {int(regime_ids[idx])}')
+            arrow_dataset = FancyArrowPatch((0.0, 0.0), (math.cos(theta_raw[idx] + rot_bias_seq[idx]), math.sin(theta_raw[idx] + rot_bias_seq[idx])), arrowstyle='->', mutation_scale=12, lw=1.8, color='#2ca02c')
+            ax_data.add_patch(arrow_dataset)
+
+            circle = Circle((0.0, 0.0), radius=1.0, fill=False, lw=2.0, alpha=0.6)
+            ax_spin.add_patch(circle)
+            spin_vec = SpinorScheduler.spinor_vec(theta_raw[idx])
+            arrow_spin = FancyArrowPatch((0.0, 0.0), (float(spin_vec[0]), float(spin_vec[1])), arrowstyle='->', mutation_scale=14, lw=2.2, color='#d62728')
+            ax_spin.add_patch(arrow_spin)
+            ax_spin.set_xlim(-1.3, 1.3)
+            ax_spin.set_ylim(-1.3, 1.3)
+            ax_spin.set_aspect('equal', 'box')
+            ax_spin.axis('off')
+            theta_deg = (float(theta_raw[idx]) % (2.0 * math.pi)) * 180.0 / math.pi
+            ax_spin.set_title('spinor orientation')
+            ax_spin.text(0.0, -1.15, f'θ={theta_deg:5.1f}° | parity {int(parity[idx])}', ha='center', va='top', fontsize=10)
+            fig.suptitle('Spinor-fractal transition overview', fontsize=12)
+            fig.tight_layout()
+            fig.canvas.draw()
+            w, h = fig.canvas.get_width_height()
+            frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            frames.append(frame.reshape(h, w, 3))
+            plt.close(fig)
+
+        if frames:
+            spinor_transition_gif = f'{out_prefix}_spinor_transition.gif'
+            try:
+                _mimsave(spinor_transition_gif, frames, fps=6)
+            except Exception as gif_err:
+                print('[WARN] Unable to write spinor transition GIF:', gif_err)
+                spinor_transition_gif = None
+
+    artifacts: Dict[str, Optional[str]] = {'telemetry_csv': tel.tel_csv, 'regimes_csv': tel.reg_csv, 'phase_png': fig1, 'parity_png': fig2, 'regimes_png': fig3}
+    if resilience_log:
+        artifacts['resilience_log'] = resilience_log
+    if spinor_grid_png:
+        artifacts['spinor_transition_grid'] = spinor_grid_png
+    if spinor_transition_gif:
+        artifacts['spinor_transition_gif'] = spinor_transition_gif
+    return artifacts
 
 @dataclass
 class SpinorScheduler:
