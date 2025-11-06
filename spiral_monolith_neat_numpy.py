@@ -18,6 +18,7 @@ from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
 from collections import deque, defaultdict, OrderedDict
 import math, argparse, os, mimetypes, csv
 import sys
+import time
 import matplotlib
 import warnings
 import pickle as _pickle
@@ -4404,8 +4405,44 @@ def export_interactive_html_report(path: str, title: str, history, genomes, *, m
         f.write(html)
     print('[REPORT]', path)
 
+def _run_default_fractal_demo() -> int:
+    """Execute the fractal spinor showcase with polished logging and layout."""
+    _ensure_matplotlib_agg(force=True)
+    root = os.environ.get('SPINOR_DEFAULT_ROOT', os.path.join('out', 'fractal_default'))
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    out_prefix = os.path.join(root, timestamp, 'spinor_demo')
+    out_dir = os.path.dirname(out_prefix) or '.'
+    os.makedirs(out_dir, exist_ok=True)
+    print('[INFO] No CLI arguments supplied; running default fractal spinor environment demo.')
+    print(f'[INFO] Artifacts will be stored under: {out_dir}')
+    try:
+        artifacts = run_spinor_monolith(out_prefix=out_prefix)
+    except Exception as exc:
+        print('[ERROR] Fractal spinor environment demo failed.', file=sys.stderr)
+        traceback.print_exc()
+        return 1
+    if not artifacts:
+        print('[WARN] Demo completed but did not report any artifacts.')
+        return 0
+    key_width = max(len(k) for k in artifacts)
+    print('[OK] Fractal spinor environment demo completed. Generated artifacts:')
+    for key in sorted(artifacts):
+        print(f'  - {key.ljust(key_width)} : {artifacts[key]}')
+    summary_path = os.path.join(out_dir, 'artifact_manifest.json')
+    try:
+        with open(summary_path, 'w', encoding='utf-8') as fh:
+            json.dump(artifacts, fh, indent=2, ensure_ascii=False)
+        print(f'[INFO] Artifact manifest saved to {summary_path}')
+    except Exception:
+        print('[WARN] Unable to persist artifact manifest to disk.')
+    return 0
+
+
 def main(argv: Optional[Iterable[str]]=None) -> int:
     """Command-line interface entrypoint."""
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if not argv_list:
+        return _run_default_fractal_demo()
     _ensure_matplotlib_agg(force=True)
     ap = argparse.ArgumentParser(description='Spiral-NEAT NumPy | built-in CLI')
     ap.add_argument('--task', choices=['xor', 'circles', 'spiral'])
@@ -4427,7 +4464,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--gallery', nargs='*', default=[])
     ap.add_argument('--gallery-analysis-only', action='store_true', help='compose gallery from current run without rerun')
     ap.add_argument('--report', action='store_true')
-    args = ap.parse_args(None if argv is None else list(argv))
+    args = ap.parse_args(argv_list)
     script_name = os.path.basename(__file__) if '__file__' in globals() else 'spiral_monolith_neat_numpy.py'
     os.makedirs(args.out, exist_ok=True)
     figs: Dict[str, Optional[str]] = {}
@@ -4743,12 +4780,41 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     controller.update_for_generation(0, shmem=False)
     fit = SpinorNomologyFitness(controller=controller, get_generation=lambda: neat_inst.generation, steps=40, lr=0.005, l2=0.0001, alpha_nodes=0.001, alpha_edges=0.0005)
     hist = neat_inst.evolve(fit, n_generations=gens, target_fitness=None, verbose=True, env_schedule=None)
-    tel_arr = np.genfromtxt(tel.tel_csv, delimiter=',', names=True)
-    g = tel_arr['gen']
-    theta4 = tel_arr['theta_mod_4pi']
-    parity = tel_arr['parity']
+
+    def _load_csv_rows(path: str) -> List[Dict[str, str]]:
+        if not os.path.exists(path):
+            return []
+        with open(path, newline='') as fh:
+            reader = csv.DictReader(fh)
+            return [row for row in reader]
+
+    tele_rows = _load_csv_rows(tel.tel_csv)
+    reg_rows = _load_csv_rows(tel.reg_csv)
+
+    def _float_col(rows: List[Dict[str, str]], key: str) -> np.ndarray:
+        return np.array([float(row.get(key, 'nan')) for row in rows], dtype=np.float64)
+
+    def _int_col(rows: List[Dict[str, str]], key: str) -> np.ndarray:
+        out = []
+        for row in rows:
+            try:
+                out.append(int(float(row.get(key, '0'))))
+            except ValueError:
+                out.append(0)
+        return np.array(out, dtype=np.int32)
+
+    g = _int_col(tele_rows, 'gen') if tele_rows else np.array([], dtype=np.int32)
+    theta4 = _float_col(tele_rows, 'theta_mod_4pi') if tele_rows else np.array([], dtype=np.float64)
+    parity = _int_col(tele_rows, 'parity') if tele_rows else np.array([], dtype=np.int32)
+    theta_raw = _float_col(tele_rows, 'theta') if tele_rows else np.array([], dtype=np.float64)
+    noise_seq = _float_col(tele_rows, 'noise') if tele_rows else np.array([], dtype=np.float64)
+    turns_seq = _float_col(tele_rows, 'turns') if tele_rows else np.array([], dtype=np.float64)
+    rot_bias_seq = _float_col(tele_rows, 'rot_bias') if tele_rows else np.array([], dtype=np.float64)
+    regime_ids = _int_col(tele_rows, 'regime_id') if tele_rows else np.array([], dtype=np.int32)
+
     plt.figure()
-    plt.plot(g, theta4)
+    if g.size:
+        plt.plot(g, theta4)
     plt.xlabel('generation')
     plt.ylabel('theta mod 4π')
     fig1 = f'{out_prefix}_phase.png'
@@ -4756,7 +4822,8 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     plt.savefig(fig1, dpi=160)
     plt.close()
     plt.figure()
-    plt.step(g, parity, where='post')
+    if g.size:
+        plt.step(g, parity, where='post')
     plt.xlabel('generation')
     plt.ylabel('parity (2π branch)')
     fig2 = f'{out_prefix}_parity.png'
@@ -4764,22 +4831,134 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     plt.savefig(fig2, dpi=160)
     plt.close()
     plt.figure()
-    plt.plot(g, theta4)
-    try:
-        reg_arr = np.genfromtxt(tel.reg_csv, delimiter=',', names=True)
-        if reg_arr.size > 0:
-            xs = [int(v) for v in np.atleast_1d(reg_arr['gen'])]
-            for x in xs:
-                plt.axvline(x=x, linestyle='--')
-    except Exception:
-        pass
+    if g.size:
+        plt.plot(g, theta4)
+    if reg_rows and g.size:
+        for row in reg_rows:
+            try:
+                x = int(float(row.get('gen', 'nan')))
+            except (TypeError, ValueError):
+                continue
+            plt.axvline(x=x, linestyle='--')
     plt.xlabel('generation')
     plt.ylabel('theta mod 4π (regimes)')
     fig3 = f'{out_prefix}_regimes.png'
     plt.tight_layout()
     plt.savefig(fig3, dpi=160)
     plt.close()
-    return {'telemetry_csv': tel.tel_csv, 'regimes_csv': tel.reg_csv, 'phase_png': fig1, 'parity_png': fig2, 'regimes_png': fig3}
+
+    spinor_grid_png: Optional[str] = None
+    spinor_transition_gif: Optional[str] = None
+
+    if tele_rows and g.size:
+        gen_to_idx: Dict[int, int] = {}
+        for idx, gen_val in enumerate(g):
+            gen_to_idx.setdefault(int(gen_val), idx)
+
+        picks: Set[int] = {0, max(0, len(g) - 1)}
+        for row in reg_rows:
+            try:
+                event_gen = int(float(row.get('gen', 'nan')))
+            except (TypeError, ValueError):
+                continue
+            idx = gen_to_idx.get(event_gen)
+            if idx is not None:
+                picks.add(idx)
+        target = min(6, len(g))
+        if target:
+            for frac in np.linspace(0.0, 1.0, num=target):
+                if len(g) == 1:
+                    idx = 0
+                else:
+                    idx = int(round(frac * (len(g) - 1)))
+                picks.add(int(np.clip(idx, 0, len(g) - 1)))
+        snapshots = sorted({idx for idx in picks if 0 <= idx < len(g)})
+
+        def _synth_snapshot(idx: int) -> Tuple[np.ndarray, np.ndarray]:
+            theta = float(theta_raw[idx])
+            noise = float(noise_seq[idx])
+            turns = float(turns_seq[idx])
+            rot_bias = float(rot_bias_seq[idx])
+            gen_val = int(g[idx])
+            local_rng = np.random.default_rng((seed + gen_val * 7919) % (1 << 32))
+            spiral_seed = int(local_rng.integers(1 << 31))
+            X, y = make_spirals(n=240, noise=noise, turns=turns, seed=spiral_seed)
+            X_rot = rotate_2d(X, theta + rot_bias)
+            return (X_rot, y)
+
+        if snapshots:
+            ncols = min(3, len(snapshots))
+            nrows = int(math.ceil(len(snapshots) / float(ncols)))
+            fig, axes = plt.subplots(nrows, ncols, figsize=(4.0 * ncols, 4.0 * nrows))
+            axes_arr = np.atleast_1d(axes).ravel()
+            for ax, idx in zip(axes_arr, snapshots):
+                X_vis, y_vis = _synth_snapshot(idx)
+                ax.scatter(X_vis[:, 0], X_vis[:, 1], c=y_vis, cmap='coolwarm', s=12, alpha=0.7, edgecolors='none')
+                ax.set_title(f'gen {int(g[idx])} | regime {int(regime_ids[idx])} | parity {int(parity[idx])}')
+                ax.add_patch(FancyArrowPatch((0.0, 0.0), (math.cos(theta_raw[idx] + rot_bias_seq[idx]), math.sin(theta_raw[idx] + rot_bias_seq[idx])), arrowstyle='->', mutation_scale=12, lw=1.5, color='#444444'))
+                ax.set_xlim(-1.6, 1.6)
+                ax.set_ylim(-1.6, 1.6)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_aspect('equal', 'box')
+                ax.grid(False)
+            for ax in axes_arr[len(snapshots):]:
+                ax.axis('off')
+            plt.tight_layout()
+            spinor_grid_png = f'{out_prefix}_spinor_transition_grid.png'
+            plt.savefig(spinor_grid_png, dpi=170)
+            plt.close(fig)
+
+        step = max(1, len(g) // 60)
+        frames: List[np.ndarray] = []
+        for idx in range(0, len(g), step):
+            X_vis, y_vis = _synth_snapshot(idx)
+            fig, axs = plt.subplots(1, 2, figsize=(7.0, 3.6))
+            ax_data, ax_spin = axs
+            ax_data.scatter(X_vis[:, 0], X_vis[:, 1], c=y_vis, cmap='coolwarm', s=14, alpha=0.75, edgecolors='none')
+            ax_data.set_xlim(-1.6, 1.6)
+            ax_data.set_ylim(-1.6, 1.6)
+            ax_data.set_aspect('equal', 'box')
+            ax_data.set_xticks([])
+            ax_data.set_yticks([])
+            ax_data.set_title(f'gen {int(g[idx])} | regime {int(regime_ids[idx])}')
+            arrow_dataset = FancyArrowPatch((0.0, 0.0), (math.cos(theta_raw[idx] + rot_bias_seq[idx]), math.sin(theta_raw[idx] + rot_bias_seq[idx])), arrowstyle='->', mutation_scale=12, lw=1.8, color='#2ca02c')
+            ax_data.add_patch(arrow_dataset)
+
+            circle = Circle((0.0, 0.0), radius=1.0, fill=False, lw=2.0, alpha=0.6)
+            ax_spin.add_patch(circle)
+            spin_vec = SpinorScheduler.spinor_vec(theta_raw[idx])
+            arrow_spin = FancyArrowPatch((0.0, 0.0), (float(spin_vec[0]), float(spin_vec[1])), arrowstyle='->', mutation_scale=14, lw=2.2, color='#d62728')
+            ax_spin.add_patch(arrow_spin)
+            ax_spin.set_xlim(-1.3, 1.3)
+            ax_spin.set_ylim(-1.3, 1.3)
+            ax_spin.set_aspect('equal', 'box')
+            ax_spin.axis('off')
+            theta_deg = (float(theta_raw[idx]) % (2.0 * math.pi)) * 180.0 / math.pi
+            ax_spin.set_title('spinor orientation')
+            ax_spin.text(0.0, -1.15, f'θ={theta_deg:5.1f}° | parity {int(parity[idx])}', ha='center', va='top', fontsize=10)
+            fig.suptitle('Spinor-fractal transition overview', fontsize=12)
+            fig.tight_layout()
+            fig.canvas.draw()
+            w, h = fig.canvas.get_width_height()
+            frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            frames.append(frame.reshape(h, w, 3))
+            plt.close(fig)
+
+        if frames:
+            spinor_transition_gif = f'{out_prefix}_spinor_transition.gif'
+            try:
+                _mimsave(spinor_transition_gif, frames, fps=6)
+            except Exception as gif_err:
+                print('[WARN] Unable to write spinor transition GIF:', gif_err)
+                spinor_transition_gif = None
+
+    artifacts: Dict[str, Optional[str]] = {'telemetry_csv': tel.tel_csv, 'regimes_csv': tel.reg_csv, 'phase_png': fig1, 'parity_png': fig2, 'regimes_png': fig3}
+    if spinor_grid_png:
+        artifacts['spinor_transition_grid'] = spinor_grid_png
+    if spinor_transition_gif:
+        artifacts['spinor_transition_gif'] = spinor_transition_gif
+    return artifacts
 
 @dataclass
 class SpinorScheduler:
