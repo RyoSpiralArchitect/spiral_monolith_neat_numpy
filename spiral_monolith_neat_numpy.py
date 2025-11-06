@@ -1603,7 +1603,11 @@ class ReproPlanaNEATPlus:
             g = base_genome.copy()
             g.max_hidden_nodes = self.max_hidden_nodes
             g.max_edges = self.max_edges
-            g.sex = 'female' if self.rng.random() < 0.5 else 'male'
+            r0 = self.rng.random()
+            if r0 < float(getattr(self, 'hermaphrodite_init_ratio', 0.0)):
+                g.sex = 'hermaphrodite'
+            else:
+                g.sex = 'female' if self.rng.random() < 0.5 else 'male'
             g.regen = bool(self.rng.random() < 0.5)
             g.regen_mode = self.rng.choice(['head', 'tail', 'split'])
             g.embryo_bias = 'inputward'
@@ -1799,6 +1803,17 @@ class ReproPlanaNEATPlus:
             genome.mutate_add_connection(self.rng, self.innov)
         if self.rng.random() < weight_prob:
             genome.mutate_weights(self.rng)
+
+        # Occasional sex mutation to increase hermaphrodite emergence
+        try:
+            p_sex = float(getattr(self, 'mutate_sex_prob', 0.0))
+        except Exception:
+            p_sex = 0.0
+        if p_sex > 0.0 and self.rng.random() < p_sex:
+            try:
+                genome.mutate_sex(self.rng)
+            except Exception:
+                pass
         if self.rng.random() < float(getattr(self, 'embryo_bias_mut_rate', 0.03)):
             genome.embryo_bias = self.rng.choice(['neutral', 'inputward', 'outputward'])
         if float(self.env.get('difficulty', 0.0)) >= 0.9 and self.rng.random() < getattr(self, 'diversity_push', 0.15):
@@ -1856,6 +1871,10 @@ class ReproPlanaNEATPlus:
 
     def _make_offspring(self, species, offspring_counts, sidx, species_pool):
         sp = species[sidx]
+
+        # Build fitness lookup for adaptive mutation
+        fit_map = {g.id: f for (g, f) in sp.members}
+        species_avg = (sum((f for _g, f in sp.members)) / max(1, len(sp.members))) if sp.members else 0.0
         new_pop = []
         events = {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0, 'asexual_clone': 0}
         sp.sort()
@@ -1889,9 +1908,31 @@ class ReproPlanaNEATPlus:
             father_id = None
             parent_adj_before_regen = None
             use_sexual_reproduction = False
-            effective_mix_ratio = mix_ratio / self.hermaphrodite_mate_bias if hermaphrodites else mix_ratio
+            parent_candidate = pool[int(self.rng.integers(len(pool)))]
+            effective_mix_ratio = mix_ratio
+            if bool(getattr(self, 'adaptive_self_mutation', True)):
+                f_par = float(fit_map.get(parent_candidate.id, species_avg))
+                denom = (abs(species_avg) + 1e-9)
+                rel = (species_avg - f_par) / denom
+                try:
+                    n_hidden = sum((1 for n in parent_candidate.nodes.values() if n.type == 'hidden'))
+                    n_edges = sum((1 for c in parent_candidate.connections.values() if c.enabled))
+                    comp = 0.5 * (n_hidden / max(1, self.max_hidden_nodes)) + 0.5 * (n_edges / max(1, self.max_edges))
+                except Exception:
+                    comp = 0.0
+                gain = float(getattr(self, 'self_mutation_gain', 0.5))
+                pen = float(getattr(self, 'self_mutation_complexity_penalty', 0.25))
+                lim = float(getattr(self, 'self_mutation_limit', 0.5))
+                delta = gain * rel - pen * comp
+                if delta > lim:
+                    delta = lim
+                if delta < -lim:
+                    delta = -lim
+                effective_mix_ratio = min(0.95, max(0.0, effective_mix_ratio * (1.0 + delta)))
+            if hermaphrodites:
+                effective_mix_ratio = effective_mix_ratio / float(getattr(self, 'hermaphrodite_mate_bias', 2.5))
             if self.rng.random() < effective_mix_ratio:
-                parent = pool[int(self.rng.integers(len(pool)))]
+                parent = parent_candidate
                 if parent.sex == 'hermaphrodite':
                     use_sexual_reproduction = True
                 elif parent.regen and self.mode.enable_regen_reproduction:
@@ -3113,6 +3154,38 @@ def export_decision_boundaries_all(genome: Genome, out_dir: str, steps: int=50, 
     plot_decision_boundary(genome, Xs, ys, path_s, steps=steps, contour_cmap='magma', point_cmap='plasma', point_size=14.0)
     return {'circles': path_c, 'xor': path_x, 'spiral': path_s}
 
+
+def compose_gallery_from_existing(result: Dict[str, str], out_dir: str, task: str='task', idx: int=1) -> Dict[str, str]:
+    """Compose a gallery tile (learning curve + decision boundary) without rerunning experiments."""
+    os.makedirs(out_dir or '.', exist_ok=True)
+    outputs: Dict[str, str] = {}
+    lc = result.get('learning_curve')
+    db = result.get('decision_boundary')
+    if lc and db and os.path.exists(lc) and os.path.exists(db):
+        combo = os.path.join(out_dir, f'{idx:02d}_{task}_gallery.png')
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
+        for ax, path, title in zip(axes, (lc, db), ('学習曲線', '決定境界')):
+            img = _imread_image(path)
+            ax.imshow(img)
+            ax.set_title(title, fontsize=11)
+            ax.axis('off')
+        fig.tight_layout()
+        fig.savefig(combo, dpi=220)
+        plt.close(fig)
+        outputs[f'{idx:02d} {task.upper()} 学習曲線＋決定境界'] = combo
+    else:
+        if lc:
+            outputs[f'{idx:02d} {task.upper()} 学習曲線'] = lc
+        if db:
+            outputs[f'{idx:02d} {task.upper()} 決定境界'] = db
+    topo = result.get('topology')
+    if topo and os.path.exists(topo):
+        outputs[f'{idx:02d} {task.upper()} トポロジ'] = topo
+    lineage = result.get('lineage')
+    if lineage and os.path.exists(lineage):
+        outputs[f'{idx:02d} {task.upper()} 系統図'] = lineage
+    return outputs
+
 def export_task_gallery(tasks: Tuple[str, ...], gens: int, pop: int, steps: int, out_dir: str) -> Dict[str, str]:
     """Run a batch of miniature experiments and collect figure paths."""
     os.makedirs(out_dir or '.', exist_ok=True)
@@ -3282,7 +3355,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         Xva, yva = make_circles(256, r=0.6, noise=0.05, seed=1)
     rng = np.random.default_rng(rng_seed)
     out_dim = 2
-neat = sys.modules[__name__]
+    neat = sys.modules[__name__]
     _apply_stable_neat_defaults(neat)
     regen_log_path = f'{out_prefix}_regen_log.csv'
     if hasattr(neat, 'lcs_monitor') and neat.lcs_monitor is not None:
@@ -3973,6 +4046,20 @@ def _apply_stable_neat_defaults(neat: ReproPlanaNEATPlus):
     neat.mutate_add_conn_prob = 0.08
     neat.mutate_add_node_prob = 0.05
     neat.mutate_weight_prob = 0.8
+
+    # Sex & hermaphrodite tuning
+    neat.hermaphrodite_init_ratio = getattr(neat, 'hermaphrodite_init_ratio', 0.12)
+    neat.mutate_sex_prob = 0.01
+    neat.hermaphrodite_inheritance_rate = 0.12
+    neat.hermaphrodite_mate_bias = 2.5
+    # Regen mix (lower baseline)
+    neat.mix_asexual_base = 0.08
+    neat.mix_asexual_gain = 0.30
+    # Adaptive self-selected mutation
+    neat.adaptive_self_mutation = True
+    neat.self_mutation_gain = 0.6
+    neat.self_mutation_limit = 0.5
+    neat.self_mutation_complexity_penalty = 0.35
     neat.regen_mode_mut_rate = 0.08
     neat.mix_asexual_base = 0.1
     neat.complexity_threshold = 8.0
@@ -3984,7 +4071,7 @@ def setup_neat_for_env(env_id: str, population: int=48, output_activation: str='
     env = gym.make(env_id)
     obs_dim = obs_dim_from_space(env.observation_space)
     out_dim = output_dim_from_space(env.action_space)
-neat = sys.modules[__name__]
+    neat = sys.modules[__name__]
     _apply_stable_neat_defaults(neat)
     return (neat, env)
 
@@ -4338,6 +4425,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--make-gifs', action='store_true')
     ap.add_argument('--make-lineage', action='store_true')
     ap.add_argument('--gallery', nargs='*', default=[])
+    ap.add_argument('--gallery-analysis-only', action='store_true', help='compose gallery from current run without rerun')
     ap.add_argument('--report', action='store_true')
     args = ap.parse_args(None if argv is None else list(argv))
     script_name = os.path.basename(__file__) if '__file__' in globals() else 'spiral_monolith_neat_numpy.py'
@@ -4388,6 +4476,15 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
         final_avg = history[-1][1] if history else None
         initial_best = history[0][0] if history else None
         report_meta['supervised'] = {'task': args.task, 'gens': args.gens, 'pop': args.pop, 'steps': args.steps, 'best_fit': best_fit, 'final_best': final_best, 'final_avg': final_avg, 'initial_best': initial_best, 'has_lineage': has_lineage, 'has_regen_log': has_regen_log, 'has_lcs_viz': bool(has_ribbon or has_timeline), 'has_spiral': has_scars_spiral}
+
+        # If analysis-only gallery is requested, compose from current run and skip rerun
+    if args.gallery and args.gallery_analysis_only and args.task:
+        gal_dir = os.path.join(args.out, 'gallery')
+        os.makedirs(gal_dir, exist_ok=True)
+        gal = compose_gallery_from_existing(res, out_dir=gal_dir, task=args.task, idx=1)
+        for k, v in gal.items():
+            figs[f'ギャラリー {k}'] = v
+        args.gallery = []
     if args.gallery:
         gal = export_task_gallery(tasks=tuple(args.gallery), gens=max(6, args.gens // 2), pop=max(12, args.pop // 2), steps=max(10, args.steps // 2), out_dir=os.path.join(args.out, 'gallery'))
         for k, v in gal.items():
@@ -4404,7 +4501,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                     env_probe.close()
                 except Exception:
                     pass
-neat = sys.modules[__name__]
+            neat = sys.modules[__name__]
             _apply_stable_neat_defaults(neat)
             regen_log_path = os.path.join(args.out, f"{args.rl_env.replace(':', '_')}_regen_log.csv")
             if hasattr(neat, 'lcs_monitor') and neat.lcs_monitor is not None:
