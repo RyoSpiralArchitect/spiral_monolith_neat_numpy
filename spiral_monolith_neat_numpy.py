@@ -1579,6 +1579,9 @@ class ReproPlanaNEATPlus:
         self._proc_pool = None
         self._proc_pool_age = 0
         self._shm_meta = None
+        self._resilience_failures = deque(maxlen=16)
+        self._resilience_eval_guard = 0
+        self._resilience_history = []
         self.refine_topk_ratio = float(os.environ.get('NEAT_REFINE_TOPK_RATIO', '0.08'))
         nodes = {}
         for i in range(num_inputs):
@@ -2242,122 +2245,151 @@ class ReproPlanaNEATPlus:
         for step in range(n_generations):
             gen = start_gen + step
             self.generation = gen
-            prev = history[-1] if history else (None, None)
-            if env_schedule is not None:
-                env = env_schedule(gen, {'gen': gen, 'prev_best': prev[0] if prev else None, 'prev_avg': prev[1] if prev else None})
-            elif getattr(self, 'auto_curriculum', True):
-                env = self._auto_env_schedule(gen, history)
-            else:
-                env = None
-            if env is not None:
-                self.env.update({k: v for k, v in env.items() if k not in {'enable_regen'}})
-                if 'enable_regen' in env:
-                    flag = bool(env['enable_regen'])
-                    self.mode.enable_regen_reproduction = flag
-                    if flag:
-                        self.mix_asexual_base = max(self.mix_asexual_base, 0.3)
-            self.env_history.append({'gen': gen, **self.env, 'regen_enabled': self.mode.enable_regen_reproduction})
-            diff = float(self.env.get('difficulty', 0.0))
-            self.pollen_flow_rate = float(min(0.5, max(0.1, 0.1 + 0.35 * diff)))
-            if hasattr(fitness_fn, 'set_noise_std'):
+            try:
+                prev = history[-1] if history else (None, None)
+                if env_schedule is not None:
+                    env = env_schedule(gen, {'gen': gen, 'prev_best': prev[0] if prev else None, 'prev_avg': prev[1] if prev else None})
+                elif getattr(self, 'auto_curriculum', True):
+                    env = self._auto_env_schedule(gen, history)
+                else:
+                    env = None
+                if env is not None:
+                    self.env.update({k: v for k, v in env.items() if k not in {'enable_regen'}})
+                    if 'enable_regen' in env:
+                        flag = bool(env['enable_regen'])
+                        self.mode.enable_regen_reproduction = flag
+                        if flag:
+                            self.mix_asexual_base = max(self.mix_asexual_base, 0.3)
+                self.env_history.append({'gen': gen, **self.env, 'regen_enabled': self.mode.enable_regen_reproduction})
+                diff = float(self.env.get('difficulty', 0.0))
+                self.pollen_flow_rate = float(min(0.5, max(0.1, 0.1 + 0.35 * diff)))
+                if hasattr(fitness_fn, 'set_noise_std'):
+                    try:
+                        fitness_fn.set_noise_std(float(self.env.get('noise_std', 0.0)))
+                    except Exception:
+                        pass
+                raw = self._evaluate_population(fitness_fn)
+                fitnesses = []
+                for g, f in zip(self.population, raw):
+                    f2 = float(f)
+                    if not self.mode.vanilla:
+                        f2 *= self.sex_fitness_scale.get(g.sex, 1.0) * getattr(g, 'hybrid_scale', 1.0)
+                        if g.regen:
+                            f2 += self.regen_bonus
+                    f2 -= self._complexity_penalty(g)
+                    if not np.isfinite(f2):
+                        f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
+                    fitnesses.append(f2)
                 try:
-                    fitness_fn.set_noise_std(float(self.env.get('noise_std', 0.0)))
+                    fitnesses = self._adaptive_refine_fitness(fitnesses, fitness_fn)
                 except Exception:
                     pass
-            raw = self._evaluate_population(fitness_fn)
-            fitnesses = []
-            for g, f in zip(self.population, raw):
-                f2 = float(f)
-                if not self.mode.vanilla:
-                    f2 *= self.sex_fitness_scale.get(g.sex, 1.0) * getattr(g, 'hybrid_scale', 1.0)
-                    if g.regen:
-                        f2 += self.regen_bonus
-                f2 -= self._complexity_penalty(g)
-                if not np.isfinite(f2):
-                    f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
-                fitnesses.append(f2)
-            try:
-                fitnesses = self._adaptive_refine_fitness(fitnesses, fitness_fn)
-            except Exception:
-                pass
-            best_idx = int(np.argmax(fitnesses))
-            best_fit = float(fitnesses[best_idx])
-            avg_fit = float(np.mean(fitnesses))
+                best_idx = int(np.argmax(fitnesses))
+                best_fit = float(fitnesses[best_idx])
+                avg_fit = float(np.mean(fitnesses))
 
-            def genome_complexity(g):
-                n_hidden = sum((1 for n in g.nodes.values() if n.type == 'hidden'))
-                n_edges = sum((1 for c in g.connections.values() if c.enabled))
-                return (n_hidden, n_edges)
-            sorted_indices = np.argsort(fitnesses)[::-1]
-            pool_size = getattr(self, 'top3_candidate_pool_size', 10)
-            node_threshold = getattr(self, 'top3_diversity_node_threshold', 1)
-            edge_threshold = getattr(self, 'top3_diversity_edge_threshold', 2)
-            for idx in sorted_indices[:pool_size]:
-                candidate = self.population[idx].copy()
-                candidate_fit = float(fitnesses[idx])
-                n_hidden_cand, n_edges_cand = genome_complexity(candidate)
-                is_diverse = True
-                for existing_genome, _, _ in top3_best:
-                    n_hidden_exist, n_edges_exist = genome_complexity(existing_genome)
-                    if abs(n_hidden_cand - n_hidden_exist) <= node_threshold and abs(n_edges_cand - n_edges_exist) <= edge_threshold:
-                        is_diverse = False
+                def genome_complexity(g):
+                    n_hidden = sum((1 for n in g.nodes.values() if n.type == 'hidden'))
+                    n_edges = sum((1 for c in g.connections.values() if c.enabled))
+                    return (n_hidden, n_edges)
+                sorted_indices = np.argsort(fitnesses)[::-1]
+                pool_size = getattr(self, 'top3_candidate_pool_size', 10)
+                node_threshold = getattr(self, 'top3_diversity_node_threshold', 1)
+                edge_threshold = getattr(self, 'top3_diversity_edge_threshold', 2)
+                for idx in sorted_indices[:pool_size]:
+                    candidate = self.population[idx].copy()
+                    candidate_fit = float(fitnesses[idx])
+                    n_hidden_cand, n_edges_cand = genome_complexity(candidate)
+                    is_diverse = True
+                    for existing_genome, _, _ in top3_best:
+                        n_hidden_exist, n_edges_exist = genome_complexity(existing_genome)
+                        if abs(n_hidden_cand - n_hidden_exist) <= node_threshold and abs(n_edges_cand - n_edges_exist) <= edge_threshold:
+                            is_diverse = False
+                            break
+                    if len(top3_best) < 3:
+                        top3_best.append((candidate, candidate_fit, gen))
+                    elif is_diverse:
+                        top3_best.append((candidate, candidate_fit, gen))
+                        top3_best.sort(key=lambda x: x[1], reverse=True)
+                        top3_best = top3_best[:3]
+                    if len(top3_best) >= 3 and (not is_diverse):
                         break
-                if len(top3_best) < 3:
-                    top3_best.append((candidate, candidate_fit, gen))
-                elif is_diverse:
-                    top3_best.append((candidate, candidate_fit, gen))
-                    top3_best.sort(key=lambda x: x[1], reverse=True)
-                    top3_best = top3_best[:3]
-                if len(top3_best) >= 3 and (not is_diverse):
+                self._last_top3_ids = [g.id for g, _fit, _gen in top3_best]
+                self._last_top3_complexities = [genome_complexity(g) for g, _fit, _gen in top3_best]
+                try:
+                    curr_best = self.population[best_idx].copy()
+                    scars = diff_scars(prev_best, curr_best, scars, birth_gen=gen, regen_mode_for_new=getattr(curr_best, 'regen_mode', 'split'))
+                    stride = int(getattr(self, 'snapshot_stride', 1))
+                    if gen % max(1, stride) == 0 or gen == n_generations - 1:
+                        if len(self.snapshots_genomes) >= int(getattr(self, 'snapshot_max', 320)):
+                            self.snapshots_genomes.pop(0)
+                            self.snapshots_scars.pop(0)
+                        self.snapshots_genomes.append(curr_best)
+                        self.snapshots_scars.append(scars)
+                    prev_best = curr_best
+                except Exception:
+                    pass
+                history.append((best_fit, avg_fit))
+                self.best_ids.append(self.population[best_idx].id)
+                try:
+                    self.hidden_counts_history.append([sum((1 for n in g.nodes.values() if n.type == 'hidden')) for g in self.population])
+                    self.edge_counts_history.append([sum((1 for c in g.connections.values() if c.enabled)) for g in self.population])
+                except Exception:
+                    self.hidden_counts_history.append([])
+                    self.edge_counts_history.append([])
+                if verbose:
+                    noise = float(self.env.get('noise_std', 0.0))
+                    ev = self.event_log[-1] if self.event_log else {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0}
+                    n_herm = sum((1 for g in self.population if g.sex == 'hermaphrodite'))
+                    herm_str = f' | herm {n_herm}' if n_herm > 0 else ''
+                    top3_str = ''
+                    if len(top3_best) >= 3:
+                        complexities = [(sum((1 for n in g.nodes.values() if n.type == 'hidden')), sum((1 for c in g.connections.values() if c.enabled))) for g, _, _ in top3_best]
+                        top3_str = f' | top3: [{complexities[0][0]}n,{complexities[0][1]}e] [{complexities[1][0]}n,{complexities[1][1]}e] [{complexities[2][0]}n,{complexities[2][1]}e]'
+                    print(f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}")
+                if best_fit > best_ever_fit:
+                    best_ever_fit = best_fit
+                    best_ever = self.population[best_idx].copy()
+                if target_fitness is not None and best_fit >= target_fitness:
+                    self._resilience_eval_guard = 0
+                    self._resilience_history = list(history)
                     break
-            self._last_top3_ids = [g.id for g, _fit, _gen in top3_best]
-            self._last_top3_complexities = [genome_complexity(g) for g, _fit, _gen in top3_best]
-            try:
-                curr_best = self.population[best_idx].copy()
-                scars = diff_scars(prev_best, curr_best, scars, birth_gen=gen, regen_mode_for_new=getattr(curr_best, 'regen_mode', 'split'))
-                stride = int(getattr(self, 'snapshot_stride', 1))
-                if gen % max(1, stride) == 0 or gen == n_generations - 1:
-                    if len(self.snapshots_genomes) >= int(getattr(self, 'snapshot_max', 320)):
-                        self.snapshots_genomes.pop(0)
-                        self.snapshots_scars.pop(0)
-                    self.snapshots_genomes.append(curr_best)
-                    self.snapshots_scars.append(scars)
-                prev_best = curr_best
-            except Exception:
-                pass
-            history.append((best_fit, avg_fit))
-            self.best_ids.append(self.population[best_idx].id)
-            try:
-                self.hidden_counts_history.append([sum((1 for n in g.nodes.values() if n.type == 'hidden')) for g in self.population])
-                self.edge_counts_history.append([sum((1 for c in g.connections.values() if c.enabled)) for g in self.population])
-            except Exception:
-                self.hidden_counts_history.append([])
-                self.edge_counts_history.append([])
-            if verbose:
-                noise = float(self.env.get('noise_std', 0.0))
-                ev = self.event_log[-1] if self.event_log else {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0}
-                n_herm = sum((1 for g in self.population if g.sex == 'hermaphrodite'))
-                herm_str = f' | herm {n_herm}' if n_herm > 0 else ''
-                top3_str = ''
-                if len(top3_best) >= 3:
-                    complexities = [(sum((1 for n in g.nodes.values() if n.type == 'hidden')), sum((1 for c in g.connections.values() if c.enabled))) for g, _, _ in top3_best]
-                    top3_str = f' | top3: [{complexities[0][0]}n,{complexities[0][1]}e] [{complexities[1][0]}n,{complexities[1][1]}e] [{complexities[2][0]}n,{complexities[2][1]}e]'
-                print(f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}")
-            if best_fit > best_ever_fit:
-                best_ever_fit = best_fit
-                best_ever = self.population[best_idx].copy()
-            if target_fitness is not None and best_fit >= target_fitness:
-                break
-            species = self.speciate(fitnesses)
-            try:
-                self._learn_species_target(len(species), best_fit, gen)
-            except Exception as _spe:
-                print('[WARN] species target learning skipped:', _spe)
-            self._adapt_compat_threshold(len(species))
-            self.reproduce(species, fitnesses)
+                species = self.speciate(fitnesses)
+                try:
+                    self._learn_species_target(len(species), best_fit, gen)
+                except Exception as _spe:
+                    print('[WARN] species target learning skipped:', _spe)
+                self._adapt_compat_threshold(len(species))
+                self.reproduce(species, fitnesses)
+                self._resilience_eval_guard = 0
+                self._resilience_history = list(history)
+            except Exception as gen_err:
+                _tb = traceback.format_exc()
+                try:
+                    self._resilience_failures.append({'gen': int(gen), 'error': repr(gen_err), 'traceback': _tb})
+                except Exception:
+                    pass
+                self._resilience_eval_guard = getattr(self, '_resilience_eval_guard', 0) + 1
+                if self._resilience_eval_guard == 1:
+                    print(f"[WARN] Generation {gen} failed with {gen_err!r}; switching to single-thread fallback and continuing.")
+                    self.parallel_backend = 'thread'
+                    self.eval_workers = 1
+                    self.pool_keepalive = 0
+                elif self._resilience_eval_guard == 2:
+                    print('[WARN] Multiple generation failures detected; disabling regenerative reproduction for stability.')
+                    self.mode.enable_regen_reproduction = False
+                else:
+                    print(f"[WARN] Generation {gen} failed again ({gen_err!r}); continuing with resilience guard (attempt {self._resilience_eval_guard}).")
+                try:
+                    self._close_pool()
+                except Exception:
+                    pass
+                self._resilience_history = list(history)
+                continue
         if best_ever is None and self.population:
             best_ever = self.population[0].copy()
         self.top3_best_topologies = top3_best
+        self._resilience_history = list(history)
         try:
             self._close_pool()
         except Exception:
@@ -3452,7 +3484,17 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     if hasattr(neat, 'snapshots_genomes') and neat.snapshots_genomes:
         for g in neat.snapshots_genomes:
             genomes_cyto.append(_genome_to_cyto(g))
-    return {'learning_curve': lc_path, 'decision_boundary': db_path, 'topology': topo_path, 'top3_topologies': top3_paths, 'regen_gif': regen_gif, 'morph_gif': morph_gif, 'lineage': lineage_path, 'scars_spiral': scars_spiral, 'summary_decisions': summary_paths, 'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None, 'lcs_ribbon': lcs_ribbon, 'lcs_timeline': lcs_timeline, 'history': hist, 'genomes_cyto': genomes_cyto}
+    resilience_log = None
+    failures = list(getattr(neat, '_resilience_failures', [])) if hasattr(neat, '_resilience_failures') else []
+    if failures:
+        resilience_log = f'{out_prefix}_resilience_log.json'
+        try:
+            with open(resilience_log, 'w', encoding='utf-8') as fh:
+                json.dump({'failures': failures, 'eval_guard': getattr(neat, '_resilience_eval_guard', 0), 'history': getattr(neat, '_resilience_history', [])}, fh, indent=2, ensure_ascii=False)
+        except Exception as log_err:
+            print('[WARN] Resilience log write failed:', log_err)
+            resilience_log = None
+    return {'learning_curve': lc_path, 'decision_boundary': db_path, 'topology': topo_path, 'top3_topologies': top3_paths, 'regen_gif': regen_gif, 'morph_gif': morph_gif, 'lineage': lineage_path, 'scars_spiral': scars_spiral, 'summary_decisions': summary_paths, 'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None, 'lcs_ribbon': lcs_ribbon, 'lcs_timeline': lcs_timeline, 'history': hist, 'genomes_cyto': genomes_cyto, 'resilience_log': resilience_log}
 
 def _fig_to_rgb(fig):
     """
@@ -4507,12 +4549,16 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
         has_timeline = bool(timeline and os.path.exists(timeline))
         if has_timeline:
             figs['LCS Timeline'] = timeline
+        resilience_log = res.get('resilience_log')
+        has_resilience_log = bool(resilience_log and os.path.exists(resilience_log))
+        if has_resilience_log:
+            figs['Resilience Tracebacks'] = resilience_log
         history = res.get('history') or []
         best_fit = max((b for b, _a in history), default=None)
         final_best = history[-1][0] if history else None
         final_avg = history[-1][1] if history else None
         initial_best = history[0][0] if history else None
-        report_meta['supervised'] = {'task': args.task, 'gens': args.gens, 'pop': args.pop, 'steps': args.steps, 'best_fit': best_fit, 'final_best': final_best, 'final_avg': final_avg, 'initial_best': initial_best, 'has_lineage': has_lineage, 'has_regen_log': has_regen_log, 'has_lcs_viz': bool(has_ribbon or has_timeline), 'has_spiral': has_scars_spiral}
+        report_meta['supervised'] = {'task': args.task, 'gens': args.gens, 'pop': args.pop, 'steps': args.steps, 'best_fit': best_fit, 'final_best': final_best, 'final_avg': final_avg, 'initial_best': initial_best, 'has_lineage': has_lineage, 'has_regen_log': has_regen_log, 'has_lcs_viz': bool(has_ribbon or has_timeline), 'has_spiral': has_scars_spiral, 'has_resilience': has_resilience_log}
 
         # If analysis-only gallery is requested, compose from current run and skip rerun
     if args.gallery and args.gallery_analysis_only and args.task:
@@ -4547,6 +4593,16 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                     os.remove(regen_log_path)
             fit = gym_fitness_factory(args.rl_env, stochastic=args.rl_stochastic, temp=args.rl_temp, max_steps=args.rl_max_steps, episodes=args.rl_episodes)
             best, hist = neat.evolve(fit, n_generations=args.rl_gens, verbose=True, env_schedule=_default_difficulty_schedule)
+            rl_resilience_log = None
+            rl_failures = list(getattr(neat, '_resilience_failures', [])) if hasattr(neat, '_resilience_failures') else []
+            if rl_failures:
+                rl_resilience_log = os.path.join(args.out, f"{args.rl_env.replace(':', '_')}_resilience_log.json")
+                try:
+                    with open(rl_resilience_log, 'w', encoding='utf-8') as fh:
+                        json.dump({'failures': rl_failures, 'eval_guard': getattr(neat, '_resilience_eval_guard', 0), 'history': getattr(neat, '_resilience_history', [])}, fh, indent=2, ensure_ascii=False)
+                except Exception as log_err:
+                    print('[WARN] RL resilience log write failed:', log_err)
+                    rl_resilience_log = None
             close_env = getattr(fit, 'close_env', None)
             if callable(close_env):
                 close_env()
@@ -4565,6 +4621,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             plt.savefig(rc_png, dpi=150)
             plt.close()
             figs['RL 平均エピソード報酬'] = rc_png
+            if rl_resilience_log and os.path.exists(rl_resilience_log):
+                figs['RL Resilience Tracebacks'] = rl_resilience_log
             lcs_rows = load_lcs_log(regen_log_path) if os.path.exists(regen_log_path) else []
             lcs_series = _prepare_lcs_series(lcs_rows) if lcs_rows else None
             if os.path.exists(regen_log_path):
@@ -4594,7 +4652,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             rl_best = max((b for b, _a in hist), default=None)
             rl_final_best = hist[-1][0] if hist else None
             rl_final_avg = hist[-1][1] if hist else None
-            report_meta['rl'] = {'env': args.rl_env, 'gens': args.rl_gens, 'pop': args.rl_pop, 'episodes': args.rl_episodes, 'best_reward': rl_best, 'final_best': rl_final_best, 'final_avg': rl_final_avg, 'has_lcs_log': bool(os.path.exists(regen_log_path)), 'has_lcs_viz': bool(lcs_rows), 'has_gameplay': bool(gif and os.path.exists(gif))}
+            report_meta['rl'] = {'env': args.rl_env, 'gens': args.rl_gens, 'pop': args.rl_pop, 'episodes': args.rl_episodes, 'best_reward': rl_best, 'final_best': rl_final_best, 'final_avg': rl_final_avg, 'has_lcs_log': bool(os.path.exists(regen_log_path)), 'has_lcs_viz': bool(lcs_rows), 'has_gameplay': bool(gif and os.path.exists(gif)), 'has_resilience': bool(rl_resilience_log and os.path.exists(rl_resilience_log))}
         except Exception as e:
             print('[WARN] RL branch skipped:', e)
     if args.report:
@@ -4659,6 +4717,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                         extras.append('lineage')
                     if sup_meta.get('has_spiral'):
                         extras.append('scar map')
+                    if sup_meta.get('has_resilience'):
+                        extras.append('resilience log')
                     extra_txt = f" [{', '.join(extras)}]" if extras else ''
                     summary_items.append(f"<li><strong>Supervised ({htmllib.escape(sup_meta['task'].upper())})</strong> — best {_fmt_float(sup_meta.get('best_fit'))} | final {_fmt_float(sup_meta.get('final_best'))} / avg {_fmt_float(sup_meta.get('final_avg'))}{extra_txt}</li>")
                 rl_meta = report_meta.get('rl')
@@ -4670,6 +4730,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                         extras.append('LCS visuals')
                     if rl_meta.get('has_gameplay'):
                         extras.append('gameplay gif')
+                    if rl_meta.get('has_resilience'):
+                        extras.append('resilience log')
                     extra_txt = f" [{', '.join(extras)}]" if extras else ''
                     summary_items.append(f"<li><strong>RL ({htmllib.escape(rl_meta['env'])})</strong> — best {_fmt_float(rl_meta.get('best_reward'))} | final {_fmt_float(rl_meta.get('final_best'))} / avg {_fmt_float(rl_meta.get('final_avg'))}{extra_txt}</li>")
                 f.write("<section class='summary'><h2>Overview / 概要</h2>")
@@ -4780,6 +4842,16 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     controller.update_for_generation(0, shmem=False)
     fit = SpinorNomologyFitness(controller=controller, get_generation=lambda: neat_inst.generation, steps=40, lr=0.005, l2=0.0001, alpha_nodes=0.001, alpha_edges=0.0005)
     hist = neat_inst.evolve(fit, n_generations=gens, target_fitness=None, verbose=True, env_schedule=None)
+    resilience_log = None
+    failures = list(getattr(neat_inst, '_resilience_failures', [])) if hasattr(neat_inst, '_resilience_failures') else []
+    if failures:
+        resilience_log = f'{out_prefix}_resilience_log.json'
+        try:
+            with open(resilience_log, 'w', encoding='utf-8') as fh:
+                json.dump({'failures': failures, 'eval_guard': getattr(neat_inst, '_resilience_eval_guard', 0), 'history': getattr(neat_inst, '_resilience_history', [])}, fh, indent=2, ensure_ascii=False)
+        except Exception as log_err:
+            print('[WARN] Resilience log write failed:', log_err)
+            resilience_log = None
 
     def _load_csv_rows(path: str) -> List[Dict[str, str]]:
         if not os.path.exists(path):
@@ -4954,6 +5026,8 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
                 spinor_transition_gif = None
 
     artifacts: Dict[str, Optional[str]] = {'telemetry_csv': tel.tel_csv, 'regimes_csv': tel.reg_csv, 'phase_png': fig1, 'parity_png': fig2, 'regimes_png': fig3}
+    if resilience_log:
+        artifacts['resilience_log'] = resilience_log
     if spinor_grid_png:
         artifacts['spinor_transition_grid'] = spinor_grid_png
     if spinor_transition_gif:
