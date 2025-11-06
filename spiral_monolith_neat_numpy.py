@@ -18,6 +18,7 @@ from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
 from collections import deque, defaultdict, OrderedDict
 import math, argparse, os, mimetypes, csv
 import sys
+import time
 import matplotlib
 import warnings
 import pickle as _pickle
@@ -4404,8 +4405,44 @@ def export_interactive_html_report(path: str, title: str, history, genomes, *, m
         f.write(html)
     print('[REPORT]', path)
 
+def _run_default_fractal_demo() -> int:
+    """Execute the fractal spinor showcase with polished logging and layout."""
+    _ensure_matplotlib_agg(force=True)
+    root = os.environ.get('SPINOR_DEFAULT_ROOT', os.path.join('out', 'fractal_default'))
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    out_prefix = os.path.join(root, timestamp, 'spinor_demo')
+    out_dir = os.path.dirname(out_prefix) or '.'
+    os.makedirs(out_dir, exist_ok=True)
+    print('[INFO] No CLI arguments supplied; running default fractal spinor environment demo.')
+    print(f'[INFO] Artifacts will be stored under: {out_dir}')
+    try:
+        artifacts = run_spinor_monolith(out_prefix=out_prefix)
+    except Exception as exc:
+        print('[ERROR] Fractal spinor environment demo failed.', file=sys.stderr)
+        traceback.print_exc()
+        return 1
+    if not artifacts:
+        print('[WARN] Demo completed but did not report any artifacts.')
+        return 0
+    key_width = max(len(k) for k in artifacts)
+    print('[OK] Fractal spinor environment demo completed. Generated artifacts:')
+    for key in sorted(artifacts):
+        print(f'  - {key.ljust(key_width)} : {artifacts[key]}')
+    summary_path = os.path.join(out_dir, 'artifact_manifest.json')
+    try:
+        with open(summary_path, 'w', encoding='utf-8') as fh:
+            json.dump(artifacts, fh, indent=2, ensure_ascii=False)
+        print(f'[INFO] Artifact manifest saved to {summary_path}')
+    except Exception:
+        print('[WARN] Unable to persist artifact manifest to disk.')
+    return 0
+
+
 def main(argv: Optional[Iterable[str]]=None) -> int:
     """Command-line interface entrypoint."""
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if not argv_list:
+        return _run_default_fractal_demo()
     _ensure_matplotlib_agg(force=True)
     ap = argparse.ArgumentParser(description='Spiral-NEAT NumPy | built-in CLI')
     ap.add_argument('--task', choices=['xor', 'circles', 'spiral'])
@@ -4427,7 +4464,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--gallery', nargs='*', default=[])
     ap.add_argument('--gallery-analysis-only', action='store_true', help='compose gallery from current run without rerun')
     ap.add_argument('--report', action='store_true')
-    args = ap.parse_args(None if argv is None else list(argv))
+    args = ap.parse_args(argv_list)
     script_name = os.path.basename(__file__) if '__file__' in globals() else 'spiral_monolith_neat_numpy.py'
     os.makedirs(args.out, exist_ok=True)
     figs: Dict[str, Optional[str]] = {}
