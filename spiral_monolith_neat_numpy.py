@@ -2483,7 +2483,18 @@ def loss_and_output_delta(comp, Z, y, l2, w):
     else:
         logits = Z[:, out_idx]
         probs = _softmax(logits)
-        y_one = np.eye(len(out_idx), dtype=np.float64)[y] if y.ndim == 1 else y.astype(np.float64)
+        if y.ndim == 1:
+            y_idx = np.asarray(y)
+            if not np.issubdtype(y_idx.dtype, np.integer):
+                y_idx = np.rint(y_idx).astype(np.int64, copy=False)
+            else:
+                y_idx = y_idx.astype(np.int64, copy=False)
+            if y_idx.size:
+                np.clip(y_idx, 0, len(out_idx) - 1, out=y_idx)
+            y_one = np.zeros((B, len(out_idx)), dtype=np.float64)
+            y_one[np.arange(B, dtype=np.int64), y_idx] = 1.0
+        else:
+            y_one = y.astype(np.float64)
         loss = -(y_one * np.log(probs + 1e-09)).sum(axis=1).mean()
         delta_out = probs - y_one
     loss = float(loss + 0.5 * l2 * np.sum(w * w))
