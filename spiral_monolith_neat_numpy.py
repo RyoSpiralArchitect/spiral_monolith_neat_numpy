@@ -27,6 +27,7 @@ import traceback
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
+from matplotlib import font_manager as _font_manager
 import csv
 import json
 import math
@@ -134,6 +135,66 @@ def _ensure_matplotlib_agg(force: bool=False):
     except TypeError:
         matplotlib.use('Agg')
     return matplotlib
+
+
+def _install_cjk_font() -> Optional['matplotlib.font_manager.FontProperties']:
+    """Try to locate a system font that can render Japanese glyphs."""
+    candidates = [
+        'Hiragino Sans',
+        'Hiragino Kaku Gothic ProN',
+        'Yu Gothic',
+        'YuGothic',
+        'Meiryo',
+        'MS Gothic',
+        'MS Mincho',
+        'Noto Sans CJK JP',
+        'Source Han Sans JP',
+        'Source Han Sans HW',
+        'IPAPGothic',
+        'IPAexGothic',
+        'TakaoGothic',
+        'AppleGothic',
+    ]
+    for family in candidates:
+        try:
+            prop = _font_manager.FontProperties(family=family)
+            _font_manager.findfont(prop, fontext='ttf', fallback_to_default=False)
+        except Exception:
+            continue
+        matplotlib.rcParams['font.family'] = [family]
+        plt.rcParams['font.family'] = [family]
+        matplotlib.rcParams['axes.unicode_minus'] = False
+        plt.rcParams['axes.unicode_minus'] = False
+        return prop
+    try:
+        for path in _font_manager.findSystemFonts(fontext='ttf'):
+            try:
+                prop = _font_manager.FontProperties(fname=path)
+                name = prop.get_name()
+            except Exception:
+                continue
+            if any(tag in name for tag in ('Gothic', 'Mincho', 'Hiragino', 'Yu', 'Meiryo', 'Noto', 'Source Han', 'IPA')):
+                try:
+                    _font_manager.fontManager.addfont(path)
+                except Exception:
+                    pass
+                matplotlib.rcParams['font.family'] = [name]
+                plt.rcParams['font.family'] = [name]
+                matplotlib.rcParams['axes.unicode_minus'] = False
+                plt.rcParams['axes.unicode_minus'] = False
+                return prop
+    except Exception:
+        pass
+    warnings.filterwarnings(
+        'ignore',
+        message='Glyph .* missing from font',
+        category=UserWarning,
+        module='matplotlib'
+    )
+    return None
+
+
+_CJK_FONT_PROP = _install_cjk_font()
 
 def _mimsave(path, frames, fps=12):
     """Robust GIF writer that tolerates missing imageio by falling back to Pillow."""
@@ -4582,7 +4643,13 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             figs[f'ギャラリー {k}'] = v
         args.gallery = []
     if args.gallery:
-        gal = export_task_gallery(tasks=tuple(args.gallery), gens=max(6, args.gens // 2), pop=max(12, args.pop // 2), steps=max(10, args.steps // 2), out_dir=os.path.join(args.out, 'gallery'))
+        gal = export_task_gallery(
+            tasks=tuple(args.gallery),
+            gens=max(6, args.gens),
+            pop=max(12, args.pop),
+            steps=max(10, args.steps),
+            out_dir=os.path.join(args.out, 'gallery'),
+        )
         for k, v in gal.items():
             figs[f'ギャラリー {k}'] = v
     if args.rl_env:
