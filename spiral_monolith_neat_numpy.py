@@ -3388,7 +3388,8 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         Xva, yva = make_circles(256, r=0.6, noise=0.05, seed=1)
     rng = np.random.default_rng(rng_seed)
     out_dim = 2
-    neat = sys.modules[__name__]
+    neat_module = sys.modules[__name__]
+    neat = neat_module.ReproPlanaNEATPlus(num_inputs=Xtr.shape[1], num_outputs=out_dim, population_size=pop, output_activation='identity', rng=rng)
     _apply_stable_neat_defaults(neat)
     regen_log_path = f'{out_prefix}_regen_log.csv'
     if hasattr(neat, 'lcs_monitor') and neat.lcs_monitor is not None:
@@ -4114,7 +4115,8 @@ def setup_neat_for_env(env_id: str, population: int=48, output_activation: str='
     env = gym.make(env_id)
     obs_dim = obs_dim_from_space(env.observation_space)
     out_dim = output_dim_from_space(env.action_space)
-    neat = sys.modules[__name__]
+    neat_module = sys.modules[__name__]
+    neat = neat_module.ReproPlanaNEATPlus(num_inputs=obs_dim, num_outputs=out_dim, population_size=population, output_activation=output_activation, rng=np.random.default_rng())
     _apply_stable_neat_defaults(neat)
     return (neat, env)
 
@@ -4584,7 +4586,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                     env_probe.close()
                 except Exception:
                     pass
-            neat = sys.modules[__name__]
+            neat_module = sys.modules[__name__]
+            neat = neat_module.ReproPlanaNEATPlus(num_inputs=obs_dim, num_outputs=out_dim, population_size=args.rl_pop, output_activation='identity', rng=np.random.default_rng(args.seed))
             _apply_stable_neat_defaults(neat)
             regen_log_path = os.path.join(args.out, f"{args.rl_env.replace(':', '_')}_regen_log.csv")
             if hasattr(neat, 'lcs_monitor') and neat.lcs_monitor is not None:
