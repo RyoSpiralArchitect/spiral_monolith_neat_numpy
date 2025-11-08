@@ -425,6 +425,7 @@ class Genome:
         g.origin_mode = getattr(self, 'origin_mode', 'initial')
         g.max_hidden_nodes = self.max_hidden_nodes
         g.max_edges = self.max_edges
+        g._compat_cache = None
         return g
 
     def invalidate_caches(self, structure: bool=False, weights: bool=False):
@@ -761,6 +762,7 @@ class Genome:
             w = float(rng.uniform(-2.0, 2.0))
             inn = innov.get_conn_innovation(in_id, out_id)
             self.connections[inn] = ConnectionGene(in_id, out_id, w, True, inn)
+            self._invalidate_cache()
             return True
         return False
 
@@ -1470,6 +1472,8 @@ def platyregenerate(genome: Genome, rng: np.random.Generator, innov: InnovationT
     except Exception:
         pass
     _connectivity_guard(g, innov, rng, min_frac=getattr(genome, 'min_conn_after_regen', 0.65), eps=eps)
+    if hasattr(g, '_invalidate_cache'):
+        g._invalidate_cache()
     return g
 
 @dataclass
