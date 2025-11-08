@@ -4,7 +4,6 @@
 # - "Part 1" NEAT (with optional planarian-like regeneration) + "Part 2" Backprop NEAT.
 # - Clean, single-file design for reproducible demos and paper-ready figures.
 #
-# Additions in this build:
 #   * Auto-export of regen/morph GIFs from evolution snapshots
 #   * Learning curve with moving average + rolling-std "CI" (line styles only)
 #   * Decision boundaries for Circles/XOR/Spiral as separate PNGs
@@ -2396,6 +2395,9 @@ class ReproPlanaNEATPlus:
         self._resilience_failures = deque(maxlen=16)
         self._resilience_eval_guard = 0
         self._resilience_history = []
+        self.diversity_history: List[Dict[str, float]] = []
+        self.diversity_history_limit = 4096
+        self._diversity_snapshot: Dict[str, Any] = {}
         self.refine_topk_ratio = float(os.environ.get('NEAT_REFINE_TOPK_RATIO', '0.08'))
         nodes = {}
         for i in range(num_inputs):
@@ -3803,8 +3805,56 @@ class ReproPlanaNEATPlus:
                             max_complexity_score = float(score)
                     except Exception:
                         pass
-                div_bonus_scale = float(getattr(self, 'structure_diversity_bonus', 0.0))
-                div_power = float(getattr(self, 'structure_diversity_power', 1.0))
+                base_div_bonus = float(getattr(self, 'structure_diversity_bonus', 0.0))
+                base_div_power = float(getattr(self, 'structure_diversity_power', 1.0))
+                diversity_counts = np.asarray(list(signature_counts.values()), dtype=np.float64) if signature_counts else np.zeros(0, dtype=np.float64)
+                if diversity_counts.size:
+                    freq = diversity_counts / max(1.0, diversity_counts.sum())
+                    raw_entropy = float(-(freq * np.log(freq + 1e-12)).sum())
+                    max_entropy = float(np.log(max(1.0, diversity_counts.size)))
+                    diversity_entropy = raw_entropy / max(max_entropy, 1e-12) if max_entropy > 0 else 0.0
+                else:
+                    diversity_entropy = 0.0
+                diversity_entropy = float(np.clip(diversity_entropy, 0.0, 1.0))
+                diversity_scarcity = float(np.clip(1.0 - diversity_entropy, 0.0, 1.0))
+                complexity_arr = np.asarray(complexity_scores, dtype=np.float64) if complexity_scores else np.zeros(0, dtype=np.float64)
+                complexity_mean = float(complexity_arr.mean()) if complexity_arr.size else 0.0
+                complexity_std = float(complexity_arr.std()) if complexity_arr.size else 0.0
+                structural_spread = float(complexity_std / (abs(complexity_mean) + 1e-9)) if complexity_mean else 0.0
+                env_noise = float(self.env.get('noise_std', 0.0))
+                env_focus = float(self.env.get('noise_focus', 0.0) or 0.0)
+                env_entropy = float(self.env.get('noise_entropy', 0.0) or 0.0)
+                lazy_payload = getattr(self, '_lazy_env_feedback', {}) or {}
+                lazy_share = float(lazy_payload.get('share', 0.0)) if isinstance(lazy_payload, dict) else 0.0
+                adaptive_multiplier = 1.0 + 0.65 * diversity_scarcity + 0.25 * env_noise + 0.18 * env_focus + 0.35 * structural_spread
+                adaptive_multiplier = float(np.clip(adaptive_multiplier, 0.5, 3.5))
+                div_bonus_scale = float(base_div_bonus * adaptive_multiplier)
+                div_power = float(np.clip(base_div_power * (1.0 + 0.5 * diversity_scarcity), 1.0, 3.5))
+                diversity_snapshot = {
+                    'gen': int(gen),
+                    'entropy': float(diversity_entropy),
+                    'scarcity': float(diversity_scarcity),
+                    'complexity_mean': float(complexity_mean),
+                    'complexity_std': float(complexity_std),
+                    'structural_spread': float(structural_spread),
+                    'diversity_bonus': float(div_bonus_scale),
+                    'diversity_power': float(div_power),
+                    'env_noise': float(env_noise),
+                    'env_focus': float(env_focus),
+                    'env_entropy': float(env_entropy),
+                    'lazy_share': float(lazy_share),
+                    'unique_signatures': int(len(signature_counts) or 0),
+                }
+                self._diversity_snapshot = diversity_snapshot
+                self.diversity_history.append(diversity_snapshot)
+                if len(self.diversity_history) > int(getattr(self, 'diversity_history_limit', 4096)):
+                    self.diversity_history = self.diversity_history[-int(self.diversity_history_limit):]
+                controller = getattr(self, 'spinor_controller', None)
+                if controller is not None and hasattr(controller, 'ingest_diversity_metrics'):
+                    try:
+                        controller.ingest_diversity_metrics(gen, diversity_snapshot)
+                    except Exception:
+                        pass
                 auto_state = None
                 if getattr(self, 'auto_complexity_controls', False):
                     try:
@@ -3951,7 +4001,18 @@ class ReproPlanaNEATPlus:
                         nk = mono.get('noise_kind')
                         if nk:
                             mono_str = f"{mono_str} {nk}"
-                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}")
+                    div_str = ''
+                    div_snap = getattr(self, '_diversity_snapshot', None)
+                    if isinstance(div_snap, dict) and div_snap:
+                        try:
+                            div_str = (
+                                f" | div H{float(div_snap.get('entropy', 0.0)):.2f}"
+                                f" sc{float(div_snap.get('scarcity', 0.0)):.2f}"
+                                f" κ{float(div_snap.get('structural_spread', 0.0)):.2f}"
+                            )
+                        except Exception:
+                            div_str = ''
+                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}{div_str}")
                 if context_best > best_ever_fit:
                     best_ever_fit = context_best
                     best_ever = self.population[best_idx].copy()
@@ -4067,6 +4128,22 @@ def compile_genome(g: Genome):
     for e, (s, d) in enumerate(zip(src, dst)):
         in_edges[d].append(e)
         out_edges[s].append(e)
+    if len(edges):
+        in_sort = np.argsort(dst, kind='mergesort')
+        out_sort = np.argsort(src, kind='mergesort')
+        in_edges_flat = in_sort.astype(np.int32, copy=False)
+        out_edges_flat = out_sort.astype(np.int32, copy=False)
+        in_counts = np.bincount(dst[in_sort], minlength=n)
+        out_counts = np.bincount(src[out_sort], minlength=n)
+        in_edges_ptr = np.zeros(n + 1, dtype=np.int32)
+        out_edges_ptr = np.zeros(n + 1, dtype=np.int32)
+        np.cumsum(in_counts, out=in_edges_ptr[1:])
+        np.cumsum(out_counts, out=out_edges_ptr[1:])
+    else:
+        in_edges_flat = np.zeros(0, dtype=np.int32)
+        out_edges_flat = np.zeros(0, dtype=np.int32)
+        in_edges_ptr = np.zeros(n + 1, dtype=np.int32)
+        out_edges_ptr = np.zeros(n + 1, dtype=np.int32)
     compiled = {
         'order': order,
         'idx_of': idx_of,
@@ -4081,6 +4158,10 @@ def compile_genome(g: Genome):
         'eid': eid,
         'in_edges': in_edges,
         'out_edges': out_edges,
+        'in_edges_flat': in_edges_flat,
+        'in_edges_ptr': in_edges_ptr,
+        'out_edges_flat': out_edges_flat,
+        'out_edges_ptr': out_edges_ptr,
         'node_sensitivity': node_sensitivity,
         'node_jitter': node_jitter,
         'node_momentum': node_momentum,
@@ -4109,9 +4190,21 @@ def forward_batch(comp, X, w=None):
     for j in range(n):
         if comp['types'][j] in ('input', 'bias'):
             continue
-        z = np.zeros(B, dtype=np.float64)
-        for e in comp['in_edges'][j]:
-            z += A[:, comp['src'][e]] * w[e]
+        ptr = comp.get('in_edges_ptr')
+        flat = comp.get('in_edges_flat')
+        if ptr is not None and flat is not None and j < len(ptr) - 1:
+            start = int(ptr[j])
+            end = int(ptr[j + 1])
+            if end > start:
+                idx = flat[start:end]
+                src_idx = comp['src'][idx]
+                z = A[:, src_idx] @ w[idx]
+            else:
+                z = np.zeros(B, dtype=np.float64)
+        else:
+            z = np.zeros(B, dtype=np.float64)
+            for e in comp['in_edges'][j]:
+                z += A[:, comp['src'][e]] * w[e]
         Z[:, j] = z
         A[:, j] = act_forward(comp['acts'][j], z)
     return (A, Z)
@@ -4209,19 +4302,40 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
         dz = dz_raw * dest_mix
         delta_z[:, j] = dz
         node_signal[j] += float(_np.mean(_np.abs(dz))) * (1.0 + 0.1 * _np.tanh(dest_var))
-        for e in comp['in_edges'][j]:
-            s = comp['src'][e]
-            src_mom = float(node_momentum[s])
-            src_var = float(node_variance[s])
-            src_scale = float(node_scale[s]) * (1.0 + 0.04 * _np.tanh(src_mom))
-            src_jitter = 1.0 + 0.05 * float(node_jitter[s]) + 0.03 * _np.tanh(src_var)
-            src_mix = src_scale * src_jitter
-            edge_scale = 0.5 * (dest_mix + src_mix)
-            contrib = _np.dot(A[:, s], dz)
-            grad_w[e] += edge_scale * contrib
-            flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom)
-            node_push[s] += float(_np.mean(_np.abs(dz * w[e]))) * edge_scale * flow_bias
-            delta_a[:, s] += dz * w[e] * src_mix
+        ptr = comp.get('in_edges_ptr')
+        flat = comp.get('in_edges_flat')
+        if ptr is not None and flat is not None and j < len(ptr) - 1:
+            start = int(ptr[j])
+            end = int(ptr[j + 1])
+            if end > start:
+                idx = flat[start:end]
+                src_idx = comp['src'][idx]
+                weights_local = w[idx]
+                src_mom = node_momentum[src_idx]
+                src_var = node_variance[src_idx]
+                src_scale = node_scale[src_idx] * (1.0 + 0.04 * _np.tanh(src_mom))
+                src_jitter = 1.0 + 0.05 * node_jitter[src_idx] + 0.03 * _np.tanh(src_var)
+                src_mix = src_scale * src_jitter
+                edge_scale = 0.5 * (dest_mix + src_mix)
+                contrib = A[:, src_idx].T @ dz
+                grad_w[idx] += edge_scale * contrib
+                flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom)
+                node_push[src_idx] += _np.mean(_np.abs(dz[:, None] * weights_local), axis=0) * edge_scale * flow_bias
+                delta_a[:, src_idx] += dz[:, None] * (weights_local * src_mix)
+        else:
+            for e in comp['in_edges'][j]:
+                s = comp['src'][e]
+                src_mom = float(node_momentum[s])
+                src_var = float(node_variance[s])
+                src_scale = float(node_scale[s]) * (1.0 + 0.04 * _np.tanh(src_mom))
+                src_jitter = 1.0 + 0.05 * float(node_jitter[s]) + 0.03 * _np.tanh(src_var)
+                src_mix = src_scale * src_jitter
+                edge_scale = 0.5 * (dest_mix + src_mix)
+                contrib = _np.dot(A[:, s], dz)
+                grad_w[e] += edge_scale * contrib
+                flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom)
+                node_push[s] += float(_np.mean(_np.abs(dz * w[e]))) * edge_scale * flow_bias
+                delta_a[:, s] += dz * w[e] * src_mix
     grad_w = grad_w / max(1, B) + l2 * w
     if not _np.all(_np.isfinite(grad_w)):
         grad_w = _np.nan_to_num(grad_w, nan=0.0, posinf=0.0, neginf=0.0)
@@ -4998,6 +5112,56 @@ def plot_learning_and_complexity(history: List[Tuple[float, float]], hidden_coun
     _savefig(fig, out_path, dpi=200)
     plt.close(fig)
 
+
+def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: str, png_path: str, title: str='Diversity & Environment Trajectory') -> Tuple[Optional[str], Optional[str]]:
+    if not div_history:
+        return (None, None)
+    os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
+    os.makedirs(os.path.dirname(png_path) or '.', exist_ok=True)
+    fields = ['gen', 'entropy', 'scarcity', 'complexity_mean', 'complexity_std', 'structural_spread', 'diversity_bonus', 'diversity_power', 'env_noise', 'env_focus', 'env_entropy', 'lazy_share', 'unique_signatures']
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in div_history:
+            payload = {key: row.get(key, '') for key in fields}
+            writer.writerow(payload)
+    gens = np.array([int(item.get('gen', idx)) for idx, item in enumerate(div_history)], dtype=np.int32)
+    entropy = np.array([float(item.get('entropy', 0.0)) for item in div_history], dtype=np.float64)
+    scarcity = np.array([float(item.get('scarcity', 0.0)) for item in div_history], dtype=np.float64)
+    spread = np.array([float(item.get('structural_spread', 0.0)) for item in div_history], dtype=np.float64)
+    bonus = np.array([float(item.get('diversity_bonus', 0.0)) for item in div_history], dtype=np.float64)
+    env_noise = np.array([float(item.get('env_noise', 0.0)) for item in div_history], dtype=np.float64)
+    env_focus = np.array([float(item.get('env_focus', 0.0)) for item in div_history], dtype=np.float64)
+    env_entropy = np.array([float(item.get('env_entropy', 0.0)) for item in div_history], dtype=np.float64)
+    lazy_share = np.array([float(item.get('lazy_share', 0.0)) for item in div_history], dtype=np.float64)
+    fig, axes = plt.subplots(2, 1, sharex=True, figsize=(7.4, 6.0))
+    ax_top, ax_bottom = axes
+    ax_top.plot(gens, entropy, label='entropy (structural)', color='#1f78b4', linewidth=1.8)
+    ax_top.plot(gens, scarcity, label='scarcity', color='#d62728', linewidth=1.6)
+    ax_top.fill_between(gens, 0.0, scarcity, color='#ff9896', alpha=0.25)
+    ax_top.set_ylabel('entropy / scarcity')
+    ax_top.legend(loc='upper right', frameon=False, fontsize=9)
+    ax_top.grid(True, linestyle='--', alpha=0.2)
+    ax_mid = ax_bottom.twinx()
+    ax_bottom.plot(gens, bonus, label='diversity bonus', color='#2ca02c', linewidth=1.7)
+    ax_bottom.plot(gens, spread, label='structural spread', color='#9467bd', linewidth=1.5, linestyle='--')
+    ax_bottom.plot(gens, lazy_share, label='lazy share', color='#8c564b', linewidth=1.3, linestyle=':')
+    ax_bottom.set_ylabel('bonus / spread / lazy share')
+    ax_bottom.legend(loc='upper left', frameon=False, fontsize=9)
+    ax_bottom.grid(True, linestyle='--', alpha=0.2)
+    ax_mid.plot(gens, env_noise, label='env noise', color='#17becf', linewidth=1.4)
+    ax_mid.plot(gens, env_focus, label='env focus', color='#ff7f0e', linewidth=1.2, linestyle='-.')
+    ax_mid.plot(gens, env_entropy, label='env entropy', color='#7f7f7f', linewidth=1.0, linestyle=':')
+    ax_mid.set_ylabel('environmental metrics')
+    ax_mid.legend(loc='upper right', frameon=False, fontsize=8)
+    ax_bottom.set_xlabel('generation')
+    if title:
+        fig.suptitle(title, fontsize=13)
+    fig.tight_layout(rect=[0, 0.02, 1, 0.98])
+    _savefig(fig, png_path, dpi=220)
+    plt.close(fig)
+    return (csv_path, png_path)
+
 def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, contour_cmap: str='coolwarm', point_cmap: Optional[str]=None, point_size: float=12.0, point_alpha: float=0.85, add_colorbar: bool=False):
     gg = genome.copy()
     try:
@@ -5023,6 +5187,7 @@ def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, c
     fig.tight_layout()
     _savefig(fig, out_path, dpi=220)
     plt.close(fig)
+    return {'figure': out_path, 'history': loss, 'profile': profile}
 
 def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
@@ -5548,8 +5713,22 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
             print(f'[INFO] Top-{idx + 1}: {n_hidden} hidden nodes, {n_edges} edges, fitness={fitness:.4f} (gen {gen})')
     genomes_cyto = []
     if hasattr(neat, 'snapshots_genomes') and neat.snapshots_genomes:
-        for g in neat.snapshots_genomes:
-            genomes_cyto.append(_genome_to_cyto(g))
+        try:
+            window = min(len(neat.snapshots_genomes), 48)
+            genomes_cyto = [_genome_to_cyto(g) for g in neat.snapshots_genomes[-window:]]
+        except Exception:
+            genomes_cyto = []
+    diversity_csv = None
+    diversity_plot = None
+    if getattr(neat, 'diversity_history', None):
+        div_csv = f'{out_prefix}_diversity.csv'
+        div_png = f'{out_prefix}_diversity.png'
+        diversity_csv, diversity_plot = export_diversity_summary(
+            list(getattr(neat, 'diversity_history', [])),
+            div_csv,
+            div_png,
+            title=f'{task.upper()} | Diversity & Environment',
+        )
     resilience_log = None
     failures = list(getattr(neat, '_resilience_failures', [])) if hasattr(neat, '_resilience_failures') else []
     if failures:
@@ -5560,7 +5739,26 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         except Exception as log_err:
             print('[WARN] Resilience log write failed:', log_err)
             resilience_log = None
-    return {'learning_curve': lc_path, 'decision_boundary': db_path, 'topology': topo_path, 'top3_topologies': top3_paths, 'regen_gif': regen_gif, 'morph_gif': morph_gif, 'lineage': lineage_path, 'scars_spiral': scars_spiral, 'summary_decisions': summary_paths, 'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None, 'lcs_ribbon': lcs_ribbon, 'lcs_timeline': lcs_timeline, 'history': hist, 'genomes_cyto': genomes_cyto, 'resilience_log': resilience_log, 'backprop_variation': backprop_variation}
+    return {
+        'learning_curve': lc_path,
+        'decision_boundary': db_path,
+        'topology': topo_path,
+        'top3_topologies': top3_paths,
+        'regen_gif': regen_gif,
+        'morph_gif': morph_gif,
+        'lineage': lineage_path,
+        'scars_spiral': scars_spiral,
+        'summary_decisions': summary_paths,
+        'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None,
+        'lcs_ribbon': lcs_ribbon,
+        'lcs_timeline': lcs_timeline,
+        'history': hist,
+        'genomes_cyto': genomes_cyto,
+        'resilience_log': resilience_log,
+        'backprop_variation': backprop_variation,
+        'diversity_csv': diversity_csv,
+        'diversity_plot': diversity_plot,
+    }
 
 def _fig_to_rgb(fig):
     """
@@ -7121,6 +7319,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             bp_variant = res.get('backprop_variation')
             if isinstance(bp_variant, dict):
                 _add_artifact(f'{label_base} | Backprop Variation', bp_variant.get('figure'))
+            _add_artifact(f'{label_base} | Diversity Metrics', res.get('diversity_csv'))
+            _add_artifact(f'{label_base} | Diversity Trajectory', res.get('diversity_plot'))
             summary_decisions = res.get('summary_decisions') or {}
             if isinstance(summary_decisions, dict):
                 for variant_name, variant_path in summary_decisions.items():
@@ -7144,6 +7344,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                 'has_lcs_viz': bool((ribbon and os.path.exists(ribbon)) or (timeline and os.path.exists(timeline))),
                 'has_spiral': bool(scars_spiral_path and os.path.exists(scars_spiral_path)),
                 'has_resilience': bool(resilience_log and os.path.exists(resilience_log)),
+                'has_diversity': bool(res.get('diversity_plot') and os.path.exists(res.get('diversity_plot'))),
             }
             report_meta['supervised'].append(sup_summary)
     rl_history: List[Tuple[float, float]] = []
@@ -8037,6 +8238,7 @@ class NomologyEnv:
     noise_style_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     _noise_counter: float = field(default=0.0, init=False, repr=False)
     _last_weaver_error: Optional[str] = field(default=None, init=False, repr=False)
+    diversity_signal: Dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._rng = np.random.default_rng(self.seed)
@@ -8079,6 +8281,16 @@ class NomologyEnv:
             'regime_id': int(self.regime_id),
             'drift_scale': float(self.drift_scale),
         }
+
+    def register_diversity(self, snapshot: Dict[str, float]) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        payload = {k: float(v) for k, v in snapshot.items() if isinstance(v, (int, float))}
+        self.diversity_signal = payload
+        scarcity = float(np.clip(payload.get('scarcity', 0.0), 0.0, 1.0))
+        spread = float(np.clip(payload.get('structural_spread', 0.0), 0.0, 4.0))
+        self.intensity = float(np.clip(self.intensity * (0.92 + 0.28 * scarcity), 0.05, 0.8))
+        self.noise_jitter = float(np.clip(self.noise_jitter * (1.0 + 0.2 * spread), 0.001, 0.05))
 
     def _refresh_noise(self, advance: bool=False, surge: bool=False) -> None:
         if advance:
@@ -8199,6 +8411,11 @@ class SelfReproducingEvaluator:
     lazy_feedback_decay: float = 0.25
     _lazy_feedback: Dict[str, Any] = field(
         default_factory=lambda: {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0},
+        init=False,
+        repr=False,
+    )
+    _diversity_feedback: Dict[str, Any] = field(
+        default_factory=lambda: {'scarcity': 0.0, 'entropy': 0.0, 'structural_spread': 0.0},
         init=False,
         repr=False,
     )
@@ -8351,6 +8568,15 @@ class SelfReproducingEvaluator:
         payload.setdefault('generation', prev.get('generation', payload.get('generation', -1)))
         self._lazy_feedback = payload
 
+    def update_diversity(self, metrics: Dict[str, Any]) -> None:
+        if not isinstance(metrics, dict):
+            return
+        snapshot = dict(self._diversity_feedback)
+        for key, val in metrics.items():
+            if isinstance(val, (int, float)):
+                snapshot[key] = float(val)
+        self._diversity_feedback = snapshot
+
     def _record_resilience(self, err: BaseException, generation: int) -> str:
         label = f'{type(err).__name__}@{generation}'
         self.last_resilience = label
@@ -8395,10 +8621,18 @@ class SelfReproducingEvaluator:
         stasis *= decay
         anchor *= decay
         gap *= decay
+        div_state = getattr(self, '_diversity_feedback', {}) or {}
+        scarcity = float(np.clip(div_state.get('scarcity', 0.0), 0.0, 1.0))
+        spread = float(np.clip(div_state.get('structural_spread', 0.0), 0.0, 4.0))
+        entropy = float(np.clip(div_state.get('entropy', 0.0), 0.0, 1.2))
+        share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
         prev_noise = float(getattr(env, 'noise', 0.05))
         prev_turns = float(getattr(env, 'turns', 1.6))
         prev_rot = float(getattr(env, 'rot_bias', 0.0))
         scale_noise, scale_turns, scale_rot = self.output_scale
+        scale_noise *= float(1.0 + 0.35 * scarcity)
+        scale_turns *= float(1.0 + 0.2 * spread)
+        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy))
         mod_out0 = float(out[0] * (1.0 - 0.35 * share) + anchor * 0.35)
         mod_out1 = float(out[1] * (1.0 - 0.3 * share) + (anchor + gap * 0.5) * 0.3)
         mod_out2 = float(out[2] * (1.0 - 0.3 * share) + gap * 0.6)
@@ -8409,6 +8643,7 @@ class SelfReproducingEvaluator:
         anchor_turns = float(np.clip(1.6 + scale_turns * (anchor + gap * 0.25), 0.6, 3.2))
         rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6)
         inertia = float(np.clip(0.25 + 0.5 * share + 0.25 * stasis, 0.0, 0.9))
+        inertia *= float(np.clip(1.0 - 0.4 * scarcity + 0.15 * spread, 0.2, 1.05))
         slip = max(0.0, 1.0 - inertia)
         anchor_mix = slip * 0.5 * stasis
         leader_mix = slip - anchor_mix
@@ -8436,6 +8671,8 @@ class SelfReproducingEvaluator:
         entropy = getattr(env, 'noise_entropy', None)
         if isinstance(entropy, (int, float)) and entropy > 0:
             summary = f'{summary} | entropy {float(entropy):.2f}'
+        if scarcity > 0.0 or spread > 0.0:
+            summary = f'{summary} | div {scarcity:.2f}/{spread:.2f}'
         weave_err = getattr(env, '_last_weaver_error', None)
         if weave_err:
             summary = f'{summary} | weave {str(weave_err).split(':', 1)[0]}'
@@ -8518,6 +8755,26 @@ class Telemetry:
         if not os.path.exists(self.reg_csv):
             with open(self.reg_csv, 'w', newline='') as f:
                 csv.writer(f).writerow(['gen', 'event', 'regime_id', 'build_id'])
+        base, _ext = os.path.splitext(self.tel_csv)
+        self.div_csv = base + '_diversity.csv'
+        if not os.path.exists(self.div_csv):
+            with open(self.div_csv, 'w', newline='') as f:
+                csv.writer(f).writerow([
+                    'gen',
+                    'entropy',
+                    'scarcity',
+                    'complexity_mean',
+                    'complexity_std',
+                    'structural_spread',
+                    'diversity_bonus',
+                    'diversity_power',
+                    'env_noise',
+                    'env_focus',
+                    'env_entropy',
+                    'lazy_share',
+                    'unique_signatures',
+                    'build_id',
+                ])
 
     def log_step(
         self,
@@ -8602,6 +8859,28 @@ class Telemetry:
         with open(self.reg_csv, 'a', newline='') as f:
             csv.writer(f).writerow([gen, 'switch', env.regime_id, _build_stamp_short()])
 
+    def log_diversity(self, gen: int, metrics: Dict[str, float]) -> None:
+        if not isinstance(metrics, dict) or not metrics:
+            return
+        row = [
+            int(gen),
+            float(metrics.get('entropy', float('nan'))),
+            float(metrics.get('scarcity', float('nan'))),
+            float(metrics.get('complexity_mean', float('nan'))),
+            float(metrics.get('complexity_std', float('nan'))),
+            float(metrics.get('structural_spread', float('nan'))),
+            float(metrics.get('diversity_bonus', float('nan'))),
+            float(metrics.get('diversity_power', float('nan'))),
+            float(metrics.get('env_noise', float('nan'))),
+            float(metrics.get('env_focus', float('nan'))),
+            float(metrics.get('env_entropy', float('nan'))),
+            float(metrics.get('lazy_share', float('nan'))),
+            int(metrics.get('unique_signatures', -1)),
+            _build_stamp_short(),
+        ]
+        with open(self.div_csv, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+
 class SpinorNomologyDatasetController:
     """Updates shared datasets each generation. Why: make fitness see non-stationary regime."""
 
@@ -8630,6 +8909,7 @@ class SpinorNomologyDatasetController:
         self.last_bundle: Optional[Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]] = None
         self.lazy_feedback_smoothing = 0.4
         self._lazy_feedback: Dict[str, Any] = {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0}
+        self._diversity_state: Dict[str, Any] = {'generation': -1}
         try:
             self.env.lazy_share = 0.0
             self.env.lazy_anchor = 0.0
@@ -8710,6 +8990,27 @@ class SpinorNomologyDatasetController:
         if self.evaluator is not None:
             try:
                 self.evaluator.update_lazy_feedback(payload)
+            except Exception:
+                pass
+
+    def ingest_diversity_metrics(self, generation: int, metrics: Dict[str, Any]) -> None:
+        if not isinstance(metrics, dict):
+            return
+        snapshot = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
+        snapshot['generation'] = int(generation)
+        self._diversity_state = snapshot
+        try:
+            self.env.register_diversity(snapshot)
+        except Exception:
+            pass
+        if self.evaluator is not None and hasattr(self.evaluator, 'update_diversity'):
+            try:
+                self.evaluator.update_diversity(snapshot)
+            except Exception:
+                pass
+        if self.telemetry is not None and hasattr(self.telemetry, 'log_diversity'):
+            try:
+                self.telemetry.log_diversity(generation, snapshot)
             except Exception:
                 pass
 
