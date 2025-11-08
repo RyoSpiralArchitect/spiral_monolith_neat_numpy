@@ -2490,6 +2490,17 @@ class ReproPlanaNEATPlus:
         for g in self.population:
             self.node_registry[g.id] = {'sex': g.sex, 'regen': g.regen, 'birth_gen': g.birth_gen}
         self._assign_lazy_individuals(self.population)
+        self.monodromy_top_ratio = 0.12
+        self.monodromy_span = 6.0
+        self.monodromy_pressure_base = 0.018
+        self.monodromy_pressure_range = 0.06
+        self.monodromy_penalty_cap = 0.42
+        self.monodromy_phase_step = 0.38196601125
+        self.monodromy_smoothing = 0.4
+        self.monodromy_decay = 0.55
+        self.monodromy_release = 0.35
+        self._monodromy_registry: Dict[int, Dict[str, float]] = {}
+        self._monodromy_snapshot: Dict[str, float] = {'pressure_mean': 0.0, 'pressure_max': 0.0, 'active': 0, 'release': 0}
         self._auto_complexity_bonus_state = {
             'baseline': 0.0,
             'bonus_scale': float(self.complexity_survivor_bonus),
@@ -3422,6 +3433,113 @@ class ReproPlanaNEATPlus:
                 pass
         return improved
 
+    def _apply_monodromy_pressure(
+        self,
+        fitnesses: Sequence[float],
+        baseline: Sequence[float],
+        signature_map: Dict[int, Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]]],
+        generation: int,
+    ) -> List[float]:
+        n = len(fitnesses)
+        if n == 0:
+            self._monodromy_snapshot = {'pressure_mean': 0.0, 'pressure_max': 0.0, 'active': 0, 'release': 0}
+            return list(fitnesses)
+        base = float(getattr(self, 'monodromy_pressure_base', 0.0))
+        rng = float(getattr(self, 'monodromy_pressure_range', 0.0))
+        if base <= 0.0 and rng <= 0.0:
+            self._monodromy_snapshot = {'pressure_mean': 0.0, 'pressure_max': 0.0, 'active': 0, 'release': 0}
+            return list(fitnesses)
+        try:
+            top_ratio = float(getattr(self, 'monodromy_top_ratio', 0.1))
+        except Exception:
+            top_ratio = 0.1
+        top_k = max(1, min(n, int(round(top_ratio * n))))
+        order = list(np.argsort(baseline)[::-1])
+        top_indices = order[:top_k]
+        if not top_indices:
+            self._monodromy_snapshot = {'pressure_mean': 0.0, 'pressure_max': 0.0, 'active': 0, 'release': 0}
+            return list(fitnesses)
+        median = float(np.median(baseline)) if baseline else 0.0
+        best_val = float(baseline[order[0]]) if order else median
+        span_scale = abs(best_val - median)
+        if not math.isfinite(span_scale) or span_scale < 1e-6:
+            span_scale = max(1e-6, abs(best_val))
+        phase_step = float(getattr(self, 'monodromy_phase_step', 0.38196601125))
+        smoothing = float(np.clip(getattr(self, 'monodromy_smoothing', 0.4), 0.0, 1.0))
+        span = float(max(1.0, getattr(self, 'monodromy_span', 4.0)))
+        decay = float(np.clip(getattr(self, 'monodromy_decay', 0.5), 0.0, 1.0))
+        release = float(np.clip(getattr(self, 'monodromy_release', 0.35), 0.0, 1.0))
+        cap = float(max(0.0, getattr(self, 'monodromy_penalty_cap', 1.0)))
+        registry = getattr(self, '_monodromy_registry', None)
+        if registry is None:
+            registry = {}
+            self._monodromy_registry = registry
+        adjusted = list(fitnesses)
+        seen: Set[int] = set()
+        total_penalty = 0.0
+        max_penalty = 0.0
+        release_count = 0
+        for idx in top_indices:
+            if idx < 0 or idx >= n:
+                continue
+            genome = self.population[idx]
+            gid = genome.id
+            state = registry.get(gid)
+            sig = signature_map.get(gid)
+            if state is None:
+                phase = float(self.rng.random())
+                state = {'phase': phase, 'stasis': 0.0, 'signature': sig, 'pressure': 0.0}
+            phase = (float(state.get('phase', 0.0)) + phase_step) % 1.0
+            state['phase'] = phase
+            prev_sig = state.get('signature')
+            if sig is not None and prev_sig is not None and sig != prev_sig:
+                state['stasis'] = float(state.get('stasis', 0.0)) * release
+                state['signature'] = sig
+                release_count += 1
+            elif sig is not None and prev_sig is None:
+                state['signature'] = sig
+                state['stasis'] = float(state.get('stasis', 0.0)) + 1.0
+            else:
+                state['stasis'] = float(state.get('stasis', 0.0)) + 1.0
+            envelope = min(1.0, float(state['stasis']) / span)
+            osc = 0.5 - 0.5 * math.cos(2.0 * math.pi * phase)
+            target = (base + rng * osc) * envelope
+            pressure_prev = float(state.get('pressure', 0.0))
+            pressure = pressure_prev * (1.0 - smoothing) + target * smoothing
+            state['pressure'] = pressure
+            penalty = min(cap * span_scale, pressure * span_scale)
+            if penalty > 0.0 and math.isfinite(penalty):
+                adjusted[idx] = float(adjusted[idx] - penalty)
+                total_penalty += penalty
+                if penalty > max_penalty:
+                    max_penalty = penalty
+                state['last_penalty'] = penalty
+            state['last_seen'] = int(generation)
+            registry[gid] = state
+            seen.add(gid)
+        if registry:
+            to_remove = []
+            for gid, state in list(registry.items()):
+                if gid in seen:
+                    continue
+                state['stasis'] = float(state.get('stasis', 0.0)) * decay
+                state['pressure'] = float(state.get('pressure', 0.0)) * decay
+                if state.get('stasis', 0.0) < 0.05:
+                    to_remove.append(gid)
+                else:
+                    registry[gid] = state
+            for gid in to_remove:
+                registry.pop(gid, None)
+        active = len(seen)
+        mean_penalty = float(total_penalty / max(1, active)) if active else 0.0
+        self._monodromy_snapshot = {
+            'pressure_mean': mean_penalty,
+            'pressure_max': float(max_penalty),
+            'active': int(active),
+            'release': int(release_count),
+        }
+        return adjusted
+
     def evolve(self, fitness_fn: Callable[[Genome], float], n_generations=100, target_fitness=None, verbose=True, env_schedule=None):
         history = []
         best_ever = None
@@ -3550,14 +3668,22 @@ class ReproPlanaNEATPlus:
                     if not np.isfinite(f2):
                         f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
                     fitnesses.append(f2)
+                baseline_fitnesses = list(fitnesses)
                 try:
                     fitnesses = self._adaptive_refine_fitness(fitnesses, fitness_fn)
                 except Exception:
                     pass
+                try:
+                    fitnesses = self._apply_monodromy_pressure(fitnesses, baseline_fitnesses, signature_map, gen)
+                except Exception as _mono_err:
+                    if getattr(self, 'debug_monodromy', False):
+                        print('[WARN] monodromy pressure skipped:', _mono_err)
                 best_idx = int(np.argmax(fitnesses))
                 best_fit = float(fitnesses[best_idx])
                 avg_fit = float(np.mean(fitnesses))
-                self.raw_best_history.append((best_fit, avg_fit))
+                raw_best = float(np.max(baseline_fitnesses)) if baseline_fitnesses else best_fit
+                raw_avg = float(np.mean(baseline_fitnesses)) if baseline_fitnesses else avg_fit
+                self.raw_best_history.append((raw_best, raw_avg))
                 self._update_lazy_feedback(gen, fitnesses, best_idx, best_fit, avg_fit)
                 context_best = self._contextual_best_axis(best_fit, avg_fit)
                 history.append((context_best, avg_fit))
@@ -3620,7 +3746,11 @@ class ReproPlanaNEATPlus:
                     if len(top3_best) >= 3:
                         complexities = [(sum((1 for n in g.nodes.values() if n.type == 'hidden')), sum((1 for c in g.connections.values() if c.enabled))) for g, _, _ in top3_best]
                         top3_str = f' | top3: [{complexities[0][0]}n,{complexities[0][1]}e] [{complexities[1][0]}n,{complexities[1][1]}e] [{complexities[2][0]}n,{complexities[2][1]}e]'
-                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}")
+                    mono = getattr(self, '_monodromy_snapshot', None)
+                    mono_str = ''
+                    if mono and mono.get('active'):
+                        mono_str = f" | mono {mono.get('pressure_mean', 0.0):.3f}/{mono.get('pressure_max', 0.0):.3f}~{int(mono.get('release', 0))}"
+                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}")
                 if context_best > best_ever_fit:
                     best_ever_fit = context_best
                     best_ever = self.population[best_idx].copy()
