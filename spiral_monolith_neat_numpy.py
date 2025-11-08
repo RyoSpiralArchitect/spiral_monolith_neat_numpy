@@ -5128,6 +5128,110 @@ def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50
     plt.close(fig)
     return {'figure': out_path, 'history': loss, 'profile': profile}
 
+def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    gg = genome.copy()
+    profile: Dict[str, Any] = {}
+    history = train_with_backprop_numpy(gg, X, y, steps=steps, lr=lr, l2=l2, profile_out=profile)
+    loss = np.asarray(history, dtype=np.float64)
+    step_profiles = np.asarray(
+        profile.get('step_profiles', np.zeros((0, len(profile.get('node_order', []))), dtype=np.float64)),
+        dtype=np.float64,
+    )
+    if step_profiles.ndim != 2 or step_profiles.shape[0] == 0:
+        step_profiles = None
+    node_order = profile.get('node_order', [])
+    node_types = profile.get('node_types', [])
+    labels = []
+    for nid, t in zip(node_order, node_types):
+        prefix = (t[0].upper() + ':') if t else 'N:'
+        labels.append(f'{prefix}{nid}')
+    initial_sens = np.asarray(profile.get('initial_sensitivity', []), dtype=np.float64)
+    final_sens = np.asarray(profile.get('final_sensitivity', []), dtype=np.float64)
+    final_momentum = np.asarray(profile.get('final_momentum', []), dtype=np.float64)
+    final_variance = np.asarray(profile.get('final_variance', []), dtype=np.float64)
+    final_jitter = np.asarray(profile.get('final_jitter', []), dtype=np.float64)
+    idx_pool = [i for i, t in enumerate(node_types) if t == 'hidden']
+    if not idx_pool:
+        idx_pool = list(range(len(labels)))
+    delta = final_sens - initial_sens if initial_sens.size and final_sens.size else np.zeros(len(labels), dtype=np.float64)
+    order_idx = sorted(idx_pool, key=lambda i: abs(delta[i]) if i < delta.size else 0.0, reverse=True)
+    if len(order_idx) > 10:
+        order_idx = order_idx[:10]
+    scatter_idx = sorted(idx_pool, key=lambda i: (final_variance[i] if i < final_variance.size else 0.0) + 0.25 * abs(final_momentum[i] if i < final_momentum.size else 0.0), reverse=True)
+    if len(scatter_idx) > 12:
+        scatter_idx = scatter_idx[:12]
+    fig = plt.figure(figsize=(10.5, 6.2))
+    gs = _gridspec.GridSpec(2, 2, height_ratios=[1.7, 1.0], width_ratios=[1.0, 1.0], hspace=0.32, wspace=0.28)
+    ax_top = fig.add_subplot(gs[0, :])
+    steps_axis = np.arange(1, loss.size + 1, dtype=np.float64) if loss.size else np.arange(1, steps + 1, dtype=np.float64)
+    handles = []
+    labels_legend = []
+    if step_profiles is not None:
+        mean_profile = step_profiles.mean(axis=1)
+        std_profile = step_profiles.std(axis=1)
+        mp = mean_profile[:steps_axis.size]
+        sp = std_profile[:steps_axis.size]
+        ax_top.fill_between(steps_axis[:mp.size], mp - sp[:mp.size], mp + sp[:mp.size], color='#8ecae6', alpha=0.35, label='pulse ±σ')
+        line_mp, = ax_top.plot(steps_axis[:mp.size], mp, color='#219ebc', lw=2.0, label='pulse mean')
+        handles.append(line_mp)
+        labels_legend.append('pulse mean')
+    if loss.size:
+        ax_loss = ax_top.twinx()
+        line_loss, = ax_loss.plot(steps_axis[:loss.size], loss, color='#f07167', lw=1.8, label='loss')
+        ax_loss.set_ylabel('loss', color='#f07167')
+        ax_loss.tick_params(axis='y', colors='#f07167')
+        handles.append(line_loss)
+        labels_legend.append('loss')
+    ax_top.set_xlabel('backprop step')
+    ax_top.set_ylabel('pulse magnitude')
+    ax_top.set_title('Backprop pulse landscape')
+    if handles:
+        ax_top.legend(handles, labels_legend, loc='upper right', frameon=False, fontsize=9)
+    ax_left = fig.add_subplot(gs[1, 0])
+    if order_idx and initial_sens.size and final_sens.size:
+        y_pos = np.arange(len(order_idx))
+        init_vals = initial_sens[order_idx]
+        final_vals = final_sens[order_idx]
+        delta_vals = final_vals - init_vals
+        ax_left.barh(y_pos - 0.18, init_vals, height=0.3, color='#c1d3fe', alpha=0.75, label='initial')
+        ax_left.barh(y_pos + 0.18, final_vals, height=0.3, color='#5e60ce', alpha=0.9, label='post-train')
+        ax_left.axvline(1.0, color='#333333', lw=0.8, ls='--', alpha=0.6)
+        for k, idx in enumerate(order_idx):
+            lbl = labels[idx] if idx < len(labels) else f'n{idx}'
+            ax_left.text(final_vals[k] + 0.04, y_pos[k] + 0.2, f'Δ{delta_vals[k]:+.2f}', fontsize=8, color='#333333')
+        ax_left.set_yticks(y_pos)
+        ax_left.set_yticklabels([labels[idx] if idx < len(labels) else f'n{idx}' for idx in order_idx])
+        ax_left.set_xlabel('sensitivity')
+        ax_left.set_title('Hidden node sensitivity drift')
+        ax_left.legend(frameon=False, fontsize=8, loc='lower right')
+    else:
+        ax_left.text(0.5, 0.5, 'No hidden nodes tracked', ha='center', va='center', fontsize=10)
+        ax_left.set_axis_off()
+    ax_right = fig.add_subplot(gs[1, 1])
+    if scatter_idx and final_momentum.size and final_variance.size:
+        mom_vals = final_momentum[scatter_idx]
+        var_vals = final_variance[scatter_idx]
+        jit_vals = final_jitter[scatter_idx] if final_jitter.size else np.zeros_like(mom_vals)
+        sc = ax_right.scatter(mom_vals, var_vals, c=jit_vals, cmap='coolwarm', s=60, edgecolors='k', linewidths=0.35)
+        for k, idx in enumerate(scatter_idx):
+            lbl = labels[idx] if idx < len(labels) else f'n{idx}'
+            ax_right.text(mom_vals[k] + 0.02, var_vals[k] + 0.02, lbl, fontsize=8)
+        ax_right.set_xlabel('momentum (smoothed)')
+        ax_right.set_ylabel('variance trace')
+        ax_right.set_title('Post-train temperament field')
+        if len(scatter_idx) >= 3:
+            cb = fig.colorbar(sc, ax=ax_right, fraction=0.046, pad=0.04)
+            cb.set_label('jitter', fontsize=9)
+    else:
+        ax_right.text(0.5, 0.5, 'No temperament statistics', ha='center', va='center', fontsize=10)
+        ax_right.set_axis_off()
+    fig.suptitle(f'Backprop Variation | steps={steps}', fontsize=12)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    _savefig(fig, out_path, dpi=220)
+    plt.close(fig)
+    return {'figure': out_path, 'history': loss, 'profile': profile}
+
 def export_decision_boundaries_all(genome: Genome, out_dir: str, steps: int=50, seed: int=0):
     os.makedirs(out_dir or '.', exist_ok=True)
     Xc, yc = make_circles(512, r=0.6, noise=0.05, seed=seed)
