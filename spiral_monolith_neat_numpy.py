@@ -4,7 +4,6 @@
 # - "Part 1" NEAT (with optional planarian-like regeneration) + "Part 2" Backprop NEAT.
 # - Clean, single-file design for reproducible demos and paper-ready figures.
 #
-# Additions in this build:
 #   * Auto-export of regen/morph GIFs from evolution snapshots
 #   * Learning curve with moving average + rolling-std "CI" (line styles only)
 #   * Decision boundaries for Circles/XOR/Spiral as separate PNGs
@@ -5272,6 +5271,7 @@ def plot_learning_and_complexity(history: List[Tuple[float, float]], hidden_coun
     fig.tight_layout()
     _savefig(fig, out_path, dpi=200)
     plt.close(fig)
+    return (csv_path, png_path)
 
 
 def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: str, png_path: str, title: str='Diversity & Environment Trajectory') -> Tuple[Optional[str], Optional[str]]:
