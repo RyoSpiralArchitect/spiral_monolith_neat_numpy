@@ -1928,6 +1928,8 @@ class ReproPlanaNEATPlus:
         self.structure_diversity_power = 1.2
         self.complexity_survivor_bonus = 0.12
         self.complexity_survivor_exponent = 1.1
+        self.complexity_survivor_cap = 1.6
+        self.complexity_bonus_baseline_quantile = 0.6
         try:
             cpus = int(os.cpu_count() or 2)
             self.eval_workers = int(os.environ.get('NEAT_EVAL_WORKERS', max(1, cpus - 1)))
@@ -2037,6 +2039,13 @@ class ReproPlanaNEATPlus:
         self.mutation_will_mutation_scale = 0.05
         self.lazy_fraction = 0.02
         self.lazy_individual_fitness = -1.0
+        self.auto_complexity_controls = True
+        self.auto_complexity_bonus_fraction = 0.18
+        self.auto_complexity_smoothing = 0.35
+        self.lazy_complexity_growth_steps = 4
+        self.lazy_complexity_target_scale = 1.18
+        self.lazy_complexity_duplicate_bias = 0.45
+        self.lazy_complexity_min_growth = 0.0
         self.env = {'difficulty': 0.0, 'noise_std': 0.0}
         self.mix_asexual_base = 0.1
         self.mix_asexual_gain = 0.4
@@ -2061,6 +2070,20 @@ class ReproPlanaNEATPlus:
         for g in self.population:
             self.node_registry[g.id] = {'sex': g.sex, 'regen': g.regen, 'birth_gen': g.birth_gen}
         self._assign_lazy_individuals(self.population)
+        self._auto_complexity_bonus_state = {
+            'baseline': 0.0,
+            'bonus_scale': float(self.complexity_survivor_bonus),
+            'exponent': float(self.complexity_survivor_exponent),
+            'cap': float(self.complexity_survivor_cap),
+            'baseline_quantile': float(self.complexity_bonus_baseline_quantile),
+            'penalty_multiplier': 1.0,
+            'penalty_threshold': float(self.complexity_threshold or 0.0) if self.complexity_threshold is not None else None,
+            'bonus_multiplier': float(getattr(self, 'complexity_bonus_multiplier', -0.1)),
+            'bonus_threshold': float(getattr(self, 'complexity_bonus_threshold', 2.5)),
+            'lazy_target': 0.0,
+            'spread': 0.0,
+        }
+        self._lazy_fraction_carry = 0.0
 
     def _heterosis_scale(self, mother: Genome, father: Genome) -> float:
         d = compatibility_distance(mother, father, self.c1, self.c2, self.c3)
@@ -2520,15 +2543,143 @@ class ReproPlanaNEATPlus:
             g.cooperative = True
         if frac <= 0.0:
             return
-        lazy_count = int(round(frac * len(population)))
-        if lazy_count <= 0 and frac > 0.0:
+        target = float(frac) * float(len(population))
+        carry = float(getattr(self, '_lazy_fraction_carry', 0.0))
+        desired = target + carry
+        lazy_count = int(math.floor(desired + 1e-09))
+        remainder = desired - lazy_count
+        if desired > 0.0 and lazy_count <= 0:
             lazy_count = 1
-        lazy_count = min(lazy_count, len(population))
+            remainder = max(0.0, desired - lazy_count)
+        lazy_count = min(int(lazy_count), len(population))
         if lazy_count <= 0:
+            self._lazy_fraction_carry = remainder
             return
+        self._lazy_fraction_carry = remainder
         indices = self.rng.choice(len(population), size=lazy_count, replace=False)
         for idx in np.atleast_1d(indices):
-            population[int(idx)].cooperative = False
+            g = population[int(idx)]
+            g.cooperative = False
+            setattr(g, 'lazy_lineage', True)
+            try:
+                self._promote_lazy_complexity(g)
+            except Exception:
+                pass
+
+    def _promote_lazy_complexity(self, genome: Genome):
+        steps = int(max(0, getattr(self, 'lazy_complexity_growth_steps', 0)))
+        if steps <= 0:
+            return
+        target_scale = float(getattr(self, 'lazy_complexity_target_scale', 1.1))
+        min_growth = float(getattr(self, 'lazy_complexity_min_growth', 0.0))
+        auto_state = getattr(self, '_auto_complexity_bonus_state', None)
+        baseline = 0.0
+        spread = 0.0
+        if auto_state:
+            baseline = float(auto_state.get('baseline', 0.0) or 0.0)
+            spread = float(auto_state.get('spread', 0.0) or 0.0)
+        target_score = max(0.0, baseline * target_scale + min_growth)
+        if spread > 0.0:
+            target_score = max(target_score, baseline + spread * target_scale)
+        lazy_target = float(auto_state.get('lazy_target', 0.0)) if auto_state else 0.0
+        if lazy_target > 0.0:
+            target_score = max(target_score, lazy_target)
+        duplicate_bias = float(getattr(self, 'lazy_complexity_duplicate_bias', 0.4))
+        for _ in range(steps):
+            current = float(genome.structural_complexity_score())
+            if current >= target_score:
+                break
+            roll = float(self.rng.random())
+            try:
+                if roll < 0.45:
+                    genome.mutate_add_node(self.rng, self.innov)
+                elif roll < 0.9:
+                    genome.mutate_add_connection(self.rng, self.innov)
+                else:
+                    genome.mutate_weights(self.rng)
+            except Exception:
+                pass
+            if duplicate_bias > 0.0 and float(self.rng.random()) < duplicate_bias:
+                try:
+                    scale = float(getattr(self, 'duplicate_branch_weight_scale', 0.85))
+                except Exception:
+                    scale = 0.85
+                try:
+                    genome.mutate_duplicate_node(self.rng, self.innov, weight_scale=scale)
+                except Exception:
+                    pass
+        try:
+            genome.cooperative = False
+        except Exception:
+            pass
+
+    def _auto_tune_complexity_controls(self, scores: List[float], max_score: float) -> Optional[Dict[str, float]]:
+        prev = getattr(self, '_auto_complexity_bonus_state', None)
+        if not scores:
+            return prev
+        arr = np.asarray(scores, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return prev
+        arr.sort()
+        target_frac = float(getattr(self, 'auto_complexity_bonus_fraction', 0.18))
+        target_frac = min(0.45, max(0.02, target_frac))
+        baseline_q = float(np.clip(1.0 - target_frac, 0.55, 0.97))
+        baseline = float(np.quantile(arr, baseline_q))
+        median = float(np.quantile(arr, 0.5))
+        q90 = float(np.quantile(arr, min(0.95, baseline_q + 0.18)))
+        peak = float(max(float(max_score or 0.0), float(arr[-1])))
+        spread = float(max(1e-09, q90 - median))
+        intensity = float(min(1.0, spread / max(1e-09, baseline + median + 1e-09)))
+        bonus_scale = float(np.clip(0.05 + 0.55 * intensity, 0.03, 0.85))
+        exponent = float(np.clip(1.0 + 0.8 * intensity, 1.0, 1.8))
+        cap_ratio = 0.0
+        if peak > baseline:
+            cap_ratio = float((peak - baseline) / max(1e-09, peak))
+        cap = float(np.clip(0.8 + 1.4 * cap_ratio, 0.9, 2.2))
+        diff_pressure = float(min(1.0, max(0.0, float(self.env.get('difficulty', 0.0))) / 3.0))
+        release = float(min(1.0, baseline / max(1e-09, peak)))
+        penalty_multiplier = float(np.clip(1.0 - 0.6 * release * (0.4 + 0.6 * diff_pressure), 0.2, 1.1))
+        penalty_threshold = float((baseline + spread) * (1.2 + 0.4 * release))
+        bonus_multiplier = float(-0.04 - 0.12 * release)
+        bonus_threshold = float(1.1 + 1.2 * (1.0 - release))
+        lazy_target = float(baseline + spread * max(1.0, getattr(self, 'lazy_complexity_target_scale', 1.18)))
+        smoothing = float(np.clip(getattr(self, 'auto_complexity_smoothing', 0.35), 0.0, 0.95))
+        new_state = {
+            'baseline': baseline,
+            'bonus_scale': bonus_scale,
+            'exponent': exponent,
+            'cap': cap,
+            'baseline_quantile': baseline_q,
+            'penalty_multiplier': penalty_multiplier,
+            'penalty_threshold': penalty_threshold,
+            'bonus_multiplier': bonus_multiplier,
+            'bonus_threshold': bonus_threshold,
+            'lazy_target': lazy_target,
+            'spread': spread,
+        }
+        if prev:
+            mixed = {}
+            for key, val in new_state.items():
+                old = prev.get(key)
+                if isinstance(val, float) and np.isfinite(val):
+                    if isinstance(old, float) and np.isfinite(old):
+                        mixed[key] = float(old * smoothing + val * (1.0 - smoothing))
+                    else:
+                        mixed[key] = float(val)
+                else:
+                    mixed[key] = val if val is not None else old
+            new_state = {**prev, **mixed}
+        self._auto_complexity_bonus_state = new_state
+        if getattr(self, 'auto_complexity_controls', False):
+            self.complexity_survivor_bonus = new_state['bonus_scale']
+            self.complexity_survivor_exponent = new_state['exponent']
+            self.complexity_survivor_cap = new_state['cap']
+            self.complexity_bonus_baseline_quantile = new_state['baseline_quantile']
+            self.complexity_bonus_multiplier = new_state['bonus_multiplier']
+            self.complexity_bonus_threshold = new_state['bonus_threshold']
+            self.complexity_threshold = new_state['penalty_threshold']
+        return new_state
 
     def _complexity_penalty(self, g: Genome) -> float:
         """Adaptive complexity penalty that encourages complex topologies under high difficulty."""
@@ -2538,6 +2689,12 @@ class ReproPlanaNEATPlus:
         diff = float(self.env.get('difficulty', 0.0))
         bonus_threshold = getattr(self, 'complexity_bonus_threshold', 2.5)
         bonus_multiplier = getattr(self, 'complexity_bonus_multiplier', -0.1)
+        auto_state = None
+        if getattr(self, 'auto_complexity_controls', False):
+            auto_state = getattr(self, '_auto_complexity_bonus_state', None)
+            if auto_state:
+                bonus_threshold = float(auto_state.get('bonus_threshold', bonus_threshold) or bonus_threshold)
+                bonus_multiplier = float(auto_state.get('bonus_multiplier', bonus_multiplier) or bonus_multiplier)
         if diff < 0.5:
             multiplier = 1.0
         elif diff < 1.5:
@@ -2546,8 +2703,15 @@ class ReproPlanaNEATPlus:
             multiplier = 0.3 - 0.3 * (diff - 1.5) / (bonus_threshold - 1.5)
         else:
             multiplier = bonus_multiplier * (diff - bonus_threshold)
+        if auto_state:
+            mult_adj = float(auto_state.get('penalty_multiplier', 1.0) or 1.0)
+            multiplier *= mult_adj
         penalty = multiplier * m.complexity_alpha * (m.node_penalty * n_hidden + m.edge_penalty * n_edges)
         threshold = getattr(self, 'complexity_threshold', None)
+        if auto_state:
+            auto_thresh = auto_state.get('penalty_threshold')
+            if auto_thresh is not None:
+                threshold = float(auto_thresh)
         if threshold is not None and penalty > 0:
             penalty = min(float(threshold), penalty)
         return penalty
@@ -2739,6 +2903,7 @@ class ReproPlanaNEATPlus:
                 signature_map: Dict[int, Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]]] = {}
                 signature_counts: Dict[Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]], int] = {}
                 complexity_stats: Dict[int, Tuple[int, int, float, float, float]] = {}
+                complexity_scores: List[float] = []
                 max_complexity_score = 0.0
                 for g in self.population:
                     try:
@@ -2749,15 +2914,38 @@ class ReproPlanaNEATPlus:
                         pass
                     try:
                         stats = g.structural_complexity_stats()
+                        score = float(stats[-1])
                         complexity_stats[g.id] = stats
-                        if stats[-1] > max_complexity_score:
-                            max_complexity_score = float(stats[-1])
+                        complexity_scores.append(score)
+                        if score > max_complexity_score:
+                            max_complexity_score = float(score)
                     except Exception:
                         pass
                 div_bonus_scale = float(getattr(self, 'structure_diversity_bonus', 0.0))
                 div_power = float(getattr(self, 'structure_diversity_power', 1.0))
+                auto_state = None
+                if getattr(self, 'auto_complexity_controls', False):
+                    try:
+                        auto_state = self._auto_tune_complexity_controls(complexity_scores, max_complexity_score)
+                    except Exception:
+                        auto_state = getattr(self, '_auto_complexity_bonus_state', None)
                 comp_bonus_scale = float(getattr(self, 'complexity_survivor_bonus', 0.0))
                 comp_exp = float(getattr(self, 'complexity_survivor_exponent', 1.0))
+                comp_cap = float(getattr(self, 'complexity_survivor_cap', 1.6))
+                baseline_q = float(getattr(self, 'complexity_bonus_baseline_quantile', 0.5))
+                if not math.isfinite(baseline_q) or baseline_q <= 0.0 or baseline_q >= 1.0:
+                    comp_baseline = float(np.median(complexity_scores)) if complexity_scores else 0.0
+                else:
+                    try:
+                        comp_baseline = float(np.quantile(complexity_scores, baseline_q)) if complexity_scores else 0.0
+                    except Exception:
+                        comp_baseline = float(np.median(complexity_scores)) if complexity_scores else 0.0
+                if auto_state:
+                    comp_bonus_scale = float(auto_state.get('bonus_scale', comp_bonus_scale))
+                    comp_exp = float(auto_state.get('exponent', comp_exp))
+                    comp_cap = float(auto_state.get('cap', comp_cap))
+                    comp_baseline = float(auto_state.get('baseline', comp_baseline))
+                    baseline_q = float(auto_state.get('baseline_quantile', baseline_q))
                 fitnesses = []
                 for g, f in zip(self.population, raw):
                     f2 = float(f)
@@ -2774,14 +2962,20 @@ class ReproPlanaNEATPlus:
                             if div_power != 1.0:
                                 rarity = float(rarity ** div_power)
                             f2 += div_bonus_scale * rarity
-                    if comp_bonus_scale > 0.0 and max_complexity_score > 0.0:
+                    if (
+                        comp_bonus_scale > 0.0
+                        and max_complexity_score > 0.0
+                        and max_complexity_score > comp_baseline
+                    ):
                         stats = complexity_stats.get(g.id)
                         if stats is not None:
-                            rel = float(stats[-1]) / max(1e-9, max_complexity_score)
-                            rel = max(0.0, min(1.5, rel))
-                            if comp_exp != 1.0:
-                                rel = float(rel ** comp_exp)
-                            f2 += comp_bonus_scale * rel
+                            raw_score = float(stats[-1])
+                            if raw_score > comp_baseline:
+                                rel = (raw_score - comp_baseline) / max(1e-9, max_complexity_score - comp_baseline)
+                                rel = max(0.0, min(comp_cap, rel))
+                                if comp_exp != 1.0:
+                                    rel = float(rel ** comp_exp)
+                                f2 += comp_bonus_scale * rel
                     if not np.isfinite(f2):
                         f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
                     fitnesses.append(f2)
