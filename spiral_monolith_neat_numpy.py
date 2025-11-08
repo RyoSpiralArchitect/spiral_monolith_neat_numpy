@@ -2361,7 +2361,9 @@ class ReproPlanaNEATPlus:
         self.complexity_survivor_bonus = 0.12
         self.complexity_survivor_exponent = 1.1
         self.complexity_survivor_cap = 1.6
+        self.complexity_survivor_bonus_limit = 1.2
         self.complexity_bonus_baseline_quantile = 0.6
+        self.complexity_bonus_span_quantile = 0.9
         try:
             cpus = int(os.cpu_count() or 2)
             self.eval_workers = int(os.environ.get('NEAT_EVAL_WORKERS', max(1, cpus - 1)))
@@ -2396,7 +2398,9 @@ class ReproPlanaNEATPlus:
         self._resilience_eval_guard = 0
         self._resilience_history = []
         self.diversity_history: List[Dict[str, float]] = []
+        self.complexity_distribution_history: List[Dict[str, Any]] = []
         self.diversity_history_limit = 4096
+        self.complexity_history_limit = 4096
         self._diversity_snapshot: Dict[str, Any] = {}
         self.refine_topk_ratio = float(os.environ.get('NEAT_REFINE_TOPK_RATIO', '0.08'))
         nodes = {}
@@ -2436,6 +2440,7 @@ class ReproPlanaNEATPlus:
             g.birth_gen = 0
             g.mutation_will = float(np.clip(self.rng.uniform(0.0, 1.0), 0.0, 1.0))
             g.cooperative = True
+            setattr(g, 'lazy_lineage_strength', 0.0)
             self.population.append(g)
         input_ids = list(range(num_inputs))
         output_ids = list(range(num_inputs, num_inputs + num_outputs))
@@ -2473,6 +2478,7 @@ class ReproPlanaNEATPlus:
         self.mutation_will_mutation_rate = 0.1
         self.mutation_will_mutation_scale = 0.05
         self.lazy_fraction = 0.02
+        self.lazy_fraction_max = 0.021
         self.lazy_individual_fitness = -1.0
         self.auto_complexity_controls = True
         self.auto_complexity_bonus_fraction = 0.18
@@ -2481,6 +2487,11 @@ class ReproPlanaNEATPlus:
         self.lazy_complexity_target_scale = 1.18
         self.lazy_complexity_duplicate_bias = 0.45
         self.lazy_complexity_min_growth = 0.0
+        self.lazy_lineage_decay = 0.82
+        self.lazy_lineage_strength_cap = 3.0
+        self.lazy_lineage_inheritance_gain = 0.32
+        self.lazy_lineage_inheritance_decay = 0.24
+        self.lazy_lineage_persistence = 0.7
         self.env = {
             'difficulty': 0.0,
             'noise_std': 0.0,
@@ -2565,12 +2576,15 @@ class ReproPlanaNEATPlus:
             'exponent': float(self.complexity_survivor_exponent),
             'cap': float(self.complexity_survivor_cap),
             'baseline_quantile': float(self.complexity_bonus_baseline_quantile),
+            'span_quantile': float(self.complexity_bonus_span_quantile),
             'penalty_multiplier': 1.0,
             'penalty_threshold': float(self.complexity_threshold or 0.0) if self.complexity_threshold is not None else None,
             'bonus_multiplier': float(getattr(self, 'complexity_bonus_multiplier', -0.1)),
             'bonus_threshold': float(getattr(self, 'complexity_bonus_threshold', 2.5)),
+            'bonus_limit': float(self.complexity_survivor_bonus_limit),
             'lazy_target': 0.0,
             'spread': 0.0,
+            'span_value': 0.0,
         }
         self._lazy_fraction_carry = 0.0
         self.raw_best_history: List[Tuple[float, float]] = []
@@ -2940,6 +2954,14 @@ class ReproPlanaNEATPlus:
             self.next_gid += 1
             child.parents = (e.id, e.id)
             child.birth_gen = self.generation + 1
+            parent_strength = float(getattr(e, 'lazy_lineage_strength', 0.0) or 0.0)
+            inheritance_decay = float(np.clip(getattr(self, 'lazy_lineage_inheritance_decay', 0.24), 0.0, 0.95))
+            inheritance_gain = float(max(0.0, getattr(self, 'lazy_lineage_inheritance_gain', 0.0)))
+            strength_cap = float(max(0.0, getattr(self, 'lazy_lineage_strength_cap', 3.0)))
+            gain = inheritance_gain * (1.0 if bool(getattr(e, 'lazy_lineage', False)) else 0.5)
+            new_strength = float(np.clip(parent_strength * (1.0 - inheritance_decay) + gain, 0.0, strength_cap))
+            setattr(child, 'lazy_lineage_strength', new_strength)
+            setattr(child, 'lazy_lineage', False)
             new_pop.append(child)
             events['asexual_clone'] += 1
             self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
@@ -2963,6 +2985,9 @@ class ReproPlanaNEATPlus:
             father_id = None
             parent_adj_before_regen = None
             use_sexual_reproduction = False
+            parent = None
+            mother = None
+            father = None
             parent_candidate = pool[int(self.rng.integers(len(pool)))]
             effective_mix_ratio = mix_ratio
             if bool(getattr(self, 'adaptive_self_mutation', True)):
@@ -3060,6 +3085,29 @@ class ReproPlanaNEATPlus:
             child.parents = (mother_id, father_id)
             child.birth_gen = self.generation + 1
             child.origin_mode = mode
+            parent_strengths: List[float] = []
+            parent_lazy_flags: List[bool] = []
+            if parent is not None:
+                strength = float(getattr(parent, 'lazy_lineage_strength', 0.0) or 0.0)
+                parent_strengths.append(strength)
+                parent_lazy_flags.append(bool(getattr(parent, 'lazy_lineage', False)))
+            if mother is not None:
+                parent_strengths.append(float(getattr(mother, 'lazy_lineage_strength', 0.0) or 0.0))
+                parent_lazy_flags.append(bool(getattr(mother, 'lazy_lineage', False)))
+            if father is not None and father is not mother:
+                parent_strengths.append(float(getattr(father, 'lazy_lineage_strength', 0.0) or 0.0))
+                parent_lazy_flags.append(bool(getattr(father, 'lazy_lineage', False)))
+            base_strength = float(max(parent_strengths) if parent_strengths else 0.0)
+            mix_strength = float(np.mean(parent_strengths)) if parent_strengths else 0.0
+            inheritance_decay = float(np.clip(getattr(self, 'lazy_lineage_inheritance_decay', 0.24), 0.0, 0.95))
+            inheritance_gain = float(max(0.0, getattr(self, 'lazy_lineage_inheritance_gain', 0.0)))
+            strength_cap = float(max(0.0, getattr(self, 'lazy_lineage_strength_cap', 3.0)))
+            active_lazy = any(parent_lazy_flags)
+            carried = base_strength * (1.0 - inheritance_decay) + mix_strength * 0.35
+            gain = inheritance_gain * (1.0 if active_lazy else 0.5)
+            new_strength = float(np.clip(carried + gain, 0.0, strength_cap))
+            setattr(child, 'lazy_lineage_strength', new_strength)
+            setattr(child, 'lazy_lineage', False)
             self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
             if monitor is not None and parent_adj_before_regen is not None:
                 regen_adj = child.weighted_adjacency()
@@ -3129,6 +3177,14 @@ class ReproPlanaNEATPlus:
                 child.parents = (parent.id, None)
                 child.birth_gen = self.generation + 1
                 self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
+                parent_strength = float(getattr(parent, 'lazy_lineage_strength', 0.0) or 0.0)
+                inheritance_decay = float(np.clip(getattr(self, 'lazy_lineage_inheritance_decay', 0.24), 0.0, 0.95))
+                inheritance_gain = float(max(0.0, getattr(self, 'lazy_lineage_inheritance_gain', 0.0)))
+                strength_cap = float(max(0.0, getattr(self, 'lazy_lineage_strength_cap', 3.0)))
+                gain = inheritance_gain * (1.0 if bool(getattr(parent, 'lazy_lineage', False)) else 0.5)
+                new_strength = float(np.clip(parent_strength * (1.0 - inheritance_decay) + gain, 0.0, strength_cap))
+                setattr(child, 'lazy_lineage_strength', new_strength)
+                setattr(child, 'lazy_lineage', False)
                 pre_adj = child.weighted_adjacency() if monitor is not None else None
                 self._mutate(child)
                 if monitor is not None and pre_adj is not None:
@@ -3155,24 +3211,44 @@ class ReproPlanaNEATPlus:
         frac = float(getattr(self, 'lazy_fraction', 0.02))
         if not population:
             return
+        max_frac = float(getattr(self, 'lazy_fraction_max', frac))
+        max_frac = float(np.clip(max_frac, 0.0, max(0.0, frac * 1.1 + 1e-9)))
+        decay = float(np.clip(getattr(self, 'lazy_lineage_decay', 0.8), 0.0, 1.0))
+        strength_cap = float(max(0.0, getattr(self, 'lazy_lineage_strength_cap', 3.0)))
         for g in population:
             g.cooperative = True
+            setattr(g, 'lazy_lineage', False)
+            strength = float(getattr(g, 'lazy_lineage_strength', 0.0) or 0.0)
+            if strength > 0.0:
+                setattr(g, 'lazy_lineage_strength', float(np.clip(strength * decay, 0.0, strength_cap)))
         if frac <= 0.0:
+            self._lazy_fraction_carry = 0.0
             return
         target = float(frac) * float(len(population))
         carry = float(getattr(self, '_lazy_fraction_carry', 0.0))
         desired = target + carry
         lazy_count = int(math.floor(desired + 1e-09))
         remainder = desired - lazy_count
-        if desired > 0.0 and lazy_count <= 0:
-            lazy_count = 1
-            remainder = max(0.0, desired - lazy_count)
+        max_lazy = int(math.floor(max_frac * len(population) + 1e-09))
+        if lazy_count > max_lazy:
+            remainder += float(lazy_count - max_lazy)
+            lazy_count = max_lazy
+        elif remainder > 0.0 and lazy_count < max_lazy:
+            if float(self.rng.random()) < remainder and (lazy_count + 1) <= max_lazy:
+                lazy_count += 1
+                remainder = max(0.0, remainder - 1.0)
         lazy_count = min(int(lazy_count), len(population))
         if lazy_count <= 0:
             self._lazy_fraction_carry = remainder
             return
         self._lazy_fraction_carry = remainder
-        indices = self.rng.choice(len(population), size=lazy_count, replace=False)
+        strengths = np.asarray([max(1e-09, 1.0 + float(getattr(g, 'lazy_lineage_strength', 0.0) or 0.0)) for g in population], dtype=np.float64)
+        strengths_sum = float(strengths.sum())
+        if not np.isfinite(strengths_sum) or strengths_sum <= 0.0:
+            strengths = None
+        else:
+            strengths = strengths / strengths_sum
+        indices = self.rng.choice(len(population), size=lazy_count, replace=False, p=strengths)
         for idx in np.atleast_1d(indices):
             g = population[int(idx)]
             g.cooperative = False
@@ -3191,16 +3267,26 @@ class ReproPlanaNEATPlus:
         auto_state = getattr(self, '_auto_complexity_bonus_state', None)
         baseline = 0.0
         spread = 0.0
+        span_val = 0.0
         if auto_state:
             baseline = float(auto_state.get('baseline', 0.0) or 0.0)
             spread = float(auto_state.get('spread', 0.0) or 0.0)
+            span_val = float(auto_state.get('span_value', 0.0) or 0.0)
         target_score = max(0.0, baseline * target_scale + min_growth)
         if spread > 0.0:
             target_score = max(target_score, baseline + spread * target_scale)
+        if span_val > 0.0:
+            target_score = max(target_score, span_val)
         lazy_target = float(auto_state.get('lazy_target', 0.0)) if auto_state else 0.0
         if lazy_target > 0.0:
             target_score = max(target_score, lazy_target)
         duplicate_bias = float(getattr(self, 'lazy_complexity_duplicate_bias', 0.4))
+        current_score = float(genome.structural_complexity_score())
+        if target_score > current_score and spread > 0.0:
+            gap = float(max(0.0, target_score - current_score))
+            approx_step_gain = max(1.0, spread)
+            boost_steps = int(math.ceil(gap / approx_step_gain))
+            steps = max(steps, boost_steps)
         for _ in range(steps):
             current = float(genome.structural_complexity_score())
             if current >= target_score:
@@ -3228,6 +3314,18 @@ class ReproPlanaNEATPlus:
             genome.cooperative = False
         except Exception:
             pass
+        try:
+            post_score = float(genome.structural_complexity_score())
+        except Exception:
+            post_score = 0.0
+        baseline = max(1e-09, baseline)
+        growth_ratio = float(max(0.0, post_score - baseline) / (baseline + spread + 1e-09))
+        persistence = float(np.clip(getattr(self, 'lazy_lineage_persistence', 0.7), 0.0, 1.0))
+        cap = float(max(0.0, getattr(self, 'lazy_lineage_strength_cap', 3.0)))
+        prior = float(getattr(genome, 'lazy_lineage_strength', 0.0) or 0.0)
+        gain = float(np.clip(growth_ratio * max(0.6, target_scale), 0.0, cap))
+        new_strength = float(np.clip(prior * persistence + gain, 0.0, cap))
+        setattr(genome, 'lazy_lineage_strength', new_strength)
 
     def _auto_tune_complexity_controls(self, scores: List[float], max_score: float) -> Optional[Dict[str, float]]:
         prev = getattr(self, '_auto_complexity_bonus_state', None)
@@ -3243,7 +3341,9 @@ class ReproPlanaNEATPlus:
         baseline_q = float(np.clip(1.0 - target_frac, 0.55, 0.97))
         baseline = float(np.quantile(arr, baseline_q))
         median = float(np.quantile(arr, 0.5))
+        span_quantile = float(np.clip(max(baseline_q + 0.12, baseline_q + 0.01), baseline_q + 0.01, 0.995))
         q90 = float(np.quantile(arr, min(0.95, baseline_q + 0.18)))
+        span_val = float(np.quantile(arr, span_quantile))
         peak = float(max(float(max_score or 0.0), float(arr[-1])))
         spread = float(max(1e-09, q90 - median))
         intensity = float(min(1.0, spread / max(1e-09, baseline + median + 1e-09)))
@@ -3253,6 +3353,7 @@ class ReproPlanaNEATPlus:
         if peak > baseline:
             cap_ratio = float((peak - baseline) / max(1e-09, peak))
         cap = float(np.clip(0.8 + 1.4 * cap_ratio, 0.9, 2.2))
+        bonus_limit = float(np.clip(0.35 + 1.35 * intensity, 0.4, 2.8))
         diff_pressure = float(min(1.0, max(0.0, float(self.env.get('difficulty', 0.0))) / 3.0))
         release = float(min(1.0, baseline / max(1e-09, peak)))
         penalty_multiplier = float(np.clip(1.0 - 0.6 * release * (0.4 + 0.6 * diff_pressure), 0.2, 1.1))
@@ -3267,12 +3368,15 @@ class ReproPlanaNEATPlus:
             'exponent': exponent,
             'cap': cap,
             'baseline_quantile': baseline_q,
+            'span_quantile': span_quantile,
             'penalty_multiplier': penalty_multiplier,
             'penalty_threshold': penalty_threshold,
             'bonus_multiplier': bonus_multiplier,
             'bonus_threshold': bonus_threshold,
+            'bonus_limit': bonus_limit,
             'lazy_target': lazy_target,
             'spread': spread,
+            'span_value': span_val,
         }
         if prev:
             mixed = {}
@@ -3292,9 +3396,11 @@ class ReproPlanaNEATPlus:
             self.complexity_survivor_exponent = new_state['exponent']
             self.complexity_survivor_cap = new_state['cap']
             self.complexity_bonus_baseline_quantile = new_state['baseline_quantile']
+            self.complexity_bonus_span_quantile = new_state['span_quantile']
             self.complexity_bonus_multiplier = new_state['bonus_multiplier']
             self.complexity_bonus_threshold = new_state['bonus_threshold']
             self.complexity_threshold = new_state['penalty_threshold']
+            self.complexity_survivor_bonus_limit = new_state['bonus_limit']
         return new_state
 
     def _complexity_penalty(self, g: Genome) -> float:
@@ -3864,7 +3970,9 @@ class ReproPlanaNEATPlus:
                 comp_bonus_scale = float(getattr(self, 'complexity_survivor_bonus', 0.0))
                 comp_exp = float(getattr(self, 'complexity_survivor_exponent', 1.0))
                 comp_cap = float(getattr(self, 'complexity_survivor_cap', 1.6))
+                comp_bonus_limit = float(max(0.0, getattr(self, 'complexity_survivor_bonus_limit', 0.0)))
                 baseline_q = float(getattr(self, 'complexity_bonus_baseline_quantile', 0.5))
+                span_q = float(getattr(self, 'complexity_bonus_span_quantile', max(baseline_q + 0.1, 0.75)))
                 if not math.isfinite(baseline_q) or baseline_q <= 0.0 or baseline_q >= 1.0:
                     comp_baseline = float(np.median(complexity_scores)) if complexity_scores else 0.0
                 else:
@@ -3872,12 +3980,61 @@ class ReproPlanaNEATPlus:
                         comp_baseline = float(np.quantile(complexity_scores, baseline_q)) if complexity_scores else 0.0
                     except Exception:
                         comp_baseline = float(np.median(complexity_scores)) if complexity_scores else 0.0
+                comp_span_value = float(comp_baseline)
+                if complexity_scores:
+                    try:
+                        span_q = float(np.clip(span_q, max(baseline_q + 0.01, 0.51), 0.995))
+                        comp_span_value = float(np.quantile(complexity_scores, span_q))
+                    except Exception:
+                        comp_span_value = float(max_complexity_score)
+                comp_span_value = float(max(comp_span_value, comp_baseline))
                 if auto_state:
                     comp_bonus_scale = float(auto_state.get('bonus_scale', comp_bonus_scale))
                     comp_exp = float(auto_state.get('exponent', comp_exp))
                     comp_cap = float(auto_state.get('cap', comp_cap))
                     comp_baseline = float(auto_state.get('baseline', comp_baseline))
                     baseline_q = float(auto_state.get('baseline_quantile', baseline_q))
+                    span_q = float(auto_state.get('span_quantile', span_q))
+                    comp_span_value = float(max(comp_baseline, auto_state.get('span_value', comp_span_value)))
+                    comp_bonus_limit = float(auto_state.get('bonus_limit', comp_bonus_limit))
+                span_q = float(np.clip(span_q, min(0.995, max(baseline_q + 0.005, 0.5)), 0.995))
+                comp_span_gap = float(max(1e-9, comp_span_value - comp_baseline))
+                max_gap = float(max(1e-9, max_complexity_score - comp_baseline))
+                bonus_denom = float(max(comp_span_gap, 0.25 * max_gap))
+                comp_bonus_limit = float(max(0.0, comp_bonus_limit))
+                diversity_snapshot.update({
+                    'complexity_baseline': float(comp_baseline),
+                    'complexity_span': float(comp_span_value),
+                    'complexity_span_quantile': float(span_q),
+                    'complexity_max': float(max_complexity_score),
+                    'complexity_bonus_limit': float(comp_bonus_limit),
+                })
+                if complexity_scores:
+                    comp_distribution_snapshot = {
+                        'gen': int(gen),
+                        'baseline': float(comp_baseline),
+                        'baseline_quantile': float(baseline_q),
+                        'span_quantile': float(span_q),
+                        'span_value': float(comp_span_value),
+                        'max': float(max_complexity_score),
+                        'mean': float(complexity_mean),
+                        'std': float(complexity_std),
+                        'count': int(len(complexity_scores)),
+                    }
+                    for q in (0.1, 0.25, 0.5, 0.75, 0.9, 0.95):
+                        try:
+                            comp_distribution_snapshot[f'q{int(q * 100):02d}'] = float(np.quantile(complexity_scores, q))
+                        except Exception:
+                            continue
+                    self.complexity_distribution_history.append(comp_distribution_snapshot)
+                    if len(self.complexity_distribution_history) > int(getattr(self, 'complexity_history_limit', 4096)):
+                        limit = int(getattr(self, 'complexity_history_limit', 4096))
+                        self.complexity_distribution_history = self.complexity_distribution_history[-limit:]
+                if auto_state:
+                    auto_state['span_value'] = float(comp_span_value)
+                base_state = getattr(self, '_auto_complexity_bonus_state', None)
+                if isinstance(base_state, dict):
+                    base_state['span_value'] = float(comp_span_value)
                 fitnesses = []
                 for g, f in zip(self.population, raw):
                     f2 = float(f)
@@ -3903,11 +4060,14 @@ class ReproPlanaNEATPlus:
                         if stats is not None:
                             raw_score = float(stats[-1])
                             if raw_score > comp_baseline:
-                                rel = (raw_score - comp_baseline) / max(1e-9, max_complexity_score - comp_baseline)
+                                rel = (raw_score - comp_baseline) / bonus_denom
                                 rel = max(0.0, min(comp_cap, rel))
                                 if comp_exp != 1.0:
                                     rel = float(rel ** comp_exp)
-                                f2 += comp_bonus_scale * rel
+                                bonus = comp_bonus_scale * rel
+                                if comp_bonus_limit > 0.0:
+                                    bonus = float(min(comp_bonus_limit, bonus))
+                                f2 += bonus
                     if not np.isfinite(f2):
                         f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
                     fitnesses.append(f2)
@@ -5111,6 +5271,7 @@ def plot_learning_and_complexity(history: List[Tuple[float, float]], hidden_coun
     fig.tight_layout()
     _savefig(fig, out_path, dpi=200)
     plt.close(fig)
+    return (csv_path, png_path)
 
 
 def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: str, png_path: str, title: str='Diversity & Environment Trajectory') -> Tuple[Optional[str], Optional[str]]:
@@ -5118,7 +5279,26 @@ def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: st
         return (None, None)
     os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
     os.makedirs(os.path.dirname(png_path) or '.', exist_ok=True)
-    fields = ['gen', 'entropy', 'scarcity', 'complexity_mean', 'complexity_std', 'structural_spread', 'diversity_bonus', 'diversity_power', 'env_noise', 'env_focus', 'env_entropy', 'lazy_share', 'unique_signatures']
+    fields = [
+        'gen',
+        'entropy',
+        'scarcity',
+        'complexity_mean',
+        'complexity_std',
+        'structural_spread',
+        'diversity_bonus',
+        'diversity_power',
+        'env_noise',
+        'env_focus',
+        'env_entropy',
+        'lazy_share',
+        'unique_signatures',
+        'complexity_baseline',
+        'complexity_span',
+        'complexity_span_quantile',
+        'complexity_max',
+        'complexity_bonus_limit',
+    ]
     with open(csv_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -5187,111 +5367,6 @@ def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, c
     fig.tight_layout()
     _savefig(fig, out_path, dpi=220)
     plt.close(fig)
-    return {'figure': out_path, 'history': loss, 'profile': profile}
-
-def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
-    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-    gg = genome.copy()
-    profile: Dict[str, Any] = {}
-    history = train_with_backprop_numpy(gg, X, y, steps=steps, lr=lr, l2=l2, profile_out=profile)
-    loss = np.asarray(history, dtype=np.float64)
-    step_profiles = np.asarray(
-        profile.get('step_profiles', np.zeros((0, len(profile.get('node_order', []))), dtype=np.float64)),
-        dtype=np.float64,
-    )
-    if step_profiles.ndim != 2 or step_profiles.shape[0] == 0:
-        step_profiles = None
-    node_order = profile.get('node_order', [])
-    node_types = profile.get('node_types', [])
-    labels = []
-    for nid, t in zip(node_order, node_types):
-        prefix = (t[0].upper() + ':') if t else 'N:'
-        labels.append(f'{prefix}{nid}')
-    initial_sens = np.asarray(profile.get('initial_sensitivity', []), dtype=np.float64)
-    final_sens = np.asarray(profile.get('final_sensitivity', []), dtype=np.float64)
-    final_momentum = np.asarray(profile.get('final_momentum', []), dtype=np.float64)
-    final_variance = np.asarray(profile.get('final_variance', []), dtype=np.float64)
-    final_jitter = np.asarray(profile.get('final_jitter', []), dtype=np.float64)
-    idx_pool = [i for i, t in enumerate(node_types) if t == 'hidden']
-    if not idx_pool:
-        idx_pool = list(range(len(labels)))
-    delta = final_sens - initial_sens if initial_sens.size and final_sens.size else np.zeros(len(labels), dtype=np.float64)
-    order_idx = sorted(idx_pool, key=lambda i: abs(delta[i]) if i < delta.size else 0.0, reverse=True)
-    if len(order_idx) > 10:
-        order_idx = order_idx[:10]
-    scatter_idx = sorted(idx_pool, key=lambda i: (final_variance[i] if i < final_variance.size else 0.0) + 0.25 * abs(final_momentum[i] if i < final_momentum.size else 0.0), reverse=True)
-    if len(scatter_idx) > 12:
-        scatter_idx = scatter_idx[:12]
-    fig = plt.figure(figsize=(10.5, 6.2))
-    gs = _gridspec.GridSpec(2, 2, height_ratios=[1.7, 1.0], width_ratios=[1.0, 1.0], hspace=0.32, wspace=0.28)
-    ax_top = fig.add_subplot(gs[0, :])
-    steps_axis = np.arange(1, loss.size + 1, dtype=np.float64) if loss.size else np.arange(1, steps + 1, dtype=np.float64)
-    handles = []
-    labels_legend = []
-    if step_profiles is not None:
-        mean_profile = step_profiles.mean(axis=1)
-        std_profile = step_profiles.std(axis=1)
-        mp = mean_profile[:steps_axis.size]
-        sp = std_profile[:steps_axis.size]
-        ax_top.fill_between(steps_axis[:mp.size], mp - sp[:mp.size], mp + sp[:mp.size], color='#8ecae6', alpha=0.35, label='pulse ±σ')
-        line_mp, = ax_top.plot(steps_axis[:mp.size], mp, color='#219ebc', lw=2.0, label='pulse mean')
-        handles.append(line_mp)
-        labels_legend.append('pulse mean')
-    if loss.size:
-        ax_loss = ax_top.twinx()
-        line_loss, = ax_loss.plot(steps_axis[:loss.size], loss, color='#f07167', lw=1.8, label='loss')
-        ax_loss.set_ylabel('loss', color='#f07167')
-        ax_loss.tick_params(axis='y', colors='#f07167')
-        handles.append(line_loss)
-        labels_legend.append('loss')
-    ax_top.set_xlabel('backprop step')
-    ax_top.set_ylabel('pulse magnitude')
-    ax_top.set_title('Backprop pulse landscape')
-    if handles:
-        ax_top.legend(handles, labels_legend, loc='upper right', frameon=False, fontsize=9)
-    ax_left = fig.add_subplot(gs[1, 0])
-    if order_idx and initial_sens.size and final_sens.size:
-        y_pos = np.arange(len(order_idx))
-        init_vals = initial_sens[order_idx]
-        final_vals = final_sens[order_idx]
-        delta_vals = final_vals - init_vals
-        ax_left.barh(y_pos - 0.18, init_vals, height=0.3, color='#c1d3fe', alpha=0.75, label='initial')
-        ax_left.barh(y_pos + 0.18, final_vals, height=0.3, color='#5e60ce', alpha=0.9, label='post-train')
-        ax_left.axvline(1.0, color='#333333', lw=0.8, ls='--', alpha=0.6)
-        for k, idx in enumerate(order_idx):
-            lbl = labels[idx] if idx < len(labels) else f'n{idx}'
-            ax_left.text(final_vals[k] + 0.04, y_pos[k] + 0.2, f'Δ{delta_vals[k]:+.2f}', fontsize=8, color='#333333')
-        ax_left.set_yticks(y_pos)
-        ax_left.set_yticklabels([labels[idx] if idx < len(labels) else f'n{idx}' for idx in order_idx])
-        ax_left.set_xlabel('sensitivity')
-        ax_left.set_title('Hidden node sensitivity drift')
-        ax_left.legend(frameon=False, fontsize=8, loc='lower right')
-    else:
-        ax_left.text(0.5, 0.5, 'No hidden nodes tracked', ha='center', va='center', fontsize=10)
-        ax_left.set_axis_off()
-    ax_right = fig.add_subplot(gs[1, 1])
-    if scatter_idx and final_momentum.size and final_variance.size:
-        mom_vals = final_momentum[scatter_idx]
-        var_vals = final_variance[scatter_idx]
-        jit_vals = final_jitter[scatter_idx] if final_jitter.size else np.zeros_like(mom_vals)
-        sc = ax_right.scatter(mom_vals, var_vals, c=jit_vals, cmap='coolwarm', s=60, edgecolors='k', linewidths=0.35)
-        for k, idx in enumerate(scatter_idx):
-            lbl = labels[idx] if idx < len(labels) else f'n{idx}'
-            ax_right.text(mom_vals[k] + 0.02, var_vals[k] + 0.02, lbl, fontsize=8)
-        ax_right.set_xlabel('momentum (smoothed)')
-        ax_right.set_ylabel('variance trace')
-        ax_right.set_title('Post-train temperament field')
-        if len(scatter_idx) >= 3:
-            cb = fig.colorbar(sc, ax=ax_right, fraction=0.046, pad=0.04)
-            cb.set_label('jitter', fontsize=9)
-    else:
-        ax_right.text(0.5, 0.5, 'No temperament statistics', ha='center', va='center', fontsize=10)
-        ax_right.set_axis_off()
-    fig.suptitle(f'Backprop Variation | steps={steps}', fontsize=12)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
-    _savefig(fig, out_path, dpi=220)
-    plt.close(fig)
-    return {'figure': out_path, 'history': loss, 'profile': profile}
 
 def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
@@ -5599,7 +5674,20 @@ class PerSampleSequenceStopperPro:
         """Reset all finished samples."""
         self.finished_samples.clear()
 
-def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefix='out/exp', make_gifs: bool=True, make_lineage: bool=True, rng_seed: int=0):
+def run_backprop_neat_experiment(
+    task: str,
+    gens=60,
+    pop=64,
+    steps=80,
+    out_prefix='out/exp',
+    make_gifs: bool=True,
+    make_lineage: bool=True,
+    rng_seed: int=0,
+    complexity_baseline_quantile: Optional[float]=None,
+    complexity_survivor_cap: Optional[float]=None,
+    complexity_bonus_limit: Optional[float]=None,
+    complexity_bonus_span_quantile: Optional[float]=None,
+):
     if task == 'xor':
         Xtr, ytr = make_xor(512, noise=0.05, seed=0)
         Xva, yva = make_xor(256, noise=0.05, seed=1)
@@ -5614,6 +5702,14 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     neat_module = sys.modules[__name__]
     neat = neat_module.ReproPlanaNEATPlus(num_inputs=Xtr.shape[1], num_outputs=out_dim, population_size=pop, output_activation='identity', rng=rng)
     _apply_stable_neat_defaults(neat)
+    if complexity_baseline_quantile is not None:
+        neat.complexity_bonus_baseline_quantile = float(complexity_baseline_quantile)
+    if complexity_survivor_cap is not None:
+        neat.complexity_survivor_cap = float(complexity_survivor_cap)
+    if complexity_bonus_limit is not None:
+        neat.complexity_survivor_bonus_limit = float(complexity_bonus_limit)
+    if complexity_bonus_span_quantile is not None:
+        neat.complexity_bonus_span_quantile = float(complexity_bonus_span_quantile)
     regen_log_path = f'{out_prefix}_regen_log.csv'
     if hasattr(neat, 'lcs_monitor') and neat.lcs_monitor is not None:
         neat.lcs_monitor.csv_path = regen_log_path
@@ -5758,6 +5854,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         'backprop_variation': backprop_variation,
         'diversity_csv': diversity_csv,
         'diversity_plot': diversity_plot,
+        'complexity_distribution': list(getattr(neat, 'complexity_distribution_history', [])),
     }
 
 def _fig_to_rgb(fig):
@@ -7247,6 +7344,10 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--report', action='store_true')
     ap.add_argument('--version', action='store_true', help='print build information and exit')
     ap.add_argument('--sync-spinor-seeds', action='store_true', help='bind spinor evaluator and weaver RNGs to --seed')
+    ap.add_argument('--complexity-baseline-quantile', type=float, help='quantile (0-1) for survivor complexity bonus baseline')
+    ap.add_argument('--complexity-bonus-span-quantile', type=float, help='upper quantile used to scale survivor complexity distance')
+    ap.add_argument('--complexity-survivor-cap', type=float, help='cap applied to normalized survivor complexity bonus ratio')
+    ap.add_argument('--complexity-bonus-limit', type=float, help='absolute cap for survivor complexity bonuses')
     args = ap.parse_args(argv_list)
     requested_tasks: List[str] = []
     if getattr(args, 'tasks_single', None):
@@ -7282,7 +7383,20 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
         np.random.seed(args.seed)
         for task in requested_tasks:
             out_prefix = os.path.join(args.out, task)
-            res = run_backprop_neat_experiment(task, gens=args.gens, pop=args.pop, steps=args.steps, out_prefix=out_prefix, make_gifs=True, make_lineage=True, rng_seed=args.seed)
+            res = run_backprop_neat_experiment(
+                task,
+                gens=args.gens,
+                pop=args.pop,
+                steps=args.steps,
+                out_prefix=out_prefix,
+                make_gifs=True,
+                make_lineage=True,
+                rng_seed=args.seed,
+                complexity_baseline_quantile=args.complexity_baseline_quantile,
+                complexity_survivor_cap=args.complexity_survivor_cap,
+                complexity_bonus_limit=args.complexity_bonus_limit,
+                complexity_bonus_span_quantile=args.complexity_bonus_span_quantile,
+            )
             supervised_results[task] = res
             label_base = task.upper()
             _add_artifact(f'{label_base} | Learning Curve + Complexity', res.get('learning_curve'))
