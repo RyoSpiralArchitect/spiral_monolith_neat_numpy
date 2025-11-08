@@ -275,7 +275,7 @@ class InnovationTracker:
 
 class Genome:
 
-    def __init__(self, nodes: Dict[int, 'NodeGene'], connections: Dict[int, 'ConnectionGene'], sex: Optional[str]=None, regen: bool=False, regen_mode: Optional[str]=None, embryo_bias: Optional[str]=None, gid: Optional[int]=None, birth_gen: int=0, hybrid_scale: float=1.0, parents: Optional[Tuple[Optional[int], Optional[int]]]=None):
+    def __init__(self, nodes: Dict[int, 'NodeGene'], connections: Dict[int, 'ConnectionGene'], sex: Optional[str]=None, regen: bool=False, regen_mode: Optional[str]=None, embryo_bias: Optional[str]=None, gid: Optional[int]=None, birth_gen: int=0, hybrid_scale: float=1.0, parents: Optional[Tuple[Optional[int], Optional[int]]]=None, mutation_will: Optional[float]=None, cooperative: bool=True):
         self.origin_mode = 'initial'
         self.nodes = nodes
         self.connections = connections
@@ -290,11 +290,13 @@ class Genome:
         self.origin_mode = getattr(self, 'origin_mode', 'initial')
         self.max_hidden_nodes: Optional[int] = None
         self.max_edges: Optional[int] = None
+        self.mutation_will = float(mutation_will) if mutation_will is not None else float(np.random.uniform(0.0, 1.0))
+        self.cooperative = bool(cooperative)
 
     def copy(self):
         nodes = {nid: NodeGene(n.id, n.type, n.activation) for nid, n in self.nodes.items()}
         conns = {innov: ConnectionGene(c.in_node, c.out_node, c.weight, c.enabled, c.innovation) for innov, c in self.connections.items()}
-        g = Genome(nodes, conns, self.sex, self.regen, self.regen_mode, self.embryo_bias, self.id, self.birth_gen, self.hybrid_scale, self.parents)
+        g = Genome(nodes, conns, self.sex, self.regen, self.regen_mode, self.embryo_bias, self.id, self.birth_gen, self.hybrid_scale, self.parents, mutation_will=self.mutation_will, cooperative=self.cooperative)
         g.origin_mode = getattr(self, 'origin_mode', 'initial')
         g.max_hidden_nodes = self.max_hidden_nodes
         g.max_edges = self.max_edges
@@ -1679,6 +1681,8 @@ class ReproPlanaNEATPlus:
             g.id = self.next_gid
             self.next_gid += 1
             g.birth_gen = 0
+            g.mutation_will = float(np.clip(self.rng.uniform(0.0, 1.0), 0.0, 1.0))
+            g.cooperative = True
             self.population.append(g)
         input_ids = list(range(num_inputs))
         output_ids = list(range(num_inputs, num_inputs + num_outputs))
@@ -1709,6 +1713,14 @@ class ReproPlanaNEATPlus:
         self.lcs_reward_weight = 0.02
         self.diversity_weight = 0.02
         self.hermaphrodite_mate_bias = 2.5
+        self.hermaphrodite_similarity_threshold = 0.08
+        self.hemi_topology_inheritance_bias = 0.9
+        self.mutation_will_child_noise = 0.05
+        self.mutation_will_similarity_noise = 0.02
+        self.mutation_will_mutation_rate = 0.1
+        self.mutation_will_mutation_scale = 0.05
+        self.lazy_fraction = 0.02
+        self.lazy_individual_fitness = -1.0
         self.env = {'difficulty': 0.0, 'noise_std': 0.0}
         self.mix_asexual_base = 0.1
         self.mix_asexual_gain = 0.4
@@ -1732,6 +1744,7 @@ class ReproPlanaNEATPlus:
         self.top3_best_topologies = []
         for g in self.population:
             self.node_registry[g.id] = {'sex': g.sex, 'regen': g.regen, 'birth_gen': g.birth_gen}
+        self._assign_lazy_individuals(self.population)
 
     def _heterosis_scale(self, mother: Genome, father: Genome) -> float:
         d = compatibility_distance(mother, father, self.c1, self.c2, self.c3)
@@ -1886,6 +1899,11 @@ class ReproPlanaNEATPlus:
                 genome.mutate_add_connection(self.rng, self.innov)
             else:
                 genome.mutate_add_node(self.rng, self.innov)
+        will_rate = float(getattr(self, 'mutation_will_mutation_rate', 0.0))
+        if will_rate > 0.0 and self.rng.random() < will_rate:
+            scale = float(getattr(self, 'mutation_will_mutation_scale', 0.05))
+            delta = float(self.rng.normal(0.0, scale))
+            genome.mutation_will = float(np.clip(float(getattr(genome, 'mutation_will', 0.5)) + delta, 0.0, 1.0))
 
     def _crossover_maternal_biased(self, mother: Genome, father: Genome, species_members):
         fit_dict = {g: f for g, f in species_members}
@@ -1893,6 +1911,15 @@ class ReproPlanaNEATPlus:
         f_f = fit_dict.get(father, 0.0)
         if f_f > f_m:
             mother, father = (father, mother)
+        will_m = float(getattr(mother, 'mutation_will', 0.5))
+        will_f = float(getattr(father, 'mutation_will', 0.5))
+        will_diff = abs(will_m - will_f)
+        similarity_threshold = float(getattr(self, 'hermaphrodite_similarity_threshold', 0.08))
+        similar_will = will_diff <= similarity_threshold
+        topology_bias = 0.7
+        preferred_parent = mother if will_m >= will_f else father
+        if similar_will:
+            topology_bias = float(getattr(self, 'hemi_topology_inheritance_bias', 0.9))
         child_nodes = {}
         child_conns = {}
         for nid, n in mother.nodes.items():
@@ -1903,7 +1930,13 @@ class ReproPlanaNEATPlus:
             if inn in mother.connections and inn in father.connections:
                 cm = mother.connections[inn]
                 cf = father.connections[inn]
-                pick = cm if self.rng.random() < 0.7 else cf
+                if similar_will:
+                    if preferred_parent is mother:
+                        pick = cm if self.rng.random() < topology_bias else cf
+                    else:
+                        pick = cf if self.rng.random() < topology_bias else cm
+                else:
+                    pick = cm if self.rng.random() < 0.7 else cf
                 enabled = True
                 if not cm.enabled or not cf.enabled:
                     enabled = not self.rng.random() < 0.75
@@ -1921,11 +1954,20 @@ class ReproPlanaNEATPlus:
         child.max_hidden_nodes = self.max_hidden_nodes
         child.max_edges = self.max_edges
         child.remove_cycles()
+        if similar_will:
+            anchor_will = float(getattr(preferred_parent, 'mutation_will', 0.5))
+            noise = float(self.rng.normal(0.0, getattr(self, 'mutation_will_similarity_noise', 0.02)))
+            child.mutation_will = float(np.clip(anchor_will + noise, 0.0, 1.0))
+        else:
+            avg_will = 0.5 * (will_m + will_f)
+            noise = float(self.rng.normal(0.0, getattr(self, 'mutation_will_child_noise', 0.05)))
+            child.mutation_will = float(np.clip(avg_will + noise, 0.0, 1.0))
+        inherits_hemi = False
         if mother.sex == 'hermaphrodite' or father.sex == 'hermaphrodite':
             if self.rng.random() < self.hermaphrodite_inheritance_rate:
-                child.sex = 'hermaphrodite'
-            else:
-                child.sex = 'female' if self.rng.random() < 0.5 else 'male'
+                inherits_hemi = True
+        if inherits_hemi or similar_will:
+            child.sex = 'hermaphrodite'
         else:
             child.sex = 'female' if self.rng.random() < 0.5 else 'male'
         p = 0.7 if mother.regen or father.regen else 0.2
@@ -1946,6 +1988,7 @@ class ReproPlanaNEATPlus:
         elites = [g for g, _ in sp.members[:min(self.elitism, offspring_counts[sidx])]]
         for e in elites:
             child = e.copy()
+            child.cooperative = True
             child.id = self.next_gid
             self.next_gid += 1
             child.parents = (e.id, e.id)
@@ -2004,11 +2047,13 @@ class ReproPlanaNEATPlus:
                     if monitor is not None:
                         parent_adj_before_regen = parent.weighted_adjacency()
                     child = platyregenerate(parent, self.rng, self.innov, intensity=self._regen_intensity())
+                    child.cooperative = True
                     mode = 'asexual_regen'
                     mother_id = parent.id
                     father_id = None
                 else:
                     child = parent.copy()
+                    child.cooperative = True
                     mode = 'asexual_clone'
                     mother_id = parent.id
                     father_id = None
@@ -2053,6 +2098,7 @@ class ReproPlanaNEATPlus:
                         sp_for_fit = sp.members
                     else:
                         child = parent.copy()
+                        child.cooperative = True
                         mode = 'asexual_clone'
                         mother_id = parent.id
                         father_id = None
@@ -2061,6 +2107,7 @@ class ReproPlanaNEATPlus:
                     child.hybrid_scale = self._heterosis_scale(mother, father)
                     mother_id = mother.id
                     father_id = father.id
+                child.cooperative = True
             child.id = self.next_gid
             self.next_gid += 1
             child.parents = (mother_id, father_id)
@@ -2120,6 +2167,7 @@ class ReproPlanaNEATPlus:
             while len(new_pop) < self.pop_size:
                 parent = bests[int(self.rng.integers(len(bests)))]
                 child = parent.copy()
+                child.cooperative = True
                 child.id = self.next_gid
                 self.next_gid += 1
                 child.parents = (parent.id, None)
@@ -2135,10 +2183,29 @@ class ReproPlanaNEATPlus:
                 gen_events['asexual_clone'] += 1
         elif len(new_pop) > self.pop_size:
             new_pop = new_pop[:self.pop_size]
+        self._assign_lazy_individuals(new_pop)
         self.population = new_pop
         self.event_log.append(gen_events)
         for g in new_pop:
             self.lineage_edges.append((g.parents[0], g.parents[1], g.id, g.birth_gen, 'birth'))
+
+    def _assign_lazy_individuals(self, population: List[Genome]):
+        frac = float(getattr(self, 'lazy_fraction', 0.02))
+        if not population:
+            return
+        for g in population:
+            g.cooperative = True
+        if frac <= 0.0:
+            return
+        lazy_count = int(round(frac * len(population)))
+        if lazy_count <= 0 and frac > 0.0:
+            lazy_count = 1
+        lazy_count = min(lazy_count, len(population))
+        if lazy_count <= 0:
+            return
+        indices = self.rng.choice(len(population), size=lazy_count, replace=False)
+        for idx in np.atleast_1d(indices):
+            population[int(idx)].cooperative = False
 
     def _complexity_penalty(self, g: Genome) -> float:
         """Adaptive complexity penalty that encourages complex topologies under high difficulty."""
@@ -2165,16 +2232,25 @@ class ReproPlanaNEATPlus:
     def _evaluate_population(self, fitness_fn: Callable[[Genome], float]) -> List[float]:
         """並列評価（thread/process）。process は SHM メタを初期化し、必要なら持ち回りプールを再起動。"""
         workers = int(getattr(self, 'eval_workers', 1))
+        lazy_penalty = float(getattr(self, 'lazy_individual_fitness', 0.0))
+        coop_pairs: List[Tuple[int, Genome]] = []
+        out: List[Optional[float]] = [lazy_penalty] * len(self.population)
+        for idx, g in enumerate(self.population):
+            if getattr(g, 'cooperative', True):
+                out[idx] = None
+                coop_pairs.append((idx, g))
+        if not coop_pairs:
+            return [float(x) for x in out]
+        genomes_to_eval = [g for _, g in coop_pairs]
         if workers <= 1:
-            out = []
-            for g in self.population:
+            for idx, g in coop_pairs:
                 try:
-                    out.append(float(fitness_fn(g)))
+                    out[idx] = float(fitness_fn(g))
                 except Exception as _e:
                     _tb = traceback.format_exc()
                     print(f"[ERROR] fitness exception gid={getattr(g, 'id', '?')}: {_e}\n{_tb}")
-                    out.append(float(-1000000000.0))
-            return out
+                    out[idx] = float(-1000000000.0)
+            return [float(x if x is not None else lazy_penalty) for x in out]
         backend = getattr(self, 'parallel_backend', 'thread')
         if backend == 'process' and (not _is_picklable(fitness_fn)):
             print('[WARN] fitness_fn is not picklable; falling back to threads')
@@ -2196,43 +2272,50 @@ class ReproPlanaNEATPlus:
                         self._proc_pool = _cf.ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=_proc_init_worker, initargs=initargs)
                         self._proc_pool_age = 0
                     ex = self._proc_pool
-                    futs = [ex.submit(fitness_fn, g) for g in self.population]
-                    out = []
-                    for fut, g in zip(futs, self.population):
+                    futs = [ex.submit(fitness_fn, g) for g in genomes_to_eval]
+                    for (idx, g), fut in zip(coop_pairs, futs):
                         try:
-                            out.append(float(fut.result()))
+                            out[idx] = float(fut.result())
                         except Exception as _e:
                             _tb = traceback.format_exc()
                             print(f"[ERROR] fitness exception (proc) gid={getattr(g, 'id', '?')}: {_e}\n{_tb}")
-                            out.append(float(-1000000000.0))
+                            out[idx] = float(-1000000000.0)
                     self._proc_pool_age += 1
-                    return out
+                    return [float(x if x is not None else lazy_penalty) for x in out]
                 else:
                     with _cf.ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=_proc_init_worker, initargs=initargs) as ex:
-                        return list(ex.map(fitness_fn, self.population, chunksize=max(1, len(self.population) // workers)))
+                        futs = [ex.submit(fitness_fn, g) for g in genomes_to_eval]
+                        for (idx, g), fut in zip(coop_pairs, futs):
+                            try:
+                                out[idx] = float(fut.result())
+                            except Exception as _e:
+                                _tb = traceback.format_exc()
+                                print(f"[ERROR] fitness exception (proc) gid={getattr(g, 'id', '?')}: {_e}\n{_tb}")
+                                out[idx] = float(-1000000000.0)
+                    return [float(x if x is not None else lazy_penalty) for x in out]
             else:
+                if backend != 'thread':
+                    print(f"[WARN] Unknown backend '{backend}', defaulting to threads")
                 with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = [ex.submit(fitness_fn, g) for g in self.population]
-                    out = []
-                    for fut, g in zip(futs, self.population):
+                    futs = [ex.submit(fitness_fn, g) for g in genomes_to_eval]
+                    for (idx, g), fut in zip(coop_pairs, futs):
                         try:
-                            out.append(float(fut.result()))
+                            out[idx] = float(fut.result())
                         except Exception as _e:
                             _tb = traceback.format_exc()
                             print(f"[ERROR] fitness exception (thread) gid={getattr(g, 'id', '?')}: {_e}\n{_tb}")
-                            out.append(float(-1000000000.0))
-                    return out
+                            out[idx] = float(-1000000000.0)
+                return [float(x if x is not None else lazy_penalty) for x in out]
         except Exception as e:
             print('[WARN] parallel evaluation disabled:', e)
-            out = []
-            for g in self.population:
+            for idx, g in coop_pairs:
                 try:
-                    out.append(float(fitness_fn(g)))
+                    out[idx] = float(fitness_fn(g))
                 except Exception as _e:
                     _tb = traceback.format_exc()
                     print(f"[ERROR] fitness exception gid={getattr(g, 'id', '?')}: {_e}\n{_tb}")
-                    out.append(float(-1000000000.0))
-            return out
+                    out[idx] = float(-1000000000.0)
+            return [float(x if x is not None else lazy_penalty) for x in out]
 
     def _close_pool(self):
         ex = getattr(self, '_proc_pool', None)
