@@ -540,7 +540,22 @@ class _GenomeConnDict(dict):
 
 class Genome:
 
-    def __init__(self, nodes: Dict[int, 'NodeGene'], connections: Dict[int, 'ConnectionGene'], sex: Optional[str]=None, regen: bool=False, regen_mode: Optional[str]=None, embryo_bias: Optional[str]=None, gid: Optional[int]=None, birth_gen: int=0, hybrid_scale: float=1.0, parents: Optional[Tuple[Optional[int], Optional[int]]]=None, mutation_will: Optional[float]=None, cooperative: bool=True):
+    def __init__(
+        self,
+        nodes: Dict[int, 'NodeGene'],
+        connections: Dict[int, 'ConnectionGene'],
+        sex: Optional[str]=None,
+        regen: bool=False,
+        regen_mode: Optional[str]=None,
+        embryo_bias: Optional[str]=None,
+        gid: Optional[int]=None,
+        birth_gen: int=0,
+        hybrid_scale: float=1.0,
+        parents: Optional[Tuple[Optional[int], Optional[int]]]=None,
+        mutation_will: Optional[float]=None,
+        cooperative: bool=True,
+        family_id: Optional[int]=None,
+    ):
         self.origin_mode = 'initial'
         self._structure_rev = 0
         self._weights_rev = 0
@@ -569,6 +584,7 @@ class Genome:
         self.birth_gen = int(birth_gen)
         self.hybrid_scale = float(hybrid_scale)
         self.parents = parents if parents is not None else (None, None)
+        self.family_id = int(family_id) if family_id is not None else int(self.id)
         self.origin_mode = getattr(self, 'origin_mode', 'initial')
         self.max_hidden_nodes: Optional[int] = None
         self.max_edges: Optional[int] = None
@@ -587,6 +603,10 @@ class Genome:
             info['signature'] = self.structural_signature()
         except Exception:
             info['signature'] = None
+        try:
+            info['family_id'] = int(getattr(self, 'family_id', 0))
+        except Exception:
+            info['family_id'] = None
         info['event'] = event
         info['timestamp'] = time.time()
         self.meta_reflections.append(info)
@@ -618,7 +638,21 @@ class Genome:
             for nid, n in self.nodes.items()
         }
         conns = {innov: ConnectionGene(c.in_node, c.out_node, c.weight, c.enabled, c.innovation) for innov, c in self.connections.items()}
-        g = Genome(nodes, conns, self.sex, self.regen, self.regen_mode, self.embryo_bias, self.id, self.birth_gen, self.hybrid_scale, self.parents, mutation_will=self.mutation_will, cooperative=self.cooperative)
+        g = Genome(
+            nodes,
+            conns,
+            self.sex,
+            self.regen,
+            self.regen_mode,
+            self.embryo_bias,
+            self.id,
+            self.birth_gen,
+            self.hybrid_scale,
+            self.parents,
+            mutation_will=self.mutation_will,
+            cooperative=self.cooperative,
+            family_id=getattr(self, 'family_id', None),
+        )
         g.origin_mode = getattr(self, 'origin_mode', 'initial')
         g.max_hidden_nodes = self.max_hidden_nodes
         g.max_edges = self.max_edges
@@ -2423,6 +2457,10 @@ class ReproPlanaNEATPlus:
         base_genome.max_edges = self.max_edges
         self.population = []
         self.next_gid = 1
+        self._family_seq = 1
+        self._family_lineage_cache: 'OrderedDict[Tuple[int, ...], int]' = OrderedDict()
+        self.family_lineage_cache_limit = max(4096, population_size * 8)
+        self._family_parent_map: Dict[int, Tuple[int, ...]] = {}
         for _ in range(population_size):
             g = base_genome.copy()
             g.max_hidden_nodes = self.max_hidden_nodes
@@ -2440,6 +2478,7 @@ class ReproPlanaNEATPlus:
             g.birth_gen = 0
             g.mutation_will = float(np.clip(self.rng.uniform(0.0, 1.0), 0.0, 1.0))
             g.cooperative = True
+            g.family_id = self._next_family_id()
             setattr(g, 'lazy_lineage_strength', 0.0)
             self.population.append(g)
         input_ids = list(range(num_inputs))
@@ -2530,7 +2569,7 @@ class ReproPlanaNEATPlus:
         self._households = HouseholdManager(max_households=max(population_size * 4, 256))
         self._last_household_adjustments: Dict[int, float] = {}
         for g in self.population:
-            self.node_registry[g.id] = {'sex': g.sex, 'regen': g.regen, 'birth_gen': g.birth_gen}
+            self.node_registry[g.id] = {'sex': g.sex, 'regen': g.regen, 'birth_gen': g.birth_gen, 'family_id': g.family_id}
         self._assign_lazy_individuals(self.population)
         self.monodromy_top_ratio = 0.12
         self.monodromy_span = 6.0
@@ -2551,12 +2590,14 @@ class ReproPlanaNEATPlus:
         self.monodromy_diversity_grace_decay = 0.6
         self.monodromy_diversity_grace_strength = 0.3
         self.monodromy_noise_weight = 0.25
+        self.monodromy_family_weight = 0.35
         self.monodromy_noise_style_overrides: Dict[str, Dict[str, Any]] = {}
         self._monodromy_registry: Dict[int, Dict[str, float]] = {}
         self._monodromy_snapshot: Dict[str, float] = {
             'pressure_mean': 0.0,
             'pressure_max': 0.0,
             'active': 0,
+            'families': 0,
             'release': 0,
             'relief_mean': 0.0,
             'momentum_mean': 0.0,
@@ -2568,6 +2609,8 @@ class ReproPlanaNEATPlus:
             'noise_kind': '',
             'noise_focus': 0.0,
             'noise_entropy': 0.0,
+            'family_factor_mean': 1.0,
+            'family_factor_max': 1.0,
         }
         self._monodromy_noise_tag = ''
         self._auto_complexity_bonus_state = {
@@ -2592,6 +2635,7 @@ class ReproPlanaNEATPlus:
         self._lazy_env_feedback: Dict[str, Any] = {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0}
         self.spinor_controller: Optional[Any] = None
         self._best_context_value = -1000000000.0
+        self.monodromy_family_limit = max(self.pop_size * 6, 1536)
 
     def _heterosis_scale(self, mother: Genome, father: Genome) -> float:
         d = self._compat_distance(mother, father)
@@ -2608,6 +2652,64 @@ class ReproPlanaNEATPlus:
         notes.append((gen, summary))
         if len(notes) > 6:
             self.lineage_annotations[gid] = notes[-6:]
+
+    def _next_family_id(self) -> int:
+        seq = int(getattr(self, '_family_seq', 1))
+        self._family_seq = seq + 1
+        return seq
+
+    def _family_key_from_parents(self, parents: Sequence[Optional['Genome']]) -> Tuple[int, ...]:
+        ids: Set[int] = set()
+        for parent in parents:
+            if parent is None:
+                continue
+            fid = getattr(parent, 'family_id', None)
+            if fid is None:
+                continue
+            try:
+                ids.add(int(fid))
+            except Exception:
+                continue
+        if not ids:
+            return tuple()
+        return tuple(sorted(ids))
+
+    def _resolve_family_from_key(self, key: Tuple[int, ...]) -> int:
+        if not key:
+            return self._next_family_id()
+        if len(key) == 1:
+            return int(key[0])
+        cache = getattr(self, '_family_lineage_cache', None)
+        if cache is None:
+            cache = OrderedDict()
+            self._family_lineage_cache = cache
+        fid = cache.get(key)
+        if fid is None:
+            fid = self._next_family_id()
+            cache[key] = fid
+        else:
+            cache.move_to_end(key)
+        limit = int(getattr(self, 'family_lineage_cache_limit', max(4096, self.pop_size * 8)))
+        while len(cache) > limit:
+            cache.popitem(last=False)
+        parent_map = getattr(self, '_family_parent_map', None)
+        if isinstance(parent_map, dict):
+            parent_map[fid] = key
+            valid_ids = set(cache.values())
+            if len(parent_map) > max(limit, len(valid_ids)):
+                for stale in [k for k in list(parent_map.keys()) if k not in valid_ids]:
+                    parent_map.pop(stale, None)
+        return int(fid)
+
+    def _assign_child_family(self, child: 'Genome', parents: Sequence[Optional['Genome']]) -> int:
+        key = self._family_key_from_parents(parents)
+        fid = getattr(child, 'family_id', None)
+        if key:
+            fid = self._resolve_family_from_key(key)
+        elif fid is None:
+            fid = self._next_family_id()
+        child.family_id = int(fid)
+        return int(fid)
 
     def _update_lazy_feedback(self, generation: int, fitnesses: Sequence[float], best_idx: int, best_fit: float, avg_fit: float) -> None:
         total = len(self.population)
@@ -2954,6 +3056,7 @@ class ReproPlanaNEATPlus:
             self.next_gid += 1
             child.parents = (e.id, e.id)
             child.birth_gen = self.generation + 1
+            self._assign_child_family(child, (e,))
             parent_strength = float(getattr(e, 'lazy_lineage_strength', 0.0) or 0.0)
             inheritance_decay = float(np.clip(getattr(self, 'lazy_lineage_inheritance_decay', 0.24), 0.0, 0.95))
             inheritance_gain = float(max(0.0, getattr(self, 'lazy_lineage_inheritance_gain', 0.0)))
@@ -2964,7 +3067,7 @@ class ReproPlanaNEATPlus:
             setattr(child, 'lazy_lineage', False)
             new_pop.append(child)
             events['asexual_clone'] += 1
-            self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
+            self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen, 'family_id': child.family_id}
         remaining = offspring_counts[sidx] - len(elites)
         k = max(2, int(math.ceil(self.survival_rate * len(sp.members))))
         females = [g for g, _ in sp.members[:k] if g.sex == 'female']
@@ -3085,6 +3188,7 @@ class ReproPlanaNEATPlus:
             child.parents = (mother_id, father_id)
             child.birth_gen = self.generation + 1
             child.origin_mode = mode
+            self._assign_child_family(child, (parent, mother, father))
             parent_strengths: List[float] = []
             parent_lazy_flags: List[bool] = []
             if parent is not None:
@@ -3108,7 +3212,7 @@ class ReproPlanaNEATPlus:
             new_strength = float(np.clip(carried + gain, 0.0, strength_cap))
             setattr(child, 'lazy_lineage_strength', new_strength)
             setattr(child, 'lazy_lineage', False)
-            self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
+            self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen, 'family_id': child.family_id}
             if monitor is not None and parent_adj_before_regen is not None:
                 regen_adj = child.weighted_adjacency()
                 changed_nodes, changed_edges = summarize_graph_changes(parent_adj_before_regen, regen_adj, weight_tol)
@@ -3176,7 +3280,8 @@ class ReproPlanaNEATPlus:
                 self.next_gid += 1
                 child.parents = (parent.id, None)
                 child.birth_gen = self.generation + 1
-                self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen}
+                self._assign_child_family(child, (parent,))
+                self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen, 'family_id': child.family_id}
                 parent_strength = float(getattr(parent, 'lazy_lineage_strength', 0.0) or 0.0)
                 inheritance_decay = float(np.clip(getattr(self, 'lazy_lineage_inheritance_decay', 0.24), 0.0, 0.95))
                 inheritance_gain = float(max(0.0, getattr(self, 'lazy_lineage_inheritance_gain', 0.0)))
@@ -3604,12 +3709,15 @@ class ReproPlanaNEATPlus:
         signature_map: Dict[int, Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]]],
         generation: int,
         signature_counts: Optional[Dict[Any, int]]=None,
+        family_counts: Optional[Dict[int, int]]=None,
+        family_metrics: Optional[Dict[int, Dict[str, Any]]]=None,
     ) -> List[float]:
         def _reset_snapshot() -> None:
             self._monodromy_snapshot = {
                 'pressure_mean': 0.0,
                 'pressure_max': 0.0,
                 'active': 0,
+                'families': 0,
                 'release': 0,
                 'relief_mean': 0.0,
                 'momentum_mean': 0.0,
@@ -3621,6 +3729,8 @@ class ReproPlanaNEATPlus:
                 'noise_kind': '',
                 'noise_focus': 0.0,
                 'noise_entropy': 0.0,
+                'family_factor_mean': 1.0,
+                'family_factor_max': 1.0,
             }
 
         n = len(fitnesses)
@@ -3672,18 +3782,106 @@ class ReproPlanaNEATPlus:
             top_ratio = float(getattr(self, 'monodromy_top_ratio', 0.1))
         except Exception:
             top_ratio = 0.1
-        top_k = max(1, min(n, int(round(top_ratio * n))))
-        if top_k >= n:
-            order = np.argsort(baseline_arr)[::-1]
+        pop = getattr(self, 'population', [])
+        family_members: Dict[int, Tuple[int, ...]] = {}
+        family_best_idx: Dict[int, int] = {}
+        fam_counts_local: Dict[int, int] = {}
+        if family_metrics:
+            fam_counts_local = {}
+            for key, info in family_metrics.items():
+                try:
+                    fid = int(key)
+                except Exception:
+                    continue
+                members_seq = info.get('members', ()) if isinstance(info, dict) else ()
+                members_tuple = tuple(
+                    int(m)
+                    for m in members_seq
+                    if isinstance(m, (int, np.integer)) and 0 <= int(m) < len(pop)
+                )
+                if not members_tuple and isinstance(info, dict):
+                    # Fallback to recorded best index if provided
+                    best_idx = int(info.get('best_idx', -1)) if 'best_idx' in info else -1
+                    if 0 <= best_idx < len(pop):
+                        members_tuple = (best_idx,)
+                if not members_tuple:
+                    continue
+                fam_counts_local[fid] = int(info.get('size', len(members_tuple))) if isinstance(info, dict) else len(members_tuple)
+                best_idx = int(info.get('best_idx', members_tuple[0])) if isinstance(info, dict) else members_tuple[0]
+                if best_idx < 0 or best_idx >= len(pop):
+                    best_idx = members_tuple[0]
+                family_members[fid] = members_tuple
+                family_best_idx[fid] = best_idx
         else:
-            partition = np.argpartition(baseline_arr, -top_k)[-top_k:]
-            order = partition[np.argsort(baseline_arr[partition])[::-1]]
-        top_indices = [int(i) for i in order[:top_k]]
+            fallback_members: Dict[int, List[int]] = defaultdict(list)
+            fam_counts_local = {}
+            if family_counts:
+                for key, val in family_counts.items():
+                    try:
+                        fam_counts_local[int(key)] = int(val)
+                    except Exception:
+                        continue
+            for idx, genome in enumerate(pop):
+                if idx >= baseline_arr.size:
+                    break
+                fid_raw = getattr(genome, 'family_id', None)
+                if fid_raw is None:
+                    parents = getattr(genome, 'parents', (None, None))
+                    fid_raw = parents[0] if parents and parents[0] is not None else genome.id
+                try:
+                    fid = int(fid_raw)
+                except Exception:
+                    fid = int(getattr(genome, 'id', idx))
+                fallback_members[fid].append(idx)
+                prev_idx = family_best_idx.get(fid)
+                if prev_idx is None or baseline_arr[idx] > baseline_arr[prev_idx]:
+                    family_best_idx[fid] = idx
+            family_members = {fid: tuple(members) for fid, members in fallback_members.items() if members}
+            for fid, members in family_members.items():
+                fam_counts_local.setdefault(fid, len(members))
+        family_counts = fam_counts_local
+        families = list(family_best_idx.keys())
+        family_order: List[int] = []
+        if families:
+            fam_ids = np.asarray(families, dtype=np.int64)
+            fam_scores = np.asarray([baseline_arr[family_best_idx[fid]] for fid in fam_ids], dtype=np.float64)
+            fam_count = fam_ids.size
+            fam_top = max(1, min(fam_count, int(math.ceil(top_ratio * fam_count))))
+            if fam_top >= fam_count:
+                fam_order_idx = np.argsort(fam_scores)[::-1]
+            else:
+                fam_part = np.argpartition(fam_scores, -fam_top)[-fam_top:]
+                fam_order_idx = fam_part[np.argsort(fam_scores[fam_part])[::-1]]
+            family_order = [int(fam_ids[i]) for i in fam_order_idx]
+            top_indices = [int(family_best_idx[fid]) for fid in family_order]
+        else:
+            order = np.argsort(baseline_arr)[::-1]
+            top_k = max(1, min(n, int(round(top_ratio * n))))
+            top_indices = [int(i) for i in order[:top_k]]
+            if pop:
+                for idx in top_indices:
+                    if 0 <= idx < len(pop):
+                        fid_raw = getattr(pop[idx], 'family_id', None)
+                        if fid_raw is None:
+                            parents = getattr(pop[idx], 'parents', (None, None))
+                            fid_raw = parents[0] if parents and parents[0] is not None else getattr(pop[idx], 'id', idx)
+                        try:
+                            family_order.append(int(fid_raw))
+                        except Exception:
+                            family_order.append(int(idx))
+                    else:
+                        family_order.append(int(idx))
+            else:
+                family_order = [int(i) for i in top_indices]
         if not top_indices:
             _reset_snapshot()
             return list(fitnesses)
         median = float(np.median(baseline_arr))
-        best_val = float(baseline_arr[order[0]]) if order.size else median
+        if family_order:
+            best_idx = family_best_idx.get(family_order[0], top_indices[0])
+            best_val = float(baseline_arr[best_idx]) if baseline_arr.size else median
+        else:
+            best_val = float(baseline_arr[top_indices[0]]) if top_indices else median
         span_scale = abs(best_val - median)
         if not math.isfinite(span_scale) or span_scale < 1e-6:
             span_scale = max(1e-6, abs(best_val) if math.isfinite(best_val) else 1.0)
@@ -3702,8 +3900,9 @@ class ReproPlanaNEATPlus:
             registry = {}
             self._monodromy_registry = registry
         adjusted = list(fitnesses)
-        seen: Set[int] = set()
+        seen_families: Set[int] = set()
         total_penalty = 0.0
+        spill_penalty_total = 0.0
         max_penalty = 0.0
         release_count = 0
         relief_total = 0.0
@@ -3712,17 +3911,42 @@ class ReproPlanaNEATPlus:
         diversity_total = 0.0
         diversity_max = 0.0
         grace_total = 0.0
+        family_factor_total = 0.0
+        family_factor_max = 1.0
+        elite_seen = 0
         span_scale_safe = max(span_scale, 1e-6)
-        for idx in top_indices:
-            if idx < 0 or idx >= n:
+        family_weight = float(np.clip(getattr(self, 'monodromy_family_weight', 0.0), 0.0, 2.0))
+        pop_size = max(1, len(pop))
+        family_target_share = 1.0 / float(max(1, len(family_counts))) if family_counts else 0.0
+        family_surplus_total = 0.0
+        family_surplus_max = 0.0
+        family_spread_total = 0.0
+        family_trend_total = 0.0
+        for fam_id, idx in zip(family_order, top_indices):
+            if idx < 0 or idx >= n or idx >= len(self.population):
                 continue
             genome = self.population[idx]
             gid = genome.id
-            state = registry.get(gid)
+            try:
+                family_id = int(fam_id)
+            except Exception:
+                try:
+                    family_id = int(getattr(genome, 'family_id', gid))
+                except Exception:
+                    family_id = int(gid)
+            state = registry.get(family_id)
             sig = signature_map.get(gid)
             if state is None:
                 phase = float(self.rng.random())
-                state = {'phase': phase, 'stasis': 0.0, 'signature': sig, 'pressure': 0.0, 'momentum': 0.0, 'diversity_grace': grace_init}
+                state = {
+                    'phase': phase,
+                    'stasis': 0.0,
+                    'signature': sig,
+                    'pressure': 0.0,
+                    'momentum': 0.0,
+                    'diversity_grace': grace_init,
+                    'family_id': family_id,
+                }
             phase = (float(state.get('phase', 0.0)) + phase_step) % 1.0
             state['phase'] = phase
             prev_sig = state.get('signature')
@@ -3783,19 +4007,89 @@ class ReproPlanaNEATPlus:
             target *= div_factor
             target *= grace_factor
             target *= noise_factor
+            info = family_metrics.get(family_id) if family_metrics else None
+            members = family_members.get(family_id, tuple())
+            if info:
+                family_size = max(1, int(info.get('size', len(members) or 1)))
+                family_share = float(info.get('share', family_size / float(pop_size)))
+                family_surplus = float(max(0.0, info.get('surplus', family_share - family_target_share)))
+                family_median = float(info.get('median', baseline_arr[idx]))
+                family_spread = float(max(0.0, info.get('spread', 0.0)))
+            else:
+                family_size = max(1, int(family_counts.get(family_id, len(members) or 1)))
+                family_share = float(family_size) / float(pop_size)
+                family_surplus = max(0.0, family_share - family_target_share)
+                if members:
+                    try:
+                        members_arr = np.asarray(members, dtype=np.int64)
+                        local_scores = baseline_arr[members_arr]
+                    except Exception:
+                        local_scores = np.asarray([baseline_arr[m] for m in members], dtype=np.float64)
+                    family_median = float(np.median(local_scores)) if local_scores.size else float(baseline_arr[idx])
+                    family_spread = float(np.std(local_scores)) if local_scores.size else 0.0
+                else:
+                    family_median = float(baseline_arr[idx])
+                    family_spread = 0.0
+            prev_share = float(state.get('family_share', family_share))
+            share_delta = float(family_share - prev_share)
+            surplus_ratio = family_surplus / max(family_target_share, 1e-9) if family_target_share > 0.0 else 0.0
+            family_surplus_total += surplus_ratio
+            if surplus_ratio > family_surplus_max:
+                family_surplus_max = surplus_ratio
+            family_spread_total += family_spread
+            family_trend_total += share_delta
+            state['family_size'] = float(family_size)
+            state['family_share'] = float(family_share)
+            state['family_surplus'] = float(family_surplus)
+            state['family_median'] = float(family_median)
+            state['family_spread'] = float(family_spread)
+            state['family_share_delta'] = float(share_delta)
+            state['family_surplus_ratio'] = float(surplus_ratio)
+            family_factor = 1.0
+            if family_weight > 0.0:
+                share_factor = 1.0 + family_weight * min(3.5, max(0.0, surplus_ratio))
+                trend_factor = float(np.clip(1.0 + 0.5 * family_weight * share_delta * max(1, len(family_counts)), 0.5, 1.8))
+                median_factor = 1.0 + 0.45 * family_weight * max(0.0, (family_median - median) / span_scale_safe)
+                if span_scale_safe > 0.0:
+                    spread_norm = float(np.clip(1.0 - min(1.0, family_spread / max(span_scale_safe, 1e-9)), 0.0, 1.0))
+                else:
+                    spread_norm = 0.0
+                spread_factor = 1.0 + 0.25 * family_weight * spread_norm
+                family_factor = float(np.clip(share_factor * trend_factor * median_factor * spread_factor, 1.0, 6.0))
+            state['family_factor'] = family_factor
+            family_factor_total += family_factor
+            if family_factor > family_factor_max:
+                family_factor_max = family_factor
+            target *= family_factor
             pressure_prev = float(state.get('pressure', 0.0))
             pressure = pressure_prev * (1.0 - smoothing) + target * smoothing
             state['pressure'] = pressure
             penalty = min(cap * span_scale, pressure * span_scale)
+            state['family_spill'] = 0.0
             if penalty > 0.0 and math.isfinite(penalty):
                 adjusted[idx] = float(adjusted[idx] - penalty)
                 total_penalty += penalty
                 if penalty > max_penalty:
                     max_penalty = penalty
                 state['last_penalty'] = penalty
+                members = family_members.get(family_id, [])
+                spill_total = 0.0
+                if members and len(members) > 1:
+                    others = [m for m in members if m != idx]
+                    if others:
+                        spill_total = float(penalty * min(0.35, 0.18 * math.log1p(len(others))))
+                        if spill_total > 0.0:
+                            per_other = spill_total / len(others)
+                            for other_idx in others:
+                                if 0 <= other_idx < len(adjusted):
+                                    adjusted[other_idx] = float(adjusted[other_idx] - per_other)
+                            spill_penalty_total += spill_total
+                state['family_spill'] = float(spill_total)
             state['last_seen'] = int(generation)
-            registry[gid] = state
-            seen.add(gid)
+            state['last_gid'] = int(gid)
+            registry[family_id] = state
+            seen_families.add(family_id)
+            elite_seen += 1
             relief_total += relief_gain
             momentum_total += momentum
             if abs(momentum) > momentum_max:
@@ -3806,27 +4100,39 @@ class ReproPlanaNEATPlus:
             grace_total += float(grace_factor)
         if registry:
             to_remove = []
-            for gid, state in list(registry.items()):
-                if gid in seen:
+            for fid, state in list(registry.items()):
+                if int(fid) in seen_families:
                     continue
                 state['stasis'] = float(state.get('stasis', 0.0)) * decay
                 state['pressure'] = float(state.get('pressure', 0.0)) * decay
                 state['momentum'] = float(state.get('momentum', 0.0)) * decay
                 state['diversity_grace'] = float(state.get('diversity_grace', 0.0)) * grace_decay
                 if state.get('stasis', 0.0) < 0.05:
-                    to_remove.append(gid)
+                    to_remove.append(fid)
                 else:
-                    registry[gid] = state
-            for gid in to_remove:
-                registry.pop(gid, None)
-        active = len(seen)
-        mean_penalty = float(total_penalty / max(1, active)) if active else 0.0
+                    registry[fid] = state
+            for fid in to_remove:
+                registry.pop(fid, None)
+            limit = int(getattr(self, 'monodromy_family_limit', max(self.pop_size * 6, 1536)))
+            if len(registry) > limit:
+                ordered = sorted(registry.items(), key=lambda kv: kv[1].get('last_seen', -1))
+                for old_fid, _ in ordered[:-limit]:
+                    if int(old_fid) in seen_families:
+                        continue
+                    registry.pop(old_fid, None)
+        active = elite_seen
+        total_penalty_all = total_penalty + spill_penalty_total
+        mean_penalty = float(total_penalty_all / max(1, active)) if active else 0.0
         relief_mean = float(relief_total / max(1, active)) if active else 0.0
         momentum_mean = float(momentum_total / max(1, active)) if active else 0.0
+        family_surplus_mean = float(family_surplus_total / max(1, active)) if active else 0.0
+        family_spread_mean = float(family_spread_total / max(1, active)) if active else 0.0
+        family_trend_mean = float(family_trend_total / max(1, active)) if active else 0.0
         self._monodromy_snapshot = {
             'pressure_mean': mean_penalty,
             'pressure_max': float(max_penalty),
             'active': int(active),
+            'families': int(len(seen_families)),
             'release': int(release_count),
             'relief_mean': relief_mean,
             'momentum_mean': momentum_mean,
@@ -3838,6 +4144,13 @@ class ReproPlanaNEATPlus:
             'noise_kind': style.get('symbol', noise_kind or ''),
             'noise_focus': float(noise_focus),
             'noise_entropy': float(noise_entropy),
+            'family_factor_mean': float(family_factor_total / max(1, active)) if active else 1.0,
+            'family_factor_max': float(family_factor_max),
+            'family_surplus_mean': float(family_surplus_mean),
+            'family_surplus_max': float(family_surplus_max),
+            'family_spread_mean': float(family_spread_mean),
+            'family_share_delta_mean': float(family_trend_mean),
+            'family_target_share': float(family_target_share),
         }
         return adjusted
 
@@ -3888,20 +4201,33 @@ class ReproPlanaNEATPlus:
                             print(f"[WARN] household manager failed: {_hm_err}")
                         adjustments = {}
                 self._last_household_adjustments = dict(adjustments)
+                pop_total = len(self.population)
                 if adjustments:
                     raw = [float(r + adjustments.get(g.id, 0.0)) for g, r in zip(self.population, raw)]
                 signature_map: Dict[int, Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]]] = {}
                 signature_counts: Dict[Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]], int] = {}
+                family_counts: Dict[int, int] = {}
+                family_members: Dict[int, List[int]] = defaultdict(list)
                 complexity_stats: Dict[int, Tuple[int, int, float, float, float]] = {}
                 complexity_scores: List[float] = []
                 max_complexity_score = 0.0
-                for g in self.population:
+                for idx, g in enumerate(self.population):
                     try:
                         sig = g.structural_signature()
                         signature_map[g.id] = sig
                         signature_counts[sig] = signature_counts.get(sig, 0) + 1
                     except Exception:
                         pass
+                    try:
+                        fid_raw = getattr(g, 'family_id', None)
+                        if fid_raw is None:
+                            parents = getattr(g, 'parents', (None, None))
+                            fid_raw = parents[0] if parents and parents[0] is not None else g.id
+                        fid = int(fid_raw)
+                    except Exception:
+                        fid = int(getattr(g, 'id', 0))
+                    family_counts[fid] = family_counts.get(fid, 0) + 1
+                    family_members[fid].append(idx)
                     try:
                         stats = g.structural_complexity_stats()
                         score = float(stats[-1])
@@ -3923,6 +4249,28 @@ class ReproPlanaNEATPlus:
                     diversity_entropy = 0.0
                 diversity_entropy = float(np.clip(diversity_entropy, 0.0, 1.0))
                 diversity_scarcity = float(np.clip(1.0 - diversity_entropy, 0.0, 1.0))
+                family_entropy = 0.0
+                top_family_share = 0.0
+                family_surplus_ratio_max = 0.0
+                family_surplus_ratio_mean = 0.0
+                family_count = len(family_counts)
+                if family_count:
+                    fam_arr = np.asarray(list(family_counts.values()), dtype=np.float64)
+                    fam_freq = fam_arr / max(1.0, fam_arr.sum())
+                    fam_entropy_raw = float(-(fam_freq * np.log(fam_freq + 1e-12)).sum())
+                    fam_entropy_max = float(np.log(max(1.0, fam_arr.size)))
+                    family_entropy = fam_entropy_raw / max(fam_entropy_max, 1e-12) if fam_entropy_max > 0 else 0.0
+                    top_family_share = float(fam_freq.max())
+                    if pop_total > 0:
+                        target_share = 1.0 / float(family_count)
+                        ratios = [
+                            float(max(0.0, (count / float(pop_total)) - target_share)) / max(target_share, 1e-9)
+                            for count in family_counts.values()
+                        ]
+                        if ratios:
+                            family_surplus_ratio_max = float(max(ratios))
+                            family_surplus_ratio_mean = float(sum(ratios) / len(ratios))
+                family_entropy = float(np.clip(family_entropy, 0.0, 1.0))
                 complexity_arr = np.asarray(complexity_scores, dtype=np.float64) if complexity_scores else np.zeros(0, dtype=np.float64)
                 complexity_mean = float(complexity_arr.mean()) if complexity_arr.size else 0.0
                 complexity_std = float(complexity_arr.std()) if complexity_arr.size else 0.0
@@ -3936,6 +4284,7 @@ class ReproPlanaNEATPlus:
                 adaptive_multiplier = float(np.clip(adaptive_multiplier, 0.5, 3.5))
                 div_bonus_scale = float(base_div_bonus * adaptive_multiplier)
                 div_power = float(np.clip(base_div_power * (1.0 + 0.5 * diversity_scarcity), 1.0, 3.5))
+                household_pressure = float(self._household_pressure())
                 diversity_snapshot = {
                     'gen': int(gen),
                     'entropy': float(diversity_entropy),
@@ -3950,17 +4299,18 @@ class ReproPlanaNEATPlus:
                     'env_entropy': float(env_entropy),
                     'lazy_share': float(lazy_share),
                     'unique_signatures': int(len(signature_counts) or 0),
+                    'family_entropy': float(family_entropy),
+                    'top_family_share': float(top_family_share),
+                    'family_count': int(family_count),
+                    'family_surplus_ratio_max': float(family_surplus_ratio_max),
+                    'family_surplus_ratio_mean': float(family_surplus_ratio_mean),
+                    'household_pressure': float(household_pressure),
                 }
                 self._diversity_snapshot = diversity_snapshot
                 self.diversity_history.append(diversity_snapshot)
                 if len(self.diversity_history) > int(getattr(self, 'diversity_history_limit', 4096)):
                     self.diversity_history = self.diversity_history[-int(self.diversity_history_limit):]
                 controller = getattr(self, 'spinor_controller', None)
-                if controller is not None and hasattr(controller, 'ingest_diversity_metrics'):
-                    try:
-                        controller.ingest_diversity_metrics(gen, diversity_snapshot)
-                    except Exception:
-                        pass
                 auto_state = None
                 if getattr(self, 'auto_complexity_controls', False):
                     try:
@@ -4072,12 +4422,56 @@ class ReproPlanaNEATPlus:
                         f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
                     fitnesses.append(f2)
                 baseline_fitnesses = list(fitnesses)
+                family_metrics: Dict[int, Dict[str, Any]] = {}
+                if family_members:
+                    try:
+                        baseline_arr = np.asarray(baseline_fitnesses, dtype=np.float64)
+                    except Exception:
+                        baseline_arr = np.array([float(x) for x in baseline_fitnesses], dtype=np.float64)
+                    target_share = 1.0 / float(family_count) if family_count else 0.0
+                    for fid, members in family_members.items():
+                        if not members:
+                            continue
+                        members_arr = np.asarray(members, dtype=np.int64)
+                        try:
+                            local_scores = baseline_arr[members_arr]
+                        except Exception:
+                            local_scores = np.asarray([baseline_fitnesses[i] for i in members], dtype=np.float64)
+                        if local_scores.size == 0:
+                            continue
+                        best_local = int(np.argmax(local_scores))
+                        best_idx = int(members_arr[best_local]) if best_local < members_arr.size else int(members[0])
+                        share = float(len(members)) / float(max(1, pop_total))
+                        surplus = max(0.0, share - target_share)
+                        family_metrics[int(fid)] = {
+                            'members': tuple(int(i) for i in members),
+                            'size': int(len(members)),
+                            'share': float(share),
+                            'surplus': float(surplus),
+                            'best_idx': int(best_idx),
+                            'best_score': float(local_scores[best_local]),
+                            'median': float(np.median(local_scores)),
+                            'spread': float(np.std(local_scores)),
+                        }
+                if controller is not None and hasattr(controller, 'ingest_diversity_metrics'):
+                    try:
+                        controller.ingest_diversity_metrics(gen, diversity_snapshot)
+                    except Exception:
+                        pass
                 try:
                     fitnesses = self._adaptive_refine_fitness(fitnesses, fitness_fn)
                 except Exception:
                     pass
                 try:
-                    fitnesses = self._apply_monodromy_pressure(fitnesses, baseline_fitnesses, signature_map, gen, signature_counts=signature_counts)
+                    fitnesses = self._apply_monodromy_pressure(
+                        fitnesses,
+                        baseline_fitnesses,
+                        signature_map,
+                        gen,
+                        signature_counts=signature_counts,
+                        family_counts=family_counts,
+                        family_metrics=family_metrics,
+                    )
                 except Exception as _mono_err:
                     if getattr(self, 'debug_monodromy', False):
                         print('[WARN] monodromy pressure skipped:', _mono_err)
@@ -4156,7 +4550,8 @@ class ReproPlanaNEATPlus:
                             f" | mono {mono.get('pressure_mean', 0.0):.3f}/{mono.get('pressure_max', 0.0):.3f}"
                             f"~{int(mono.get('release', 0))}"
                             f" Δ{mono.get('relief_mean', 0.0):.3f} μ{mono.get('momentum_mean', 0.0):.3f}"
-                            f" div{mono.get('diversity_mean', 0.0):.2f} gr{mono.get('grace_mean', 0.0):.2f} nf{mono.get('noise_factor', 1.0):.2f}"
+                            f" div{mono.get('diversity_mean', 0.0):.2f} gr{mono.get('grace_mean', 0.0):.2f}"
+                            f" nf{mono.get('noise_factor', 1.0):.2f} fam{mono.get('family_factor_mean', 1.0):.2f}@{int(mono.get('families', 0))}"
                         )
                         nk = mono.get('noise_kind')
                         if nk:
@@ -4170,6 +4565,10 @@ class ReproPlanaNEATPlus:
                                 f" sc{float(div_snap.get('scarcity', 0.0)):.2f}"
                                 f" κ{float(div_snap.get('structural_spread', 0.0)):.2f}"
                             )
+                            fam_count = int(div_snap.get('family_count', 0) or 0)
+                            if fam_count:
+                                div_str += f" fam{float(div_snap.get('top_family_share', 0.0)):.2f}@{fam_count}"
+                            div_str += f" hh{float(div_snap.get('household_pressure', 0.0)):.2f}"
                         except Exception:
                             div_str = ''
                     print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}{div_str}")
@@ -5332,6 +5731,90 @@ def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: st
     ax_mid.plot(gens, env_noise, label='env noise', color='#17becf', linewidth=1.4)
     ax_mid.plot(gens, env_focus, label='env focus', color='#ff7f0e', linewidth=1.2, linestyle='-.')
     ax_mid.plot(gens, env_entropy, label='env entropy', color='#7f7f7f', linewidth=1.0, linestyle=':')
+    ax_mid.set_ylabel('environmental metrics')
+    ax_mid.legend(loc='upper right', frameon=False, fontsize=8)
+    ax_bottom.set_xlabel('generation')
+    if title:
+        fig.suptitle(title, fontsize=13)
+    fig.tight_layout(rect=[0, 0.02, 1, 0.98])
+    _savefig(fig, png_path, dpi=220)
+    plt.close(fig)
+    return (csv_path, png_path)
+
+
+def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: str, png_path: str, title: str='Diversity & Environment Trajectory') -> Tuple[Optional[str], Optional[str]]:
+    if not div_history:
+        return (None, None)
+    os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
+    os.makedirs(os.path.dirname(png_path) or '.', exist_ok=True)
+    fields = [
+        'gen',
+        'entropy',
+        'scarcity',
+        'family_entropy',
+        'top_family_share',
+        'family_surplus_ratio_max',
+        'family_surplus_ratio_mean',
+        'family_count',
+        'complexity_mean',
+        'complexity_std',
+        'structural_spread',
+        'diversity_bonus',
+        'diversity_power',
+        'env_noise',
+        'env_focus',
+        'env_entropy',
+        'lazy_share',
+        'household_pressure',
+        'unique_signatures',
+        'complexity_baseline',
+        'complexity_span',
+        'complexity_span_quantile',
+        'complexity_max',
+        'complexity_bonus_limit',
+    ]
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in div_history:
+            payload = {key: row.get(key, '') for key in fields}
+            writer.writerow(payload)
+    gens = np.array([int(item.get('gen', idx)) for idx, item in enumerate(div_history)], dtype=np.int32)
+    entropy = np.array([float(item.get('entropy', 0.0)) for item in div_history], dtype=np.float64)
+    scarcity = np.array([float(item.get('scarcity', 0.0)) for item in div_history], dtype=np.float64)
+    family_entropy = np.array([float(item.get('family_entropy', 0.0)) for item in div_history], dtype=np.float64)
+    top_family_share = np.array([float(item.get('top_family_share', 0.0)) for item in div_history], dtype=np.float64)
+    family_surplus_ratio = np.array([float(item.get('family_surplus_ratio_max', 0.0)) for item in div_history], dtype=np.float64)
+    family_surplus_ratio_mean = np.array([float(item.get('family_surplus_ratio_mean', 0.0)) for item in div_history], dtype=np.float64)
+    spread = np.array([float(item.get('structural_spread', 0.0)) for item in div_history], dtype=np.float64)
+    bonus = np.array([float(item.get('diversity_bonus', 0.0)) for item in div_history], dtype=np.float64)
+    env_noise = np.array([float(item.get('env_noise', 0.0)) for item in div_history], dtype=np.float64)
+    env_focus = np.array([float(item.get('env_focus', 0.0)) for item in div_history], dtype=np.float64)
+    env_entropy = np.array([float(item.get('env_entropy', 0.0)) for item in div_history], dtype=np.float64)
+    lazy_share = np.array([float(item.get('lazy_share', 0.0)) for item in div_history], dtype=np.float64)
+    household_pressure = np.array([float(item.get('household_pressure', 0.0)) for item in div_history], dtype=np.float64)
+    fig, axes = plt.subplots(2, 1, sharex=True, figsize=(7.4, 6.0))
+    ax_top, ax_bottom = axes
+    ax_top.plot(gens, entropy, label='entropy (structural)', color='#1f78b4', linewidth=1.8)
+    ax_top.plot(gens, scarcity, label='scarcity', color='#d62728', linewidth=1.6)
+    ax_top.plot(gens, family_entropy, label='entropy (family)', color='#6a3d9a', linewidth=1.4, linestyle='-.')
+    ax_top.fill_between(gens, 0.0, scarcity, color='#ff9896', alpha=0.25)
+    ax_top.set_ylabel('entropy / scarcity')
+    ax_top.legend(loc='upper right', frameon=False, fontsize=9)
+    ax_top.grid(True, linestyle='--', alpha=0.2)
+    ax_mid = ax_bottom.twinx()
+    ax_bottom.plot(gens, bonus, label='diversity bonus', color='#2ca02c', linewidth=1.7)
+    ax_bottom.plot(gens, spread, label='structural spread', color='#9467bd', linewidth=1.5, linestyle='--')
+    ax_bottom.plot(gens, lazy_share, label='lazy share', color='#8c564b', linewidth=1.3, linestyle=':')
+    ax_bottom.plot(gens, top_family_share, label='top family share', color='#e377c2', linewidth=1.2, linestyle='-.')
+    ax_bottom.plot(gens, family_surplus_ratio, label='family surplus ratio', color='#ffbb78', linewidth=1.1, linestyle='--')
+    ax_bottom.set_ylabel('bonus / spread / lazy share')
+    ax_bottom.legend(loc='upper left', frameon=False, fontsize=9)
+    ax_bottom.grid(True, linestyle='--', alpha=0.2)
+    ax_mid.plot(gens, env_noise, label='env noise', color='#17becf', linewidth=1.4)
+    ax_mid.plot(gens, env_focus, label='env focus', color='#ff7f0e', linewidth=1.2, linestyle='-.')
+    ax_mid.plot(gens, env_entropy, label='env entropy', color='#7f7f7f', linewidth=1.0, linestyle=':')
+    ax_mid.plot(gens, household_pressure, label='household', color='#b15928', linewidth=1.1, linestyle='--')
     ax_mid.set_ylabel('environmental metrics')
     ax_mid.legend(loc='upper right', frameon=False, fontsize=8)
     ax_bottom.set_xlabel('generation')
@@ -7325,7 +7808,30 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     if not argv_list:
         return _run_default_fractal_demo()
     _ensure_matplotlib_agg(force=True)
-    ap = argparse.ArgumentParser(description='Spiral-NEAT NumPy | built-in CLI')
+    report_override: Optional[bool] = None
+    legacy_flags: List[str] = []
+    want_help = False
+    cleaned_args: List[str] = []
+    for arg in argv_list:
+        if arg == '--h':
+            want_help = True
+            continue
+        if arg == '--report':
+            report_override = True
+            legacy_flags.append('--report')
+            continue
+        if arg == '--no-report':
+            report_override = False
+            continue
+        if arg == '--sync-spinor-seeds':
+            legacy_flags.append('--sync-spinor-seeds')
+            continue
+        cleaned_args.append(arg)
+    argv_list = cleaned_args
+    ap = argparse.ArgumentParser(
+        description='Spiral-NEAT NumPy | built-in CLI',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     ap.add_argument('--task', dest='tasks_single', action='append', nargs='+', choices=['xor', 'circles', 'spiral'], help='one or more supervised tasks to evolve (repeatable)')
     ap.add_argument('--tasks', dest='tasks_single', action='append', nargs='+', choices=['xor', 'circles', 'spiral'], help=argparse.SUPPRESS)
     ap.add_argument('--gens', type=int, default=60)
@@ -7341,19 +7847,23 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--rl-temp', type=float, default=1.0)
     ap.add_argument('--rl-gameplay-gif', action='store_true')
     ap.add_argument('--out', default='out_monolith_cli')
-    ap.add_argument('--report', action='store_true')
     ap.add_argument('--version', action='store_true', help='print build information and exit')
-    ap.add_argument('--sync-spinor-seeds', action='store_true', help='bind spinor evaluator and weaver RNGs to --seed')
     ap.add_argument('--complexity-baseline-quantile', type=float, help='quantile (0-1) for survivor complexity bonus baseline')
     ap.add_argument('--complexity-bonus-span-quantile', type=float, help='upper quantile used to scale survivor complexity distance')
     ap.add_argument('--complexity-survivor-cap', type=float, help='cap applied to normalized survivor complexity bonus ratio')
     ap.add_argument('--complexity-bonus-limit', type=float, help='absolute cap for survivor complexity bonuses')
+    if want_help:
+        ap.print_help()
+        return 0
     args = ap.parse_args(argv_list)
+    if legacy_flags:
+        print(f"[INFO] Ignored legacy flag(s): {', '.join(legacy_flags)} (default behaviour now applies.)")
     requested_tasks: List[str] = []
     if getattr(args, 'tasks_single', None):
         for chunk in args.tasks_single:
             requested_tasks.extend(chunk)
     requested_tasks = list(dict.fromkeys(requested_tasks))
+    report_enabled = True if report_override is None else bool(report_override)
     if args.version:
         info = _resolve_build_info()
         print(_build_stamp_text())
@@ -7362,7 +7872,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
         return 0
     print(f"[INFO] {_build_stamp_text()}")
     global _SPINOR_BOUND_SEED
-    _SPINOR_BOUND_SEED = args.seed if args.sync_spinor_seeds else None
+    _SPINOR_BOUND_SEED = args.seed
     script_name = os.path.basename(__file__) if '__file__' in globals() else 'spiral_monolith_neat_numpy.py'
     os.makedirs(args.out, exist_ok=True)
     figs: Dict[str, Optional[str]] = OrderedDict()
@@ -7548,7 +8058,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             report_meta['rl'] = {'env': args.rl_env, 'gens': args.rl_gens, 'pop': args.rl_pop, 'episodes': args.rl_episodes, 'best_reward': rl_best, 'final_best': rl_final_best, 'final_avg': rl_final_avg, 'has_lcs_log': bool(os.path.exists(regen_log_path)), 'has_lcs_viz': bool(lcs_rows), 'has_gameplay': bool(gif and os.path.exists(gif)), 'has_resilience': bool(rl_resilience_log and os.path.exists(rl_resilience_log))}
         except Exception as e:
             print('[WARN] RL branch skipped:', e)
-    if args.report:
+    if report_enabled:
         for task, res in supervised_results.items():
             title = f'{task.upper()} | Interactive NEAT Report'
             html_path = os.path.join(args.out, f'{task}_interactive.html')
@@ -7563,6 +8073,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                 export_interactive_html_report(html_path, title=title, history=rl_history, genomes=[], max_genomes=1)
             except Exception as rl_report_err:
                 print('[WARN] RL interactive report failed:', rl_report_err)
+    else:
+        print('[INFO] Interactive report generation disabled (--no-report).')
         if figs:
 
             def _data_uri(p: str) -> Tuple[str, str]:
