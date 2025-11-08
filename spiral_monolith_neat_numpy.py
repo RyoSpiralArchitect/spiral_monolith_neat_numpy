@@ -6512,6 +6512,10 @@ class SpinorGroupInteraction:
     jitter: float = 0.0
     seed: Optional[int] = None
     _rng: np.random.Generator = field(init=False, repr=False)
+    _transposes: np.ndarray = field(init=False, repr=False)
+    _identity: np.ndarray = field(init=False, repr=False)
+    _element_norms: np.ndarray = field(init=False, repr=False)
+    _embeddings: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         elems = np.asarray(self.elements, dtype=np.float32)
@@ -6520,7 +6524,9 @@ class SpinorGroupInteraction:
         cayley = np.asarray(self.cayley, dtype=np.int64)
         if cayley.shape != (elems.shape[0], elems.shape[0]):
             raise ValueError('SpinorGroupInteraction.cayley must be square with size equal to number of elements.')
-        self.elements = elems
+        self.elements = np.ascontiguousarray(elems)
+        self._transposes = np.ascontiguousarray(np.transpose(self.elements, (0, 2, 1)))
+        self._identity = np.eye(2, dtype=np.float32)
         self.cayley = cayley
         n = elems.shape[0]
         if self.generator_weights is not None:
@@ -6532,6 +6538,9 @@ class SpinorGroupInteraction:
         else:
             self.generator_weights = np.full(n, 1.0 / n, dtype=np.float64)
         self._rng = np.random.default_rng(self.seed)
+        flat = self.elements.reshape(n, -1)
+        self._element_norms = np.linalg.norm(flat, axis=1).astype(np.float32)
+        self._embeddings = flat.astype(np.float32, copy=False)
 
     @property
     def size(self) -> int:
@@ -6542,11 +6551,26 @@ class SpinorGroupInteraction:
         return 4
 
     def matrix(self, idx: int) -> np.ndarray:
-        return self.elements[int(idx)]
+        return self.matrix_safe(idx)
+
+    def matrix_safe(self, idx: Optional[int]) -> np.ndarray:
+        if idx is None:
+            return self._identity
+        try:
+            return self.elements[int(idx) % self.size]
+        except Exception:
+            return self._identity
 
     def embed(self, idx: int) -> np.ndarray:
-        mat = self.matrix(idx)
-        return mat.reshape(-1).astype(np.float32)
+        return self.embed_safe(idx)
+
+    def embed_safe(self, idx: Optional[int]) -> np.ndarray:
+        if idx is None:
+            return self._embeddings[0]
+        try:
+            return self._embeddings[int(idx) % self.size]
+        except Exception:
+            return self._embeddings[0]
 
     def describe(self, idx: Optional[int]) -> str:
         if idx is None:
@@ -6561,6 +6585,23 @@ class SpinorGroupInteraction:
             if abs(noise) > 0.5:
                 next_state = int(self.cayley[next_state, gen_idx])
         return int(next_state % self.size)
+
+    def energy(self, idx: Optional[int]) -> float:
+        if idx is None:
+            return 0.0
+        try:
+            return float(self._element_norms[int(idx) % self.size])
+        except Exception:
+            return float(self._element_norms[0])
+
+    def apply_to_points(self, idx: Optional[int], points: np.ndarray) -> np.ndarray:
+        if idx is None or points.size == 0:
+            return points
+        try:
+            mat_t = self._transposes[int(idx) % self.size]
+            return np.asarray(points @ mat_t, dtype=np.float32)
+        except Exception:
+            return np.asarray(points, dtype=np.float32)
 
     @classmethod
     def dihedral(cls, order: int=4, twist: float=0.0, seed: Optional[int]=None) -> 'SpinorGroupInteraction':
@@ -6599,8 +6640,10 @@ class SpinorScheduler:
     seed: Optional[int] = None
     base_phase: float = 0.0
     group: Optional[SpinorGroupInteraction] = None
+    max_cached_states: int = 1024
     _rng: np.random.Generator = field(init=False, repr=False)
     _group_states: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _state_order: deque = field(default_factory=deque, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._rng = np.random.default_rng(self.seed)
@@ -6624,15 +6667,21 @@ class SpinorScheduler:
                 prev_idx = self._group_state_for(gen - 1)[0] or 0
                 idx = self.group.step(prev_idx)
             self._group_states[gen] = idx
-        mat = self.group.matrix(idx)
-        embed = self.group.embed(idx)
+            self._state_order.append(gen)
+            while len(self._group_states) > max(1, int(self.max_cached_states)):
+                old_gen = self._state_order.popleft()
+                if old_gen == gen:
+                    break
+                self._group_states.pop(old_gen, None)
+        mat = self.group.matrix_safe(idx)
+        embed = self.group.embed_safe(idx)
         return (idx, mat, embed)
 
     def phase_bundle(self, gen: int) -> Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]:
         theta = self.phase(gen)
         parity = SpinorScheduler.parity(theta)
         idx, mat, embed = self._group_state_for(gen)
-        energy = float(np.linalg.norm(mat)) if mat is not None else 0.0
+        energy = self.group.energy(idx) if self.group is not None else 0.0
         return (theta, parity, idx, mat, embed, energy)
 
     def describe_group(self, idx: Optional[int]) -> str:
@@ -6692,6 +6741,11 @@ class SelfReproducingEvaluator:
     _innov: InnovationTracker = field(init=False, repr=False)
     _next_gid: int = field(init=False, repr=False)
     last_event: Optional[str] = field(default=None, init=False)
+    last_resilience: Optional[str] = field(default=None, init=False)
+    _leader_cache_id: Optional[int] = field(default=None, init=False, repr=False)
+    _leader_cache_rev: Tuple[int, int] = field(default=(-1, -1), init=False, repr=False)
+    _leader_compiled: Optional[Dict[str, Any]] = field(default=None, init=False, repr=False)
+    _resilience_notes: deque = field(default_factory=lambda: deque(maxlen=16), init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._rng = self.rng if self.rng is not None else np.random.default_rng()
@@ -6786,6 +6840,32 @@ class SelfReproducingEvaluator:
             self._population.pop()
         return f'spawned {child.id} ← {parent.id}'
 
+    def _compiled_leader(self, leader: Genome):
+        rev = (getattr(leader, '_structure_rev', -1), getattr(leader, '_weights_rev', -1))
+        if (
+            self._leader_compiled is not None
+            and self._leader_cache_id == leader.id
+            and self._leader_cache_rev == rev
+        ):
+            return self._leader_compiled
+        compiled = compile_genome(leader)
+        self._leader_compiled = compiled
+        self._leader_cache_id = leader.id
+        self._leader_cache_rev = rev
+        return compiled
+
+    def _record_resilience(self, err: BaseException, generation: int) -> str:
+        label = f'{type(err).__name__}@{generation}'
+        self.last_resilience = label
+        try:
+            self._resilience_notes.append(label)
+        except Exception:
+            pass
+        return label
+
+    def resilience_history(self) -> List[str]:
+        return list(self._resilience_notes)
+
     def step(
         self,
         bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
@@ -6796,16 +6876,34 @@ class SelfReproducingEvaluator:
             self._population.append(self._seed_genome())
         leader = self._population[0]
         feats = self._feature_vector(bundle, env, generation)
-        compiled = compile_genome(leader)
-        out = forward_batch(compiled, feats.reshape(1, -1))[0]
-        out = np.asarray(out, dtype=np.float32)
+        resilience_flag = ''
+        start = time.perf_counter()
+        try:
+            compiled = self._compiled_leader(leader)
+            out = forward_batch(compiled, feats.reshape(1, -1))[0]
+            out = np.asarray(out, dtype=np.float32)
+        except Exception as err:
+            resilience_flag = self._record_resilience(err, generation)
+            out = np.zeros(3, dtype=np.float32)
+        latency_ms = (time.perf_counter() - start) * 1000.0
         scale_noise, scale_turns, scale_rot = self.output_scale
         env.noise = float(np.clip(0.05 + scale_noise * float(out[0]), 0.0, 0.25))
         env.turns = float(np.clip(1.6 + scale_turns * float(out[1]), 0.6, 3.2))
         env.rot_bias = float(((env.rot_bias + scale_rot * float(out[2])) + math.pi) % (2.0 * math.pi) - math.pi)
-        summary = self._mutate_child(leader, bundle, feats, out, generation)
+        try:
+            summary = self._mutate_child(leader, bundle, feats, out, generation)
+        except Exception as mutate_err:
+            resilience_flag = resilience_flag or self._record_resilience(mutate_err, generation)
+            summary = f'mutate-failed {type(mutate_err).__name__}'
+        if resilience_flag:
+            summary = f'{summary} | resilience {resilience_flag}'
         self.last_event = summary
-        return {'genome_id': leader.id, 'note': summary}
+        return {
+            'genome_id': leader.id,
+            'note': summary,
+            'resilience': resilience_flag,
+            'latency_ms': latency_ms,
+        }
 
     @property
     def leader(self) -> Genome:
@@ -6903,6 +7001,7 @@ class SpinorNomologyDatasetController:
         embed_dim = self.spin.group.embed_dim if self.spin.group else 0
         self.feature_dim = 5 + embed_dim
         self.evaluator_feature_dim = 8 + embed_dim
+        self.last_bundle: Optional[Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]] = None
         if self.evaluator is None and self.evaluator_feature_dim > 0:
             eval_rng = np.random.default_rng(int(self.rng.integers(1 << 30)))
             self.evaluator = SelfReproducingEvaluator(self.evaluator_feature_dim, self.spin, self.env, rng=eval_rng)
@@ -6912,13 +7011,24 @@ class SpinorNomologyDatasetController:
         n: int,
         theta: float,
         parity: int,
+        group_idx: Optional[int],
         group_embed: Optional[np.ndarray],
         group_matrix: Optional[np.ndarray],
     ) -> Tuple[np.ndarray, np.ndarray]:
-        X, y = neat.make_spirals(n=n, noise=self.env.noise, turns=self.env.turns, seed=int(self.rng.integers(1 << 31)))
+        try:
+            X, y = neat.make_spirals(n=n, noise=self.env.noise, turns=self.env.turns, seed=int(self.rng.integers(1 << 31)))
+        except Exception as err:
+            warnings.warn(f'Spinor dataset generation failed: {err}', RuntimeWarning)
+            X = np.zeros((n, 2), dtype=np.float32)
+            y = np.zeros(n, dtype=np.int64)
         X = rotate_2d(X, theta + self.env.rot_bias)
-        if group_matrix is not None:
-            X = (group_matrix @ X.T).T
+        if self.spin.group is not None and group_idx is not None:
+            X = self.spin.group.apply_to_points(group_idx, X)
+        elif group_matrix is not None:
+            try:
+                X = (group_matrix @ X.T).T
+            except Exception:
+                pass
         X_aug, _ = augment_with_spinor(X, theta, parity=parity, group_embed=group_embed)
         return (X_aug.astype(np.float32), y.astype(np.int64))
 
@@ -6927,6 +7037,7 @@ class SpinorNomologyDatasetController:
             return
         bundle = self.spin.phase_bundle(gen)
         theta, parity, group_idx, group_matrix, group_embed, group_energy = bundle
+        self.last_bundle = bundle
         switched = self.env.maybe_switch()
         if switched:
             self.on_regime_switch(gen)
@@ -6934,8 +7045,8 @@ class SpinorNomologyDatasetController:
         if self.evaluator is not None:
             evaluator_meta = self.evaluator.step(bundle, self.env, generation=gen)
         self.env.drift()
-        Xtr, ytr = self._dataset_core(self.n_tr, theta, parity, group_embed, group_matrix)
-        Xva, yva = self._dataset_core(self.n_va, theta, parity, group_embed, group_matrix)
+        Xtr, ytr = self._dataset_core(self.n_tr, theta, parity, group_idx, group_embed, group_matrix)
+        Xva, yva = self._dataset_core(self.n_va, theta, parity, group_idx, group_embed, group_matrix)
         neat._SHM_CACHE['Xtr'] = Xtr
         neat._SHM_CACHE['ytr'] = ytr
         neat._SHM_CACHE['Xva'] = Xva
