@@ -236,6 +236,8 @@ class NodeGene:
     id: int
     type: str
     activation: str = 'tanh'
+    backprop_sensitivity: float = 1.0
+    sensitivity_jitter: float = 0.0
 
 @dataclass
 class ConnectionGene:
@@ -402,6 +404,10 @@ class Genome:
         self._struct_sig_rev = -1
         self._complexity_cache: Optional[Tuple[int, int, float, float, float]] = None
         self._complexity_rev = -1
+        self._compiled_cache: Optional[Dict[str, Any]] = None
+        self._compiled_cache_rev: Tuple[int, int] = (-1, -1)
+        self._compat_token: Optional[Tuple[int, int, int]] = None
+        self._compat_token_rev: Tuple[int, int] = (-1, -1)
         self.nodes = _GenomeNodeDict(nodes, self)
         self.connections = _GenomeConnDict(connections, self)
         self.sex = sex or ('female' if np.random.random() < 0.5 else 'male')
@@ -419,7 +425,16 @@ class Genome:
         self.cooperative = bool(cooperative)
 
     def copy(self):
-        nodes = {nid: NodeGene(n.id, n.type, n.activation) for nid, n in self.nodes.items()}
+        nodes = {
+            nid: NodeGene(
+                n.id,
+                n.type,
+                n.activation,
+                getattr(n, 'backprop_sensitivity', 1.0),
+                getattr(n, 'sensitivity_jitter', 0.0),
+            )
+            for nid, n in self.nodes.items()
+        }
         conns = {innov: ConnectionGene(c.in_node, c.out_node, c.weight, c.enabled, c.innovation) for innov, c in self.connections.items()}
         g = Genome(nodes, conns, self.sex, self.regen, self.regen_mode, self.embryo_bias, self.id, self.birth_gen, self.hybrid_scale, self.parents, mutation_will=self.mutation_will, cooperative=self.cooperative)
         g.origin_mode = getattr(self, 'origin_mode', 'initial')
@@ -445,6 +460,10 @@ class Genome:
             self._weights_rev += 1
         elif weights:
             self._weights_rev += 1
+        self._compiled_cache = None
+        self._compiled_cache_rev = (-1, -1)
+        self._compat_token = None
+        self._compat_token_rev = (-1, -1)
 
     def enabled_connections(self):
         return [c for c in self.connections.values() if c.enabled]
@@ -639,6 +658,17 @@ class Genome:
         self._complexity_rev = self._structure_rev
         return self._complexity_cache
 
+    def compat_token(self) -> Tuple[int, int, int]:
+        rev = (self._structure_rev, self._weights_rev)
+        if self._compat_token is not None and self._compat_token_rev == rev:
+            return self._compat_token
+        sig = self.structural_signature()
+        weights = tuple(sorted((inn, float(round(conn.weight, 6)), bool(conn.enabled)) for inn, conn in self.connections.items()))
+        token = (hash(sig), hash(weights), len(weights))
+        self._compat_token = token
+        self._compat_token_rev = rev
+        return token
+
     def structural_complexity_score(self) -> float:
         return float(self.structural_complexity_stats()[-1])
 
@@ -674,7 +704,14 @@ class Genome:
             proposals = list(proposals)
             order = rng.permutation(len(proposals))[:budget]
             proposals = [proposals[int(i)] for i in order]
-        self.nodes[new_node_id] = NodeGene(new_node_id, 'hidden', self.nodes[template_id].activation)
+        template = self.nodes[template_id]
+        self.nodes[new_node_id] = NodeGene(
+            new_node_id,
+            'hidden',
+            template.activation,
+            getattr(template, 'backprop_sensitivity', 1.0),
+            getattr(template, 'sensitivity_jitter', 0.0),
+        )
         added = 0
         for src, dst, weight in proposals:
             if budget is not None and added >= budget:
@@ -779,7 +816,13 @@ class Genome:
         c.enabled = False
         new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_nid not in self.nodes:
-            self.nodes[new_nid] = NodeGene(new_nid, 'hidden', 'tanh')
+            self.nodes[new_nid] = NodeGene(
+                new_nid,
+                'hidden',
+                'tanh',
+                float(rng.uniform(0.9, 1.1)),
+                float(np.clip(rng.normal(0.0, 0.04), -0.15, 0.15)),
+            )
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
         self.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
@@ -1202,6 +1245,111 @@ def compatibility_distance(g1: Genome, g2: Genome, c1=1.0, c2=1.0, c3=0.4):
     W = sum(W_diffs) / len(W_diffs) if W_diffs else 0.0
     return c1 * E / N + c2 * D / N + c3 * W
 
+
+class HouseholdManager:
+
+    """Track structural "households" to drive environment diversity and reuse stats.
+
+    The manager clusters genomes by a hashed structural signature, remembers their
+    rolling fitness and complexity, and provides difficulty nudges per household.
+    """
+
+    def __init__(self, max_households: int=256, smoothing: float=0.6, difficulty_push: float=0.12):
+        self.max_households = int(max(1, max_households))
+        self.smoothing = float(np.clip(smoothing, 0.0, 0.99))
+        self.difficulty_push = float(difficulty_push)
+        self._stats: "OrderedDict[Tuple[int, int, int, str], Dict[str, float]]" = OrderedDict()
+
+    def _key(self, genome: Genome) -> Tuple[int, int, int, str]:
+        token = genome.compat_token()
+        comp = genome.structural_complexity_stats()[-1]
+        band = int(comp // 1.5)
+        regen = 1 if getattr(genome, 'regen', False) else 0
+        sex = str(getattr(genome, 'sex', 'unknown'))
+        return (token[0], token[1], band * 2 + regen, sex)
+
+    def _prune(self):
+        while len(self._stats) > self.max_households:
+            oldest = min(self._stats.items(), key=lambda kv: kv[1].get('last_seen', 0.0))[0]
+            self._stats.pop(oldest, None)
+
+    def update(self, genomes: List[Genome], fitnesses: List[float], env_difficulty: float) -> None:
+        if not genomes:
+            return
+        now = time.time()
+        smooth = self.smoothing
+        for g, fit in zip(genomes, fitnesses):
+            if not np.isfinite(fit):
+                continue
+            key = self._key(g)
+            entry = self._stats.get(key)
+            weight = 0.6 if not getattr(g, 'cooperative', True) else 1.0
+            comp = float(g.structural_complexity_stats()[-1])
+            if entry is None:
+                entry = {
+                    'mean_fit': float(fit),
+                    'trend': 0.0,
+                    'complexity': comp,
+                    'count': weight,
+                    'last_seen': now,
+                    'last_fit': float(fit),
+                    'env_difficulty': float(env_difficulty),
+                }
+            else:
+                entry['mean_fit'] = entry['mean_fit'] * smooth + float(fit) * (1.0 - smooth) * weight
+                delta = float(fit) - float(entry.get('last_fit', fit))
+                entry['trend'] = entry['trend'] * smooth + delta * (1.0 - smooth)
+                entry['complexity'] = entry['complexity'] * smooth + comp * (1.0 - smooth)
+                entry['count'] = entry.get('count', 0.0) * smooth + weight * (1.0 - smooth)
+                entry['last_seen'] = now
+                entry['last_fit'] = float(fit)
+                entry['env_difficulty'] = float(env_difficulty)
+            self._stats[key] = entry
+        self._prune()
+
+    def environment_adjustments(self, genomes: List[Genome], fitnesses: List[float], env: Dict[str, Any]) -> Dict[int, float]:
+        if not self._stats:
+            return {}
+        means = np.array([entry['mean_fit'] for entry in self._stats.values()], dtype=float)
+        if means.size == 0:
+            return {}
+        base_mean = float(means.mean())
+        spread = float(np.std(means)) if means.size > 1 else 0.0
+        env_diff = 0.0
+        if isinstance(env, dict):
+            env_diff = float(env.get('difficulty', 0.0))
+        else:
+            env_diff = float(env)
+        adjustments: Dict[int, float] = {}
+        push = self.difficulty_push * (1.0 + 0.25 * np.tanh(spread))
+        for g, fit in zip(genomes, fitnesses):
+            key = self._key(g)
+            entry = self._stats.get(key)
+            if entry is None:
+                continue
+            comp = float(entry.get('complexity', 0.0))
+            trend = float(entry.get('trend', 0.0))
+            normalized = 0.0
+            if spread > 1e-09:
+                normalized = (entry['mean_fit'] - base_mean) / spread
+            else:
+                normalized = entry['mean_fit'] - base_mean
+            boost = push * np.tanh(normalized + 0.2 * trend)
+            boost *= 1.0 + 0.15 * np.tanh((comp - (2.0 + env_diff)) / 3.0)
+            if not getattr(g, 'cooperative', True):
+                boost *= 0.5
+            adjustments[g.id] = float(boost)
+        return adjustments
+
+    def global_pressure(self) -> float:
+        if not self._stats:
+            return 0.0
+        means = np.array([entry['mean_fit'] for entry in self._stats.values()], dtype=float)
+        if means.size <= 1:
+            return 0.0
+        spread = float(np.std(means))
+        return float(np.tanh(spread * 1.2))
+
 def _regenerate_head(g: Genome, rng: np.random.Generator, innov: InnovationTracker, intensity=0.5):
     inputs = [nid for nid, n in g.nodes.items() if n.type in ('input', 'bias')]
     candidates = [c for c in g.enabled_connections() if c.in_node in inputs]
@@ -1214,7 +1362,13 @@ def _regenerate_head(g: Genome, rng: np.random.Generator, innov: InnovationTrack
         c.enabled = False
     chosen = rng.choice(candidates)
     new_id = innov.new_node_id()
-    g.nodes[new_id] = NodeGene(new_id, 'hidden', 'tanh')
+    g.nodes[new_id] = NodeGene(
+        new_id,
+        'hidden',
+        'tanh',
+        float(rng.uniform(0.9, 1.1)),
+        float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
+    )
     inn1 = innov.get_conn_innovation(chosen.in_node, new_id)
     inn2 = innov.get_conn_innovation(new_id, chosen.out_node)
     g.connections[inn1] = ConnectionGene(chosen.in_node, new_id, 1.0, True, inn1)
@@ -1254,7 +1408,13 @@ def _regenerate_split(g: Genome, rng: np.random.Generator, innov: InnovationTrac
         c.enabled = False
         new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_nid not in g.nodes:
-            g.nodes[new_nid] = NodeGene(new_nid, 'hidden', 'tanh')
+            g.nodes[new_nid] = NodeGene(
+                new_nid,
+                'hidden',
+                'tanh',
+                float(rng.uniform(0.9, 1.1)),
+                float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
+            )
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
@@ -1263,7 +1423,13 @@ def _regenerate_split(g: Genome, rng: np.random.Generator, innov: InnovationTrac
         return g
     target = int(rng.choice(hidden))
     dup_id = innov.new_node_id()
-    g.nodes[dup_id] = NodeGene(dup_id, 'hidden', 'tanh')
+    g.nodes[dup_id] = NodeGene(
+        dup_id,
+        'hidden',
+        'tanh',
+        float(rng.uniform(0.9, 1.1)),
+        float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
+    )
     incomings = [c for c in g.enabled_connections() if c.out_node == target]
     for cin in incomings:
         inn = innov.get_conn_innovation(cin.in_node, dup_id)
@@ -1375,7 +1541,13 @@ def _soft_regenerate_head(g, rng, innov, intensity=0.5):
         c = candidates[int(rng_local.integers(n))]
         new_id = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_id not in g.nodes:
-            g.nodes[new_id] = NodeGene(new_id, 'hidden', 'tanh')
+            g.nodes[new_id] = NodeGene(
+                new_id,
+                'hidden',
+                'tanh',
+                float(rng_local.uniform(0.9, 1.1)),
+                float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
+            )
         inn1 = innov.get_conn_innovation(c.in_node, new_id)
         inn2 = innov.get_conn_innovation(new_id, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_id, 1.0, True, inn1)
@@ -1419,7 +1591,13 @@ def _soft_regenerate_split(g, rng, innov, intensity=0.5):
         c.enabled = False
         new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_nid not in g.nodes:
-            g.nodes[new_nid] = NodeGene(new_nid, 'hidden', 'tanh')
+            g.nodes[new_nid] = NodeGene(
+                new_nid,
+                'hidden',
+                'tanh',
+                float(rng_local.uniform(0.9, 1.1)),
+                float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
+            )
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
@@ -1428,7 +1606,13 @@ def _soft_regenerate_split(g, rng, innov, intensity=0.5):
         return g
     target = int(rng_local.choice(hidden))
     dup_id = innov.new_node_id()
-    g.nodes[dup_id] = NodeGene(dup_id, 'hidden', 'tanh')
+    g.nodes[dup_id] = NodeGene(
+        dup_id,
+        'hidden',
+        'tanh',
+        float(rng_local.uniform(0.9, 1.1)),
+        float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
+    )
     incomings = [c for c in g.enabled_connections() if c.out_node == target]
     changed = False
     for cin in incomings:
@@ -2067,6 +2251,10 @@ class ReproPlanaNEATPlus:
         self.snapshots_scars: List[Dict[int, 'Scar']] = []
         self.node_registry: Dict[int, Dict[str, Any]] = {}
         self.top3_best_topologies = []
+        self._compat_cache: 'OrderedDict[Tuple[Tuple[int, int, int], Tuple[int, int, int]], float]' = OrderedDict()
+        self._compat_cache_limit = max(1024, population_size * 8)
+        self._households = HouseholdManager(max_households=max(population_size * 4, 256))
+        self._last_household_adjustments: Dict[int, float] = {}
         for g in self.population:
             self.node_registry[g.id] = {'sex': g.sex, 'regen': g.regen, 'birth_gen': g.birth_gen}
         self._assign_lazy_individuals(self.population)
@@ -2086,12 +2274,33 @@ class ReproPlanaNEATPlus:
         self._lazy_fraction_carry = 0.0
 
     def _heterosis_scale(self, mother: Genome, father: Genome) -> float:
-        d = compatibility_distance(mother, father, self.c1, self.c2, self.c3)
+        d = self._compat_distance(mother, father)
         peak = 1.0 + self.heterosis_gain * np.exp(-0.5 * ((d - self.heterosis_center) / self.heterosis_width) ** 2)
         if d > self.distance_cutoff:
             penalty = max(0.0, self.penalty_far * (d - self.distance_cutoff) / self.distance_cutoff)
             peak *= 1.0 - min(0.9, penalty)
         return float(peak)
+
+    def _compat_distance(self, g1: Genome, g2: Genome) -> float:
+        try:
+            token1 = g1.compat_token()
+            token2 = g2.compat_token()
+            key = (token1, token2) if token1 <= token2 else (token2, token1)
+        except Exception:
+            return compatibility_distance(g1, g2, self.c1, self.c2, self.c3)
+        cache = self._compat_cache
+        dist = cache.get(key)
+        if dist is not None:
+            cache.move_to_end(key)
+            return dist
+        dist = compatibility_distance(g1, g2, self.c1, self.c2, self.c3)
+        cache[key] = dist
+        if len(cache) > self._compat_cache_limit:
+            try:
+                cache.popitem(last=False)
+            except Exception:
+                pass
+        return dist
 
     def _regen_intensity(self) -> float:
         return float(min(1.0, max(0.0, self.injury_intensity_base + self.injury_intensity_gain * self.env['difficulty'])))
@@ -2118,7 +2327,7 @@ class ReproPlanaNEATPlus:
         for genome, fit in zip(self.population, fitnesses):
             placed = False
             for sp in species:
-                delta = compatibility_distance(genome, sp.representative, self.c1, self.c2, self.c3)
+                delta = self._compat_distance(genome, sp.representative)
                 if delta < self.compatibility_threshold:
                     sp.add(genome, fit)
                     placed = True
@@ -2270,7 +2479,13 @@ class ReproPlanaNEATPlus:
         child_conns = {}
         for nid, n in mother.nodes.items():
             if n.type in ('input', 'output', 'bias'):
-                child_nodes[nid] = NodeGene(n.id, n.type, n.activation)
+                child_nodes[nid] = NodeGene(
+                    n.id,
+                    n.type,
+                    n.activation,
+                    getattr(n, 'backprop_sensitivity', 1.0),
+                    getattr(n, 'sensitivity_jitter', 0.0),
+                )
         all_innovs = sorted(set(mother.connections.keys()).union(father.connections.keys()))
         for inn in all_innovs:
             if inn in mother.connections and inn in father.connections:
@@ -2295,7 +2510,13 @@ class ReproPlanaNEATPlus:
                 for nid in (g.in_node, g.out_node):
                     if nid not in child_nodes:
                         n = mother.nodes.get(nid) or father.nodes.get(nid)
-                        child_nodes[nid] = NodeGene(n.id, n.type, n.activation)
+                        child_nodes[nid] = NodeGene(
+                            n.id,
+                            n.type,
+                            n.activation,
+                            getattr(n, 'backprop_sensitivity', 1.0),
+                            getattr(n, 'sensitivity_jitter', 0.0),
+                        )
         child = Genome(child_nodes, child_conns)
         child.max_hidden_nodes = self.max_hidden_nodes
         child.max_edges = self.max_edges
@@ -2831,9 +3052,20 @@ class ReproPlanaNEATPlus:
             diff = max(diff, 0.5)
         else:
             diff = diff + bump
+        diff += 0.08 * self._household_pressure()
+        diff = float(np.clip(diff, 0.0, 5.0))
         enable_regen = bool(diff >= 0.85)
         noise_std = 0.01 + 0.05 * diff
         return {'difficulty': float(diff), 'noise_std': float(noise_std), 'enable_regen': enable_regen}
+
+    def _household_pressure(self) -> float:
+        manager = getattr(self, '_households', None)
+        if manager is None:
+            return 0.0
+        try:
+            return float(manager.global_pressure())
+        except Exception:
+            return 0.0
 
     def _adaptive_refine_fitness(self, fitnesses: List[float], fitness_fn: Callable[[Genome], float]) -> List[float]:
         """上位個体にだけ backprop ステップを追加して再評価（軽量な二段評価）。"""
@@ -2900,6 +3132,19 @@ class ReproPlanaNEATPlus:
                     except Exception:
                         pass
                 raw = self._evaluate_population(fitness_fn)
+                adjustments: Dict[int, float] = {}
+                manager = getattr(self, '_households', None)
+                if manager is not None:
+                    try:
+                        manager.update(self.population, raw, float(self.env.get('difficulty', 0.0)))
+                        adjustments = manager.environment_adjustments(self.population, raw, self.env)
+                    except Exception as _hm_err:
+                        if getattr(self, 'debug_households', False):
+                            print(f"[WARN] household manager failed: {_hm_err}")
+                        adjustments = {}
+                self._last_household_adjustments = dict(adjustments)
+                if adjustments:
+                    raw = [float(r + adjustments.get(g.id, 0.0)) for g, r in zip(self.population, raw)]
                 signature_map: Dict[int, Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]]] = {}
                 signature_counts: Dict[Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]], int] = {}
                 complexity_stats: Dict[int, Tuple[int, int, float, float, float]] = {}
@@ -3121,10 +3366,23 @@ def act_deriv(name, x):
     return 1.0 - y * y
 
 def compile_genome(g: Genome):
+    rev = (getattr(g, '_structure_rev', -1), getattr(g, '_weights_rev', -1))
+    cached = getattr(g, '_compiled_cache', None)
+    cached_rev = getattr(g, '_compiled_cache_rev', (-1, -1))
+    if cached is not None and cached_rev == rev:
+        return cached
     order = g.topological_order()
     idx_of = {nid: i for i, nid in enumerate(order)}
     types = [g.nodes[n].type for n in order]
     acts = [g.nodes[n].activation for n in order]
+    node_sensitivity = np.array(
+        [float(getattr(g.nodes[n], 'backprop_sensitivity', 1.0)) for n in order],
+        dtype=np.float64,
+    )
+    node_jitter = np.array(
+        [float(np.clip(getattr(g.nodes[n], 'sensitivity_jitter', 0.0), -0.25, 0.25)) for n in order],
+        dtype=np.float64,
+    )
     in_ids = [nid for nid in order if g.nodes[nid].type == 'input']
     bias_ids = [nid for nid in order if g.nodes[nid].type == 'bias']
     out_ids = [nid for nid in order if g.nodes[nid].type == 'output']
@@ -3139,7 +3397,29 @@ def compile_genome(g: Genome):
     for e, (s, d) in enumerate(zip(src, dst)):
         in_edges[d].append(e)
         out_edges[s].append(e)
-    return {'order': order, 'idx_of': idx_of, 'types': types, 'acts': acts, 'inputs': [idx_of[i] for i in sorted(in_ids)], 'biases': [idx_of[i] for i in bias_ids], 'outputs': [idx_of[i] for i in sorted(out_ids)], 'src': src, 'dst': dst, 'w': w, 'eid': eid, 'in_edges': in_edges, 'out_edges': out_edges}
+    compiled = {
+        'order': order,
+        'idx_of': idx_of,
+        'types': types,
+        'acts': acts,
+        'inputs': [idx_of[i] for i in sorted(in_ids)],
+        'biases': [idx_of[i] for i in bias_ids],
+        'outputs': [idx_of[i] for i in sorted(out_ids)],
+        'src': src,
+        'dst': dst,
+        'w': w,
+        'eid': eid,
+        'in_edges': in_edges,
+        'out_edges': out_edges,
+        'node_sensitivity': node_sensitivity,
+        'node_jitter': node_jitter,
+    }
+    try:
+        g._compiled_cache = compiled
+        g._compiled_cache_rev = rev
+    except Exception:
+        pass
+    return compiled
 
 def forward_batch(comp, X, w=None):
     if w is None:
@@ -3217,21 +3497,42 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
     grad_w = _np.zeros_like(w)
     delta_z = _np.zeros((B, n), dtype=_np.float64)
     delta_a = _np.zeros((B, n), dtype=_np.float64)
+    node_scale = comp.get('node_sensitivity')
+    if node_scale is None or getattr(node_scale, 'shape', (0,))[0] != n:
+        node_scale = _np.ones(n, dtype=_np.float64)
+    else:
+        node_scale = _np.clip(_np.asarray(node_scale, dtype=_np.float64), 0.2, 5.0)
+    node_jitter = comp.get('node_jitter')
+    if node_jitter is None or getattr(node_jitter, 'shape', (0,))[0] != n:
+        node_jitter = _np.zeros(n, dtype=_np.float64)
+    else:
+        node_jitter = _np.clip(_np.asarray(node_jitter, dtype=_np.float64), -0.3, 0.3)
+    node_signal = _np.zeros(n, dtype=_np.float64)
+    node_push = _np.zeros(n, dtype=_np.float64)
     for j, oi in enumerate(comp['outputs']):
         delta_z[:, oi] = delta_out[:, j:j + 1].reshape(B)
     for j in reversed(range(n)):
         t = comp['types'][j]
-        if t == 'output':
-            dz = delta_z[:, j]
-        elif t in ('input', 'bias'):
+        if t in ('input', 'bias'):
             continue
+        if t == 'output':
+            dz_raw = delta_z[:, j]
         else:
-            dz = delta_a[:, j] * act_deriv(comp['acts'][j], Z[:, j])
-            delta_z[:, j] = dz
+            dz_raw = delta_a[:, j] * act_deriv(comp['acts'][j], Z[:, j])
+        dest_scale = float(node_scale[j])
+        dest_jitter = 1.0 + 0.05 * float(node_jitter[j])
+        dz = dz_raw * dest_scale * dest_jitter
+        delta_z[:, j] = dz
+        node_signal[j] += float(_np.mean(_np.abs(dz)))
         for e in comp['in_edges'][j]:
             s = comp['src'][e]
-            grad_w[e] += _np.dot(A[:, s], dz)
-            delta_a[:, s] += dz * w[e]
+            src_scale = float(node_scale[s])
+            src_jitter = 1.0 + 0.05 * float(node_jitter[s])
+            edge_scale = 0.5 * (dest_scale * dest_jitter + src_scale * src_jitter)
+            contrib = _np.dot(A[:, s], dz)
+            grad_w[e] += edge_scale * contrib
+            node_push[s] += float(_np.mean(_np.abs(dz * w[e]))) * edge_scale
+            delta_a[:, s] += dz * w[e] * src_scale * src_jitter
     grad_w = grad_w / max(1, B) + l2 * w
     if not _np.all(_np.isfinite(grad_w)):
         grad_w = _np.nan_to_num(grad_w, nan=0.0, posinf=0.0, neginf=0.0)
@@ -3242,7 +3543,9 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
     w_new = w - float(lr) * grad_w
     if w_clip and w_clip > 0:
         _np.clip(w_new, -float(w_clip), float(w_clip), out=w_new)
-    return (w_new, float(loss))
+    profile = node_signal + 0.5 * node_push
+    profile = _np.nan_to_num(profile, nan=0.0, posinf=0.0, neginf=0.0)
+    return (w_new, float(loss), profile)
 
 def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=0.01, l2=0.0001, grad_clip=5.0, w_clip=12.0):
     X = np.asarray(X, dtype=np.float32)
@@ -3252,15 +3555,35 @@ def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=0.01, l2=0.0001
     comp = compile_genome(genome)
     w = comp['w'].copy()
     history = []
+    node_profile_accum = np.zeros(len(comp['order']), dtype=np.float64)
     if w.size == 0:
         return history
     for _ in range(int(steps)):
-        w, L = backprop_step(comp, X, y, w, lr=lr, l2=l2)
+        w, L, profile = backprop_step(comp, X, y, w, lr=lr, l2=l2)
         if not np.isfinite(L):
             L = float(np.nan_to_num(L, nan=1000.0, posinf=1000.0, neginf=1000.0))
         history.append(L)
+        if profile is not None and profile.shape[0] == node_profile_accum.shape[0]:
+            node_profile_accum += profile
     for e_idx, inn in enumerate(comp['eid']):
         genome.connections[inn].weight = float(w[e_idx])
+    if node_profile_accum.size:
+        avg_profile = node_profile_accum / max(1, float(steps))
+        for idx, nid in enumerate(comp['order']):
+            node = genome.nodes.get(nid)
+            if node is None:
+                continue
+            baseline = float(getattr(node, 'backprop_sensitivity', 1.0))
+            target = 1.0 + 0.25 * float(np.tanh(avg_profile[idx]))
+            node.backprop_sensitivity = float(np.clip(0.85 * baseline + 0.15 * target, 0.2, 5.0))
+            jitter_base = float(getattr(node, 'sensitivity_jitter', 0.0))
+            jitter_scale = 0.03 + 0.02 * float(np.clip(avg_profile[idx], 0.0, 3.0))
+            jitter_target = float(np.clip(np.random.normal(0.0, jitter_scale), -0.2, 0.2))
+            node.sensitivity_jitter = float(np.clip(0.8 * jitter_base + 0.2 * jitter_target, -0.25, 0.25))
+    try:
+        genome.invalidate_caches(weights=True)
+    except Exception:
+        pass
     return history
 
 def predict_proba(genome: Genome, X):
@@ -5526,7 +5849,7 @@ _SHM_META = {}
 _SHM_CACHE = {}
 _SHM_HANDLES = {}
 STRUCTURAL_EPS = 1e-09
-__all__ = ['NodeGene', 'ConnectionGene', 'InnovationTracker', 'Genome', 'compatibility_distance', 'EvalMode', 'ReproPlanaNEATPlus', 'compile_genome', 'forward_batch', 'train_with_backprop_numpy', 'predict', 'predict_proba', 'fitness_backprop_classifier', 'make_circles', 'make_xor', 'make_spirals', 'draw_genome_png', 'export_regen_gif', 'export_morph_gif', 'export_double_exposure', 'plot_learning_and_complexity', 'plot_decision_boundary', 'export_decision_boundaries_all', 'render_lineage', 'export_scars_spiral_map', 'output_dim_from_space', 'build_action_mapper', 'eval_with_node_activations', 'run_policy_in_env', 'run_gym_neat_experiment', 'LCSMonitor', 'summarize_graph_changes', 'load_lcs_log', 'export_lcs_ribbon_png', 'export_lcs_timeline_gif', 'PerSampleSequenceStopperPro']
+__all__ = ['NodeGene', 'ConnectionGene', 'InnovationTracker', 'Genome', 'compatibility_distance', 'HouseholdManager', 'EvalMode', 'ReproPlanaNEATPlus', 'compile_genome', 'forward_batch', 'train_with_backprop_numpy', 'predict', 'predict_proba', 'fitness_backprop_classifier', 'make_circles', 'make_xor', 'make_spirals', 'draw_genome_png', 'export_regen_gif', 'export_morph_gif', 'export_double_exposure', 'plot_learning_and_complexity', 'plot_decision_boundary', 'export_decision_boundaries_all', 'render_lineage', 'export_scars_spiral_map', 'output_dim_from_space', 'build_action_mapper', 'eval_with_node_activations', 'run_policy_in_env', 'run_gym_neat_experiment', 'LCSMonitor', 'summarize_graph_changes', 'load_lcs_log', 'export_lcs_ribbon_png', 'export_lcs_timeline_gif', 'PerSampleSequenceStopperPro']
 INF = 10 ** 12
 PATCHED_PATH = __file__
 spec = None
