@@ -5536,6 +5536,115 @@ def _cyclic_noise_profile(gen: float, ctx: Optional[Dict[str, Any]]=None) -> Tup
     return (std, kind, profile)
 
 
+@dataclass
+class SpectralNoiseWeaver:
+    """Blend spectral noise archetypes into resonant mixtures.
+
+    Keeps a tempered distribution over the palette so the environment cycles
+    through dominant modes without erasing supporting harmonics. By smoothing
+    transitions and preserving cross-mode energy, evaluator populations perceive
+    organic fluctuations rather than abrupt jumps.
+    """
+
+    palette: Tuple[str, ...] = ('white', 'alpha', 'beta', 'black')
+    blend_inertia: float = 0.65
+    std_inertia: float = 0.55
+    focus_base: float = 0.58
+    focus_surge_bonus: float = 0.18
+    jitter_std: float = 0.025
+    entropy_floor: float = 1e-05
+    seed: Optional[int] = None
+    _rng: np.random.Generator = field(init=False, repr=False)
+    _weights: Dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _last_std: float = field(default=0.05, init=False, repr=False)
+    _last_kind: str = field(default='white', init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._rng = np.random.default_rng(self.seed)
+
+    def _palette(self, ctx: Dict[str, Any]) -> Tuple[str, ...]:
+        palette = tuple(ctx.get('palette') or self.palette)
+        if not palette:
+            palette = self.palette or ('white',)
+        if not palette:
+            palette = ('white',)
+        return palette
+
+    def compose(
+        self,
+        counter: float,
+        base_std: float,
+        base_kind: str,
+        base_profile: Dict[str, Any],
+        *,
+        ctx: Dict[str, Any],
+    ) -> Tuple[float, str, Dict[str, Any]]:
+        palette = self._palette(ctx)
+        levels = ctx.get('levels') or {}
+        min_std = float(ctx.get('min_std', 0.0))
+        max_std = float(ctx.get('max_std', 1.0))
+        stage_len = max(1, int(ctx.get('stage_len', max(1, len(palette)))))
+        surge = bool(ctx.get('surge', False))
+        intensity = float(ctx.get('intensity', 0.0))
+        focus_target = self.focus_base + self.focus_surge_bonus * (1.0 if surge else 0.0)
+        focus_target += 0.12 * math.tanh((intensity - 0.2) / 0.18)
+        focus_target = float(np.clip(focus_target, 0.35, 0.96))
+        background = max(1e-06, 1.0 - focus_target)
+        new_weights: Dict[str, float] = {}
+        prev_weights = self._weights or {mode: 1.0 / len(palette) for mode in palette}
+        for idx, mode in enumerate(palette):
+            prev = float(prev_weights.get(mode, 1.0 / len(palette)))
+            if mode == base_kind:
+                target = focus_target
+            else:
+                target = background / max(1, len(palette) - 1)
+            blend = self.blend_inertia * prev + (1.0 - self.blend_inertia) * target
+            jitter = float(self._rng.normal(0.0, self.jitter_std))
+            new_weights[mode] = max(self.entropy_floor, blend + jitter)
+        total = float(sum(new_weights.values()))
+        if not math.isfinite(total) or total <= 0.0:
+            new_weights = {mode: 1.0 / len(palette) for mode in palette}
+            total = 1.0
+        weights = {mode: float(val / total) for mode, val in new_weights.items()}
+        stage_phase = (counter % stage_len) / float(stage_len)
+        mix_std = 0.0
+        harmonics: Dict[str, float] = {}
+        for idx, mode in enumerate(palette):
+            base_level, swing = levels.get(mode, levels.get(base_kind, (base_std, 0.0)))
+            phase = (stage_phase + idx / max(1, len(palette))) % 1.0
+            envelope = 0.5 - 0.5 * math.cos(math.tau * phase)
+            if mode == 'alpha':
+                envelope = 0.5 + 0.5 * math.sin(math.tau * phase)
+            elif mode == 'beta':
+                envelope = 0.5 + 0.5 * math.cos(math.tau * (phase + 0.25))
+            elif mode == 'black':
+                envelope = envelope ** 1.5
+            mode_std = float(np.clip(base_level + swing * envelope, min_std, max_std))
+            weight = weights.get(mode, 0.0)
+            harmonics[mode] = weight
+            mix_std += weight * mode_std
+        mix_std = self.std_inertia * float(self._last_std) + (1.0 - self.std_inertia) * mix_std
+        mix_std = float(np.clip(mix_std, min_std, max_std))
+        arr = np.asarray(list(weights.values()), dtype=np.float64)
+        if arr.size:
+            focus_val = float(np.max(arr))
+            entropy = float(-np.sum(arr * np.log(arr + 1e-09)))
+        else:
+            focus_val = 1.0
+            entropy = 0.0
+        dominant = max(weights.items(), key=lambda kv: kv[1])[0]
+        profile = dict(base_profile)
+        profile['harmonics'] = {k: float(v) for k, v in harmonics.items()}
+        profile['mix_entropy'] = entropy
+        profile['mix_focus'] = focus_val
+        profile['headline_kind'] = dominant
+        profile['previous_kind'] = self._last_kind
+        self._weights = weights
+        self._last_std = mix_std
+        self._last_kind = dominant
+        return (mix_std, dominant, profile)
+
+
 def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
     """Enhanced curriculum with chaotic difficulty fluctuations and environmental monotony.
 
@@ -6841,10 +6950,26 @@ class NomologyEnv:
     )
     noise_min: float = 0.02
     noise_max: float = 0.14
+    noise_weaver: Optional[SpectralNoiseWeaver] = None
+    noise_focus: float = 0.0
+    noise_entropy: float = 0.0
+    noise_harmonics: Dict[str, float] = field(default_factory=dict)
     _noise_counter: float = field(default=0.0, init=False, repr=False)
+    _last_weaver_error: Optional[str] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._rng = np.random.default_rng(self.seed)
+        if self.noise_weaver is None:
+            try:
+                self.noise_weaver = SpectralNoiseWeaver(palette=self.noise_palette, seed=self.seed)
+            except Exception as weaver_err:
+                self._last_weaver_error = f'{type(weaver_err).__name__}: {weaver_err}'
+                self.noise_weaver = None
+        else:
+            try:
+                self.noise_weaver.palette = tuple(self.noise_palette)
+            except Exception:
+                pass
         self._noise_counter = 0.0
         self._refresh_noise(surge=True)
 
@@ -6856,6 +6981,11 @@ class NomologyEnv:
             'base_levels': dict(self.noise_levels),
             'min_std': float(self.noise_min),
             'max_std': float(self.noise_max),
+            'levels': dict(self.noise_levels),
+            'surge': bool(surge),
+            'intensity': float(self.intensity),
+            'regime_id': int(self.regime_id),
+            'drift_scale': float(self.drift_scale),
         }
 
     def _refresh_noise(self, advance: bool=False, surge: bool=False) -> None:
@@ -6869,11 +6999,47 @@ class NomologyEnv:
         profile.setdefault('band_label', kind)
         profile.setdefault('cycle_phase', 0.0)
         profile['jitter'] = float(profile.get('jitter', 0.0) + jitter_extra)
+        weaver = getattr(self, 'noise_weaver', None)
+        if weaver is not None:
+            weaver_ctx = self._noise_ctx(surge)
+            try:
+                std, kind, profile = weaver.compose(
+                    self._noise_counter,
+                    std,
+                    kind,
+                    profile,
+                    ctx=weaver_ctx,
+                )
+                self._last_weaver_error = None
+            except Exception as weaver_err:
+                self._last_weaver_error = f'{type(weaver_err).__name__}: {weaver_err}'
         profile['regime'] = int(self.regime_id)
         profile['counter'] = float(self._noise_counter)
+        profile['surge'] = bool(surge)
+        profile['noise_jitter_extra'] = jitter_extra
         self.noise = std
         self.noise_kind = kind
         self.noise_profile = profile
+        harmonics = profile.get('harmonics') if isinstance(profile, dict) else None
+        if isinstance(harmonics, dict) and harmonics:
+            clean = {str(k): float(v) for k, v in harmonics.items()}
+            total = sum(max(0.0, float(v)) for v in clean.values())
+            if total > 0.0 and math.isfinite(total):
+                clean = {k: float(max(0.0, float(v)) / total) for k, v in clean.items()}
+            arr = np.asarray(list(clean.values()), dtype=np.float64)
+            if arr.size:
+                focus_val = float(np.max(arr))
+                entropy_val = float(-np.sum(arr * np.log(arr + 1e-09)))
+            else:
+                focus_val = 1.0
+                entropy_val = 0.0
+            self.noise_harmonics = clean
+        else:
+            focus_val = 1.0
+            entropy_val = 0.0
+            self.noise_harmonics = {}
+        self.noise_focus = float(profile.get('mix_focus', focus_val))
+        self.noise_entropy = float(profile.get('mix_entropy', entropy_val))
 
     def maybe_switch(self) -> bool:
         triggered = bool(self._rng.random() < self.intensity)
@@ -7071,192 +7237,15 @@ class SelfReproducingEvaluator:
         noise_kind = getattr(env, 'noise_kind', None)
         if noise_kind:
             summary = f'{summary} | noise {noise_kind}'
-        if resilience_flag:
-            summary = f'{summary} | resilience {resilience_flag}'
-        self.last_event = summary
-        return {
-            'genome_id': leader.id,
-            'note': summary,
-            'resilience': resilience_flag,
-            'latency_ms': latency_ms,
-        }
-
-    @property
-    def leader(self) -> Genome:
-        if not self._population:
-            self._population.append(self._seed_genome())
-        return self._population[0]
-
-@dataclass
-class SelfReproducingEvaluator:
-    feature_dim: int
-    spin: SpinorScheduler
-    base_env: NomologyEnv
-    population_size: int = 4
-    rng: Optional[np.random.Generator] = None
-    mutate_weights_prob: float = 0.65
-    mutate_connection_prob: float = 0.35
-    mutate_node_prob: float = 0.2
-    output_scale: Tuple[float, float, float] = (0.08, 1.0, math.pi / 4.0)
-    _population: List[Genome] = field(default_factory=list, init=False, repr=False)
-    _rng: np.random.Generator = field(init=False, repr=False)
-    _innov: InnovationTracker = field(init=False, repr=False)
-    _next_gid: int = field(init=False, repr=False)
-    last_event: Optional[str] = field(default=None, init=False)
-    last_resilience: Optional[str] = field(default=None, init=False)
-    _leader_cache_id: Optional[int] = field(default=None, init=False, repr=False)
-    _leader_cache_rev: Tuple[int, int] = field(default=(-1, -1), init=False, repr=False)
-    _leader_compiled: Optional[Dict[str, Any]] = field(default=None, init=False, repr=False)
-    _resilience_notes: deque = field(default_factory=lambda: deque(maxlen=16), init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self._rng = self.rng if self.rng is not None else np.random.default_rng()
-        bias = self.feature_dim + 1
-        outputs = 3
-        self._innov = InnovationTracker(next_node_id=bias + outputs)
-        self._next_gid = int(self._rng.integers(1 << 30))
-        if not self._population:
-            for _ in range(self.population_size):
-                self._population.append(self._seed_genome())
-
-    def _seed_genome(self) -> Genome:
-        nodes: Dict[int, NodeGene] = {}
-        for i in range(self.feature_dim):
-            nodes[i] = NodeGene(i, 'input', 'identity')
-        bias_id = self.feature_dim
-        nodes[bias_id] = NodeGene(bias_id, 'bias', 'identity')
-        out_ids = []
-        for j in range(3):
-            nid = self.feature_dim + 1 + j
-            nodes[nid] = NodeGene(nid, 'output', 'tanh')
-            out_ids.append(nid)
-        conns: Dict[int, ConnectionGene] = {}
-        for src in range(self.feature_dim + 1):
-            for dst in out_ids:
-                inn = self._innov.get_conn_innovation(src, dst)
-                weight = float(self._rng.normal(0.0, 0.5))
-                conns[inn] = ConnectionGene(src, dst, weight, True, inn)
-        gid = self._next_gid
-        self._next_gid += 1
-        g = Genome(nodes, conns, gid=gid, birth_gen=0, parents=(None, None), cooperative=True)
-        g.meta_reflect('init_env_genome', {'role': 'environment'})
-        return g
-
-    def _feature_vector(
-        self,
-        bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
-        env: NomologyEnv,
-        generation: int,
-    ) -> np.ndarray:
-        theta, parity, _, _, embed, energy = bundle
-        gen_norm = float((generation % max(1, self.spin.period_gens)) / max(1, self.spin.period_gens))
-        noise_norm = float(np.clip(env.noise / 0.2, 0.0, 1.0))
-        turns_norm = float(np.clip((env.turns - 0.6) / (3.2 - 0.6 + 1e-09), 0.0, 1.0))
-        rot_norm = float((env.rot_bias + math.pi) / (2.0 * math.pi))
-        base = [
-            math.cos(theta),
-            math.sin(theta),
-            float(parity),
-            gen_norm,
-            noise_norm,
-            turns_norm,
-            rot_norm,
-            float(energy / 4.0),
-        ]
-        if embed is not None:
-            base.extend(embed.tolist())
-        vec = np.asarray(base, dtype=np.float32)
-        if vec.size < self.feature_dim:
-            vec = np.pad(vec, (0, self.feature_dim - vec.size))
-        elif vec.size > self.feature_dim:
-            vec = vec[:self.feature_dim]
-        return vec.astype(np.float32)
-
-    def _mutate_child(self, parent: Genome, bundle, features: np.ndarray, outputs: np.ndarray, generation: int) -> str:
-        child = parent.copy()
-        changed = False
-        if self._rng.random() < self.mutate_weights_prob:
-            child.mutate_weights(self._rng)
-            changed = True
-        if self._rng.random() < self.mutate_connection_prob:
-            changed = child.mutate_add_connection(self._rng, self._innov) or changed
-        if self._rng.random() < self.mutate_node_prob:
-            changed = child.mutate_add_node(self._rng, self._innov) or changed
-        if not changed:
-            return 'steady-state'
-        child.parents = (parent.id, None)
-        child.id = self._next_gid
-        self._next_gid += 1
-        child.birth_gen = generation + 1
-        child.meta_reflect(
-            'env_self_reproduce',
-            {
-                'features': features.tolist(),
-                'outputs': outputs.tolist(),
-                'generation': generation,
-                'parent': parent.id,
-            },
-        )
-        self._population.insert(0, child)
-        if len(self._population) > self.population_size:
-            self._population.pop()
-        return f'spawned {child.id} ← {parent.id}'
-
-    def _compiled_leader(self, leader: Genome):
-        rev = (getattr(leader, '_structure_rev', -1), getattr(leader, '_weights_rev', -1))
-        if (
-            self._leader_compiled is not None
-            and self._leader_cache_id == leader.id
-            and self._leader_cache_rev == rev
-        ):
-            return self._leader_compiled
-        compiled = compile_genome(leader)
-        self._leader_compiled = compiled
-        self._leader_cache_id = leader.id
-        self._leader_cache_rev = rev
-        return compiled
-
-    def _record_resilience(self, err: BaseException, generation: int) -> str:
-        label = f'{type(err).__name__}@{generation}'
-        self.last_resilience = label
-        try:
-            self._resilience_notes.append(label)
-        except Exception:
-            pass
-        return label
-
-    def resilience_history(self) -> List[str]:
-        return list(self._resilience_notes)
-
-    def step(
-        self,
-        bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
-        env: NomologyEnv,
-        generation: int,
-    ) -> Dict[str, Any]:
-        if not self._population:
-            self._population.append(self._seed_genome())
-        leader = self._population[0]
-        feats = self._feature_vector(bundle, env, generation)
-        resilience_flag = ''
-        start = time.perf_counter()
-        try:
-            compiled = self._compiled_leader(leader)
-            out = forward_batch(compiled, feats.reshape(1, -1))[0]
-            out = np.asarray(out, dtype=np.float32)
-        except Exception as err:
-            resilience_flag = self._record_resilience(err, generation)
-            out = np.zeros(3, dtype=np.float32)
-        latency_ms = (time.perf_counter() - start) * 1000.0
-        scale_noise, scale_turns, scale_rot = self.output_scale
-        env.noise = float(np.clip(0.05 + scale_noise * float(out[0]), 0.0, 0.25))
-        env.turns = float(np.clip(1.6 + scale_turns * float(out[1]), 0.6, 3.2))
-        env.rot_bias = float(((env.rot_bias + scale_rot * float(out[2])) + math.pi) % (2.0 * math.pi) - math.pi)
-        try:
-            summary = self._mutate_child(leader, bundle, feats, out, generation)
-        except Exception as mutate_err:
-            resilience_flag = resilience_flag or self._record_resilience(mutate_err, generation)
-            summary = f'mutate-failed {type(mutate_err).__name__}'
+        focus = getattr(env, 'noise_focus', None)
+        if isinstance(focus, (int, float)) and focus > 0:
+            summary = f'{summary} | focus {float(focus):.2f}'
+        entropy = getattr(env, 'noise_entropy', None)
+        if isinstance(entropy, (int, float)) and entropy > 0:
+            summary = f'{summary} | entropy {float(entropy):.2f}'
+        weave_err = getattr(env, '_last_weaver_error', None)
+        if weave_err:
+            summary = f'{summary} | weave {str(weave_err).split(':', 1)[0]}'
         if resilience_flag:
             summary = f'{summary} | resilience {resilience_flag}'
         self.last_event = summary
@@ -7278,7 +7267,7 @@ class Telemetry:
     def __init__(self, tel_csv: str, regime_csv: str) -> None:
         self.tel_csv = tel_csv
         self.reg_csv = regime_csv
-        expected_cols = 19
+        expected_cols = 22
         if os.path.exists(self.tel_csv):
             try:
                 with open(self.tel_csv, 'r', newline='') as f:
@@ -7307,6 +7296,9 @@ class Telemetry:
                     'noise_wave_hz',
                     'noise_spectral_bias',
                     'noise_jitter',
+                    'noise_focus',
+                    'noise_entropy',
+                    'noise_harmonics',
                     'turns',
                     'rot_bias',
                     'group_idx',
@@ -7344,6 +7336,13 @@ class Telemetry:
         noise_wave = '' if noise_wave is None else float(noise_wave)
         noise_spectral = float(profile.get('spectral_bias', 0.0))
         noise_jitter = float(profile.get('jitter', 0.0))
+        noise_focus = float(getattr(env, 'noise_focus', 0.0))
+        noise_entropy = float(getattr(env, 'noise_entropy', 0.0))
+        harmonics = getattr(env, 'noise_harmonics', {})
+        if isinstance(harmonics, dict) and harmonics:
+            harm_payload = _json.dumps({k: float(v) for k, v in harmonics.items()})
+        else:
+            harm_payload = '{}'
         with open(self.tel_csv, 'a', newline='') as f:
             csv.writer(f).writerow([
                 gen,
@@ -7358,6 +7357,9 @@ class Telemetry:
                 noise_wave,
                 noise_spectral,
                 noise_jitter,
+                noise_focus,
+                noise_entropy,
+                harm_payload,
                 env.turns,
                 env.rot_bias,
                 '' if group_idx is None else int(group_idx),
