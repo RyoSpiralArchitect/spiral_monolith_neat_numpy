@@ -402,6 +402,10 @@ class Genome:
         self._struct_sig_rev = -1
         self._complexity_cache: Optional[Tuple[int, int, float, float, float]] = None
         self._complexity_rev = -1
+        self._compiled_cache: Optional[Dict[str, Any]] = None
+        self._compiled_cache_rev: Tuple[int, int] = (-1, -1)
+        self._compat_token: Optional[Tuple[int, int, int]] = None
+        self._compat_token_rev: Tuple[int, int] = (-1, -1)
         self.nodes = _GenomeNodeDict(nodes, self)
         self.connections = _GenomeConnDict(connections, self)
         self.sex = sex or ('female' if np.random.random() < 0.5 else 'male')
@@ -445,6 +449,10 @@ class Genome:
             self._weights_rev += 1
         elif weights:
             self._weights_rev += 1
+        self._compiled_cache = None
+        self._compiled_cache_rev = (-1, -1)
+        self._compat_token = None
+        self._compat_token_rev = (-1, -1)
 
     def enabled_connections(self):
         return [c for c in self.connections.values() if c.enabled]
@@ -638,6 +646,17 @@ class Genome:
         self._complexity_cache = (hidden, edges, branch, depth_spread, score)
         self._complexity_rev = self._structure_rev
         return self._complexity_cache
+
+    def compat_token(self) -> Tuple[int, int, int]:
+        rev = (self._structure_rev, self._weights_rev)
+        if self._compat_token is not None and self._compat_token_rev == rev:
+            return self._compat_token
+        sig = self.structural_signature()
+        weights = tuple(sorted((inn, float(round(conn.weight, 6)), bool(conn.enabled)) for inn, conn in self.connections.items()))
+        token = (hash(sig), hash(weights), len(weights))
+        self._compat_token = token
+        self._compat_token_rev = rev
+        return token
 
     def structural_complexity_score(self) -> float:
         return float(self.structural_complexity_stats()[-1])
@@ -1201,6 +1220,111 @@ def compatibility_distance(g1: Genome, g2: Genome, c1=1.0, c2=1.0, c3=0.4):
     N = 1 if N < 20 else N
     W = sum(W_diffs) / len(W_diffs) if W_diffs else 0.0
     return c1 * E / N + c2 * D / N + c3 * W
+
+
+class HouseholdManager:
+
+    """Track structural "households" to drive environment diversity and reuse stats.
+
+    The manager clusters genomes by a hashed structural signature, remembers their
+    rolling fitness and complexity, and provides difficulty nudges per household.
+    """
+
+    def __init__(self, max_households: int=256, smoothing: float=0.6, difficulty_push: float=0.12):
+        self.max_households = int(max(1, max_households))
+        self.smoothing = float(np.clip(smoothing, 0.0, 0.99))
+        self.difficulty_push = float(difficulty_push)
+        self._stats: "OrderedDict[Tuple[int, int, int, str], Dict[str, float]]" = OrderedDict()
+
+    def _key(self, genome: Genome) -> Tuple[int, int, int, str]:
+        token = genome.compat_token()
+        comp = genome.structural_complexity_stats()[-1]
+        band = int(comp // 1.5)
+        regen = 1 if getattr(genome, 'regen', False) else 0
+        sex = str(getattr(genome, 'sex', 'unknown'))
+        return (token[0], token[1], band * 2 + regen, sex)
+
+    def _prune(self):
+        while len(self._stats) > self.max_households:
+            oldest = min(self._stats.items(), key=lambda kv: kv[1].get('last_seen', 0.0))[0]
+            self._stats.pop(oldest, None)
+
+    def update(self, genomes: List[Genome], fitnesses: List[float], env_difficulty: float) -> None:
+        if not genomes:
+            return
+        now = time.time()
+        smooth = self.smoothing
+        for g, fit in zip(genomes, fitnesses):
+            if not np.isfinite(fit):
+                continue
+            key = self._key(g)
+            entry = self._stats.get(key)
+            weight = 0.6 if not getattr(g, 'cooperative', True) else 1.0
+            comp = float(g.structural_complexity_stats()[-1])
+            if entry is None:
+                entry = {
+                    'mean_fit': float(fit),
+                    'trend': 0.0,
+                    'complexity': comp,
+                    'count': weight,
+                    'last_seen': now,
+                    'last_fit': float(fit),
+                    'env_difficulty': float(env_difficulty),
+                }
+            else:
+                entry['mean_fit'] = entry['mean_fit'] * smooth + float(fit) * (1.0 - smooth) * weight
+                delta = float(fit) - float(entry.get('last_fit', fit))
+                entry['trend'] = entry['trend'] * smooth + delta * (1.0 - smooth)
+                entry['complexity'] = entry['complexity'] * smooth + comp * (1.0 - smooth)
+                entry['count'] = entry.get('count', 0.0) * smooth + weight * (1.0 - smooth)
+                entry['last_seen'] = now
+                entry['last_fit'] = float(fit)
+                entry['env_difficulty'] = float(env_difficulty)
+            self._stats[key] = entry
+        self._prune()
+
+    def environment_adjustments(self, genomes: List[Genome], fitnesses: List[float], env: Dict[str, Any]) -> Dict[int, float]:
+        if not self._stats:
+            return {}
+        means = np.array([entry['mean_fit'] for entry in self._stats.values()], dtype=float)
+        if means.size == 0:
+            return {}
+        base_mean = float(means.mean())
+        spread = float(np.std(means)) if means.size > 1 else 0.0
+        env_diff = 0.0
+        if isinstance(env, dict):
+            env_diff = float(env.get('difficulty', 0.0))
+        else:
+            env_diff = float(env)
+        adjustments: Dict[int, float] = {}
+        push = self.difficulty_push * (1.0 + 0.25 * np.tanh(spread))
+        for g, fit in zip(genomes, fitnesses):
+            key = self._key(g)
+            entry = self._stats.get(key)
+            if entry is None:
+                continue
+            comp = float(entry.get('complexity', 0.0))
+            trend = float(entry.get('trend', 0.0))
+            normalized = 0.0
+            if spread > 1e-09:
+                normalized = (entry['mean_fit'] - base_mean) / spread
+            else:
+                normalized = entry['mean_fit'] - base_mean
+            boost = push * np.tanh(normalized + 0.2 * trend)
+            boost *= 1.0 + 0.15 * np.tanh((comp - (2.0 + env_diff)) / 3.0)
+            if not getattr(g, 'cooperative', True):
+                boost *= 0.5
+            adjustments[g.id] = float(boost)
+        return adjustments
+
+    def global_pressure(self) -> float:
+        if not self._stats:
+            return 0.0
+        means = np.array([entry['mean_fit'] for entry in self._stats.values()], dtype=float)
+        if means.size <= 1:
+            return 0.0
+        spread = float(np.std(means))
+        return float(np.tanh(spread * 1.2))
 
 def _regenerate_head(g: Genome, rng: np.random.Generator, innov: InnovationTracker, intensity=0.5):
     inputs = [nid for nid, n in g.nodes.items() if n.type in ('input', 'bias')]
@@ -2067,6 +2191,10 @@ class ReproPlanaNEATPlus:
         self.snapshots_scars: List[Dict[int, 'Scar']] = []
         self.node_registry: Dict[int, Dict[str, Any]] = {}
         self.top3_best_topologies = []
+        self._compat_cache: 'OrderedDict[Tuple[Tuple[int, int, int], Tuple[int, int, int]], float]' = OrderedDict()
+        self._compat_cache_limit = max(1024, population_size * 8)
+        self._households = HouseholdManager(max_households=max(population_size * 4, 256))
+        self._last_household_adjustments: Dict[int, float] = {}
         for g in self.population:
             self.node_registry[g.id] = {'sex': g.sex, 'regen': g.regen, 'birth_gen': g.birth_gen}
         self._assign_lazy_individuals(self.population)
@@ -2086,12 +2214,33 @@ class ReproPlanaNEATPlus:
         self._lazy_fraction_carry = 0.0
 
     def _heterosis_scale(self, mother: Genome, father: Genome) -> float:
-        d = compatibility_distance(mother, father, self.c1, self.c2, self.c3)
+        d = self._compat_distance(mother, father)
         peak = 1.0 + self.heterosis_gain * np.exp(-0.5 * ((d - self.heterosis_center) / self.heterosis_width) ** 2)
         if d > self.distance_cutoff:
             penalty = max(0.0, self.penalty_far * (d - self.distance_cutoff) / self.distance_cutoff)
             peak *= 1.0 - min(0.9, penalty)
         return float(peak)
+
+    def _compat_distance(self, g1: Genome, g2: Genome) -> float:
+        try:
+            token1 = g1.compat_token()
+            token2 = g2.compat_token()
+            key = (token1, token2) if token1 <= token2 else (token2, token1)
+        except Exception:
+            return compatibility_distance(g1, g2, self.c1, self.c2, self.c3)
+        cache = self._compat_cache
+        dist = cache.get(key)
+        if dist is not None:
+            cache.move_to_end(key)
+            return dist
+        dist = compatibility_distance(g1, g2, self.c1, self.c2, self.c3)
+        cache[key] = dist
+        if len(cache) > self._compat_cache_limit:
+            try:
+                cache.popitem(last=False)
+            except Exception:
+                pass
+        return dist
 
     def _regen_intensity(self) -> float:
         return float(min(1.0, max(0.0, self.injury_intensity_base + self.injury_intensity_gain * self.env['difficulty'])))
@@ -2118,7 +2267,7 @@ class ReproPlanaNEATPlus:
         for genome, fit in zip(self.population, fitnesses):
             placed = False
             for sp in species:
-                delta = compatibility_distance(genome, sp.representative, self.c1, self.c2, self.c3)
+                delta = self._compat_distance(genome, sp.representative)
                 if delta < self.compatibility_threshold:
                     sp.add(genome, fit)
                     placed = True
@@ -2831,9 +2980,20 @@ class ReproPlanaNEATPlus:
             diff = max(diff, 0.5)
         else:
             diff = diff + bump
+        diff += 0.08 * self._household_pressure()
+        diff = float(np.clip(diff, 0.0, 5.0))
         enable_regen = bool(diff >= 0.85)
         noise_std = 0.01 + 0.05 * diff
         return {'difficulty': float(diff), 'noise_std': float(noise_std), 'enable_regen': enable_regen}
+
+    def _household_pressure(self) -> float:
+        manager = getattr(self, '_households', None)
+        if manager is None:
+            return 0.0
+        try:
+            return float(manager.global_pressure())
+        except Exception:
+            return 0.0
 
     def _adaptive_refine_fitness(self, fitnesses: List[float], fitness_fn: Callable[[Genome], float]) -> List[float]:
         """上位個体にだけ backprop ステップを追加して再評価（軽量な二段評価）。"""
@@ -2900,6 +3060,19 @@ class ReproPlanaNEATPlus:
                     except Exception:
                         pass
                 raw = self._evaluate_population(fitness_fn)
+                adjustments: Dict[int, float] = {}
+                manager = getattr(self, '_households', None)
+                if manager is not None:
+                    try:
+                        manager.update(self.population, raw, float(self.env.get('difficulty', 0.0)))
+                        adjustments = manager.environment_adjustments(self.population, raw, self.env)
+                    except Exception as _hm_err:
+                        if getattr(self, 'debug_households', False):
+                            print(f"[WARN] household manager failed: {_hm_err}")
+                        adjustments = {}
+                self._last_household_adjustments = dict(adjustments)
+                if adjustments:
+                    raw = [float(r + adjustments.get(g.id, 0.0)) for g, r in zip(self.population, raw)]
                 signature_map: Dict[int, Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]]] = {}
                 signature_counts: Dict[Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]], int] = {}
                 complexity_stats: Dict[int, Tuple[int, int, float, float, float]] = {}
@@ -3121,6 +3294,11 @@ def act_deriv(name, x):
     return 1.0 - y * y
 
 def compile_genome(g: Genome):
+    rev = (getattr(g, '_structure_rev', -1), getattr(g, '_weights_rev', -1))
+    cached = getattr(g, '_compiled_cache', None)
+    cached_rev = getattr(g, '_compiled_cache_rev', (-1, -1))
+    if cached is not None and cached_rev == rev:
+        return cached
     order = g.topological_order()
     idx_of = {nid: i for i, nid in enumerate(order)}
     types = [g.nodes[n].type for n in order]
@@ -3139,7 +3317,13 @@ def compile_genome(g: Genome):
     for e, (s, d) in enumerate(zip(src, dst)):
         in_edges[d].append(e)
         out_edges[s].append(e)
-    return {'order': order, 'idx_of': idx_of, 'types': types, 'acts': acts, 'inputs': [idx_of[i] for i in sorted(in_ids)], 'biases': [idx_of[i] for i in bias_ids], 'outputs': [idx_of[i] for i in sorted(out_ids)], 'src': src, 'dst': dst, 'w': w, 'eid': eid, 'in_edges': in_edges, 'out_edges': out_edges}
+    compiled = {'order': order, 'idx_of': idx_of, 'types': types, 'acts': acts, 'inputs': [idx_of[i] for i in sorted(in_ids)], 'biases': [idx_of[i] for i in bias_ids], 'outputs': [idx_of[i] for i in sorted(out_ids)], 'src': src, 'dst': dst, 'w': w, 'eid': eid, 'in_edges': in_edges, 'out_edges': out_edges}
+    try:
+        g._compiled_cache = compiled
+        g._compiled_cache_rev = rev
+    except Exception:
+        pass
+    return compiled
 
 def forward_batch(comp, X, w=None):
     if w is None:
@@ -3261,6 +3445,10 @@ def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=0.01, l2=0.0001
         history.append(L)
     for e_idx, inn in enumerate(comp['eid']):
         genome.connections[inn].weight = float(w[e_idx])
+    try:
+        genome.invalidate_caches(weights=True)
+    except Exception:
+        pass
     return history
 
 def predict_proba(genome: Genome, X):
@@ -5526,7 +5714,7 @@ _SHM_META = {}
 _SHM_CACHE = {}
 _SHM_HANDLES = {}
 STRUCTURAL_EPS = 1e-09
-__all__ = ['NodeGene', 'ConnectionGene', 'InnovationTracker', 'Genome', 'compatibility_distance', 'EvalMode', 'ReproPlanaNEATPlus', 'compile_genome', 'forward_batch', 'train_with_backprop_numpy', 'predict', 'predict_proba', 'fitness_backprop_classifier', 'make_circles', 'make_xor', 'make_spirals', 'draw_genome_png', 'export_regen_gif', 'export_morph_gif', 'export_double_exposure', 'plot_learning_and_complexity', 'plot_decision_boundary', 'export_decision_boundaries_all', 'render_lineage', 'export_scars_spiral_map', 'output_dim_from_space', 'build_action_mapper', 'eval_with_node_activations', 'run_policy_in_env', 'run_gym_neat_experiment', 'LCSMonitor', 'summarize_graph_changes', 'load_lcs_log', 'export_lcs_ribbon_png', 'export_lcs_timeline_gif', 'PerSampleSequenceStopperPro']
+__all__ = ['NodeGene', 'ConnectionGene', 'InnovationTracker', 'Genome', 'compatibility_distance', 'HouseholdManager', 'EvalMode', 'ReproPlanaNEATPlus', 'compile_genome', 'forward_batch', 'train_with_backprop_numpy', 'predict', 'predict_proba', 'fitness_backprop_classifier', 'make_circles', 'make_xor', 'make_spirals', 'draw_genome_png', 'export_regen_gif', 'export_morph_gif', 'export_double_exposure', 'plot_learning_and_complexity', 'plot_decision_boundary', 'export_decision_boundaries_all', 'render_lineage', 'export_scars_spiral_map', 'output_dim_from_space', 'build_action_mapper', 'eval_with_node_activations', 'run_policy_in_env', 'run_gym_neat_experiment', 'LCSMonitor', 'summarize_graph_changes', 'load_lcs_log', 'export_lcs_ribbon_png', 'export_lcs_timeline_gif', 'PerSampleSequenceStopperPro']
 INF = 10 ** 12
 PATCHED_PATH = __file__
 spec = None
