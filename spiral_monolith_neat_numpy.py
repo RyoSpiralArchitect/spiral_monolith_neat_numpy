@@ -4,7 +4,6 @@
 # - "Part 1" NEAT (with optional planarian-like regeneration) + "Part 2" Backprop NEAT.
 # - Clean, single-file design for reproducible demos and paper-ready figures.
 #
-# Additions in this build:
 #   * Auto-export of regen/morph GIFs from evolution snapshots
 #   * Learning curve with moving average + rolling-std "CI" (line styles only)
 #   * Decision boundaries for Circles/XOR/Spiral as separate PNGs
@@ -5989,6 +5988,7 @@ def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, c
     fig.tight_layout()
     _savefig(fig, out_path, dpi=220)
     plt.close(fig)
+    return {'figure': out_path, 'history': loss, 'profile': profile}
 
 def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
