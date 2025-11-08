@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 
 _BUILD_INFO_CACHE: Optional[Dict[str, Any]] = None
 _SPINOR_BOUND_SEED: Optional[int] = None
+_COMPILE_TICK: int = 0
 
 
 _NOISE_STYLE_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -389,6 +390,65 @@ class NodeGene:
     sensitivity_jitter: float = 0.0
     sensitivity_momentum: float = 0.0
     sensitivity_variance: float = 0.0
+    altruism: float = 0.5
+    altruism_memory: float = 0.0
+    altruism_span: float = 0.0
+
+
+def _clone_node(
+    template: NodeGene,
+    new_id: Optional[int]=None,
+    new_type: Optional[str]=None,
+    activation: Optional[str]=None,
+) -> NodeGene:
+    return NodeGene(
+        template.id if new_id is None else int(new_id),
+        new_type or template.type,
+        activation or template.activation,
+        getattr(template, 'backprop_sensitivity', 1.0),
+        getattr(template, 'sensitivity_jitter', 0.0),
+        getattr(template, 'sensitivity_momentum', 0.0),
+        getattr(template, 'sensitivity_variance', 0.0),
+        float(np.clip(getattr(template, 'altruism', 0.5), 0.0, 1.0)),
+        float(np.clip(getattr(template, 'altruism_memory', 0.0), -1.5, 1.5)),
+        float(np.clip(getattr(template, 'altruism_span', 0.0), 0.0, 4.0)),
+    )
+
+
+def _random_hidden_node(node_id: int, rng: np.random.Generator, activation: str='tanh') -> NodeGene:
+    return NodeGene(
+        node_id,
+        'hidden',
+        activation,
+        float(rng.uniform(0.9, 1.1)),
+        float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
+        0.0,
+        0.0,
+        float(np.clip(rng.normal(0.5, 0.08), 0.0, 1.0)),
+        float(np.clip(rng.normal(0.0, 0.2), -1.0, 1.0)),
+        float(np.clip(rng.gamma(2.0, 0.2), 0.0, 3.0)),
+    )
+
+
+def _node_trait_array(
+    genome: 'Genome',
+    order: Sequence[int],
+    attr: str,
+    default: float,
+    *,
+    low: Optional[float]=None,
+    high: Optional[float]=None,
+) -> np.ndarray:
+    vals: List[float] = []
+    for nid in order:
+        node = genome.nodes[nid]
+        val = getattr(node, attr, default)
+        if low is not None and val < low:
+            val = low
+        if high is not None and val > high:
+            val = high
+        vals.append(float(val))
+    return np.asarray(vals, dtype=np.float64)
 
 @dataclass
 class ConnectionGene:
@@ -572,6 +632,7 @@ class Genome:
         self._complexity_rev = -1
         self._compiled_cache: Optional[Dict[str, Any]] = None
         self._compiled_cache_rev: Tuple[int, int] = (-1, -1)
+        self._compiled_cache_tick: int = -1
         self._compat_token: Optional[Tuple[int, int, int]] = None
         self._compat_token_rev: Tuple[int, int] = (-1, -1)
         self.nodes = _GenomeNodeDict(nodes, self)
@@ -625,18 +686,7 @@ class Genome:
         }
 
     def copy(self):
-        nodes = {
-            nid: NodeGene(
-                n.id,
-                n.type,
-                n.activation,
-                getattr(n, 'backprop_sensitivity', 1.0),
-                getattr(n, 'sensitivity_jitter', 0.0),
-                getattr(n, 'sensitivity_momentum', 0.0),
-                getattr(n, 'sensitivity_variance', 0.0),
-            )
-            for nid, n in self.nodes.items()
-        }
+        nodes = {nid: _clone_node(n, nid) for nid, n in self.nodes.items()}
         conns = {innov: ConnectionGene(c.in_node, c.out_node, c.weight, c.enabled, c.innovation) for innov, c in self.connections.items()}
         g = Genome(
             nodes,
@@ -678,8 +728,21 @@ class Genome:
             self._weights_rev += 1
         self._compiled_cache = None
         self._compiled_cache_rev = (-1, -1)
+        self._compiled_cache_tick = -1
         self._compat_token = None
         self._compat_token_rev = (-1, -1)
+
+    def trim_runtime_caches(self, compiled: bool=True, compat: bool=True, topo: bool=False) -> None:
+        if compiled:
+            self._compiled_cache = None
+            self._compiled_cache_rev = (-1, -1)
+            self._compiled_cache_tick = -1
+        if compat:
+            self._compat_token = None
+            self._compat_token_rev = (-1, -1)
+        if topo:
+            self._topo_cache = None
+            self._topo_cache_rev = -1
 
     def _invalidate_cache(self):
         self.invalidate_caches(structure=True)
@@ -925,15 +988,7 @@ class Genome:
             order = rng.permutation(len(proposals))[:budget]
             proposals = [proposals[int(i)] for i in order]
         template = self.nodes[template_id]
-        self.nodes[new_node_id] = NodeGene(
-            new_node_id,
-            'hidden',
-            template.activation,
-            getattr(template, 'backprop_sensitivity', 1.0),
-            getattr(template, 'sensitivity_jitter', 0.0),
-            getattr(template, 'sensitivity_momentum', 0.0),
-            getattr(template, 'sensitivity_variance', 0.0),
-        )
+        self.nodes[new_node_id] = _clone_node(template, new_node_id, 'hidden', template.activation)
         added = 0
         for src, dst, weight in proposals:
             if budget is not None and added >= budget:
@@ -1082,6 +1137,9 @@ class Genome:
                 float(np.clip(rng.normal(0.0, 0.04), -0.15, 0.15)),
                 0.0,
                 0.0,
+                float(np.clip(rng.normal(0.5, 0.08), 0.0, 1.0)),
+                float(np.clip(rng.normal(0.0, 0.2), -1.0, 1.0)),
+                float(np.clip(rng.gamma(2.0, 0.2), 0.0, 3.0)),
             )
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
@@ -1631,15 +1689,7 @@ def _regenerate_head(g: Genome, rng: np.random.Generator, innov: InnovationTrack
         c.enabled = False
     chosen = rng.choice(candidates)
     new_id = innov.new_node_id()
-    g.nodes[new_id] = NodeGene(
-        new_id,
-        'hidden',
-        'tanh',
-        float(rng.uniform(0.9, 1.1)),
-        float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
-        0.0,
-        0.0,
-    )
+    g.nodes[new_id] = _random_hidden_node(new_id, rng)
     inn1 = innov.get_conn_innovation(chosen.in_node, new_id)
     inn2 = innov.get_conn_innovation(new_id, chosen.out_node)
     g.connections[inn1] = ConnectionGene(chosen.in_node, new_id, 1.0, True, inn1)
@@ -1679,15 +1729,7 @@ def _regenerate_split(g: Genome, rng: np.random.Generator, innov: InnovationTrac
         c.enabled = False
         new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_nid not in g.nodes:
-            g.nodes[new_nid] = NodeGene(
-                new_nid,
-                'hidden',
-                'tanh',
-                float(rng.uniform(0.9, 1.1)),
-                float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
-                0.0,
-                0.0,
-            )
+            g.nodes[new_nid] = _random_hidden_node(new_nid, rng)
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
@@ -1696,15 +1738,7 @@ def _regenerate_split(g: Genome, rng: np.random.Generator, innov: InnovationTrac
         return g
     target = int(rng.choice(hidden))
     dup_id = innov.new_node_id()
-    g.nodes[dup_id] = NodeGene(
-        dup_id,
-        'hidden',
-        'tanh',
-        float(rng.uniform(0.9, 1.1)),
-        float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
-        0.0,
-        0.0,
-    )
+    g.nodes[dup_id] = _random_hidden_node(dup_id, rng)
     incomings = [c for c in g.enabled_connections() if c.out_node == target]
     for cin in incomings:
         inn = innov.get_conn_innovation(cin.in_node, dup_id)
@@ -1766,6 +1800,12 @@ def _connectivity_guard(g, innov, rng, min_frac=0.6, max_new_edges=16, eps=0.0):
     unreachable = [o for o in outputs if o not in seen]
     attempts = 0
     rng_local = rng or np.random.default_rng()
+    collective = dict(collective_signal or {})
+    altruism_target = float(np.clip(collective.get('altruism_target', 0.5), 0.0, 1.0))
+    solidarity = float(np.clip(collective.get('solidarity', 0.5), 0.0, 1.0))
+    stress = float(np.clip(collective.get('stress', 0.0), 0.0, 2.5))
+    lazy_share = float(np.clip(collective.get('lazy_share', 0.0), 0.0, 1.0))
+    advantage = float(np.clip(collective.get('advantage', 0.0), 0.0, 2.0))
     while unreachable and attempts < int(max_new_edges):
         if not sources:
             break
@@ -1816,15 +1856,7 @@ def _soft_regenerate_head(g, rng, innov, intensity=0.5):
         c = candidates[int(rng_local.integers(n))]
         new_id = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_id not in g.nodes:
-            g.nodes[new_id] = NodeGene(
-                new_id,
-                'hidden',
-                'tanh',
-                float(rng_local.uniform(0.9, 1.1)),
-                float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
-                0.0,
-                0.0,
-            )
+            g.nodes[new_id] = _random_hidden_node(new_id, rng_local)
         inn1 = innov.get_conn_innovation(c.in_node, new_id)
         inn2 = innov.get_conn_innovation(new_id, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_id, 1.0, True, inn1)
@@ -1868,15 +1900,7 @@ def _soft_regenerate_split(g, rng, innov, intensity=0.5):
         c.enabled = False
         new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_nid not in g.nodes:
-            g.nodes[new_nid] = NodeGene(
-                new_nid,
-                'hidden',
-                'tanh',
-                float(rng_local.uniform(0.9, 1.1)),
-                float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
-                0.0,
-                0.0,
-            )
+            g.nodes[new_nid] = _random_hidden_node(new_nid, rng_local)
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
@@ -1885,15 +1909,7 @@ def _soft_regenerate_split(g, rng, innov, intensity=0.5):
         return g
     target = int(rng_local.choice(hidden))
     dup_id = innov.new_node_id()
-    g.nodes[dup_id] = NodeGene(
-        dup_id,
-        'hidden',
-        'tanh',
-        float(rng_local.uniform(0.9, 1.1)),
-        float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
-        0.0,
-        0.0,
-    )
+    g.nodes[dup_id] = _random_hidden_node(dup_id, rng_local)
     incomings = [c for c in g.enabled_connections() if c.out_node == target]
     changed = False
     for cin in incomings:
@@ -2636,6 +2652,20 @@ class ReproPlanaNEATPlus:
         self.spinor_controller: Optional[Any] = None
         self._best_context_value = -1000000000.0
         self.monodromy_family_limit = max(self.pop_size * 6, 1536)
+        self._collective_signal: Dict[str, float] = {
+            'altruism_target': 0.5,
+            'solidarity': 0.5,
+            'stress': 0.0,
+            'lazy_share': 0.0,
+            'advantage': 0.0,
+        }
+        self.selfish_leader_threshold = 0.24
+        self.compile_cache_prune_stride = 12
+        self.compile_cache_recent_keep = 384
+        self.compile_cache_top_keep = max(6, int(self.pop_size * 0.1))
+        self.compile_cache_topo_stride = 48
+        self.compile_cache_decay_start = max(120, int(self.pop_size * 0.6))
+        self.compile_cache_decay_tau = 260.0
 
     def _heterosis_scale(self, mother: Genome, father: Genome) -> float:
         d = self._compat_distance(mother, father)
@@ -2772,6 +2802,122 @@ class ReproPlanaNEATPlus:
         gap_penalty = 0.03 * abs(gap)
         variance_penalty = 0.01 * momentum
         return float(best_fit - difficulty_penalty - gap_penalty - variance_penalty + cohesion_bonus + anchor_bonus)
+
+    def _trim_runtime_caches(self, generation: int) -> None:
+        stride = int(getattr(self, 'compile_cache_prune_stride', 0))
+        if stride <= 0 or generation % stride != 0:
+            return
+        keep_top = int(getattr(self, 'compile_cache_top_keep', 0))
+        recent_keep = int(getattr(self, 'compile_cache_recent_keep', 0))
+        decay_start = int(getattr(self, 'compile_cache_decay_start', 0))
+        recent_window = recent_keep
+        if recent_keep > 0 and decay_start > 0 and generation >= decay_start:
+            tau = max(1.0, float(getattr(self, 'compile_cache_decay_tau', 240.0)))
+            factor = math.exp(-(generation - decay_start) / tau)
+            recent_window = max(4, int(round(recent_keep * factor)))
+        try:
+            current_tick = _COMPILE_TICK
+        except Exception:
+            current_tick = 0
+        threshold = current_tick - recent_window if recent_window > 0 else None
+        topo_stride = int(getattr(self, 'compile_cache_topo_stride', 0))
+        drop_topology = topo_stride > 0 and generation % topo_stride == 0
+        for idx, g in enumerate(self.population):
+            if keep_top and idx < keep_top:
+                continue
+            tick = int(getattr(g, '_compiled_cache_tick', -1))
+            if threshold is not None and tick >= threshold:
+                continue
+            g.trim_runtime_caches(compiled=True, compat=True, topo=drop_topology)
+
+    def _apply_selfish_leader_guard(
+        self,
+        fitnesses: List[float],
+        baseline: List[float],
+        generation: int,
+    ) -> None:
+        controller = getattr(self, 'spinor_controller', None)
+        evaluator = getattr(controller, 'evaluator', None) if controller is not None else None
+        if evaluator is None:
+            return
+        leader_id = getattr(evaluator, 'last_leader_id', None)
+        advantage = float(getattr(evaluator, 'last_advantage_score', 0.0) or 0.0)
+        threshold = float(getattr(self, 'selfish_leader_threshold', 0.22))
+        if leader_id is None or advantage <= threshold:
+            return
+        try:
+            idx = next(i for i, g in enumerate(self.population) if g.id == leader_id)
+        except StopIteration:
+            return
+        penalty_floor = min(baseline) if baseline else -1.0
+        drop = (abs(baseline[idx]) + abs(penalty_floor) + 1.0) * (1.5 + 2.5 * advantage)
+        killer = penalty_floor - drop
+        baseline[idx] = killer
+        fitnesses[idx] = killer
+        try:
+            self.population[idx].cooperative = False
+            setattr(self.population[idx], 'selfish_culled', True)
+        except Exception:
+            pass
+        self._note_lineage(self.population[idx].id, generation, f'selfish leader culled ({advantage:.3f})')
+        setattr(evaluator, 'last_advantage_penalty', True)
+
+    def _update_collective_signal(
+        self,
+        diversity_entropy: float,
+        diversity_scarcity: float,
+        family_surplus_mean: float,
+        generation: int,
+    ) -> None:
+        controller = getattr(self, 'spinor_controller', None)
+        evaluator = getattr(controller, 'evaluator', None) if controller is not None else None
+        lazy = getattr(self, '_lazy_env_feedback', {}) or {}
+        lazy_share = float(np.clip(lazy.get('share', 0.0), 0.0, 1.0))
+        advantage = float(getattr(evaluator, 'last_advantage_score', 0.0) or 0.0)
+        altruism_hint = float(np.clip(getattr(evaluator, 'last_altruism_signal', 0.5) or 0.5, 0.0, 1.0))
+        solidarity = float(np.clip(diversity_entropy, 0.0, 1.0))
+        stress = float(np.clip(diversity_scarcity + max(0.0, family_surplus_mean), 0.0, 2.5))
+        target = float(np.clip(0.6 * altruism_hint + 0.4 * (1.0 - advantage), 0.0, 1.0))
+        self._collective_signal = {
+            'altruism_target': target,
+            'solidarity': solidarity,
+            'stress': stress,
+            'lazy_share': lazy_share,
+            'advantage': advantage,
+        }
+        if controller is not None:
+            try:
+                controller.altruism_signal = dict(self._collective_signal)
+            except Exception:
+                pass
+
+    def _imprint_population_altruism(self, fitnesses: Sequence[float]) -> None:
+        if not fitnesses:
+            return
+        signal = getattr(self, '_collective_signal', {}) or {}
+        target = float(signal.get('altruism_target', 0.5))
+        solidarity = float(signal.get('solidarity', 0.5))
+        stress = float(signal.get('stress', 0.0))
+        lazy_share = float(signal.get('lazy_share', 0.0))
+        advantage = float(signal.get('advantage', 0.0))
+        smoothing = float(np.clip(getattr(self, 'altruism_imprint_smoothing', 0.72), 0.0, 0.99))
+        depth_ratio = float(np.clip(getattr(self, 'altruism_imprint_ratio', 0.18), 0.05, 1.0))
+        depth = max(1, int(len(self.population) * depth_ratio))
+        order = np.argsort(fitnesses)[::-1][:depth]
+        span_target = float(np.clip(stress + advantage, 0.0, 4.0))
+        mem_target = float(np.clip(solidarity - stress, -1.5, 1.5))
+        gain = float(np.clip(target + 0.1 * solidarity - 0.15 * advantage + 0.05 * lazy_share, 0.0, 1.0))
+        for idx in map(int, order):
+            g = self.population[idx]
+            for node in g.nodes.values():
+                if node.type == 'input':
+                    continue
+                prev_alt = float(np.clip(getattr(node, 'altruism', 0.5), 0.0, 1.0))
+                prev_mem = float(np.clip(getattr(node, 'altruism_memory', 0.0), -1.5, 1.5))
+                prev_span = float(np.clip(getattr(node, 'altruism_span', 0.0), 0.0, 4.0))
+                node.altruism = float(np.clip(prev_alt * smoothing + gain * (1.0 - smoothing), 0.0, 1.0))
+                node.altruism_memory = float(np.clip(0.6 * prev_mem + 0.4 * mem_target, -1.5, 1.5))
+                node.altruism_span = float(np.clip(0.65 * prev_span + 0.35 * span_target, 0.0, 4.0))
 
     def _compat_distance(self, g1: Genome, g2: Genome) -> float:
         try:
@@ -2971,15 +3117,7 @@ class ReproPlanaNEATPlus:
         child_conns = {}
         for nid, n in mother.nodes.items():
             if n.type in ('input', 'output', 'bias'):
-                child_nodes[nid] = NodeGene(
-                    n.id,
-                    n.type,
-                    n.activation,
-                    getattr(n, 'backprop_sensitivity', 1.0),
-                    getattr(n, 'sensitivity_jitter', 0.0),
-                    getattr(n, 'sensitivity_momentum', 0.0),
-                    getattr(n, 'sensitivity_variance', 0.0),
-                )
+                child_nodes[nid] = _clone_node(n, nid, n.type, n.activation)
         all_innovs = sorted(set(mother.connections.keys()).union(father.connections.keys()))
         for inn in all_innovs:
             if inn in mother.connections and inn in father.connections:
@@ -3004,15 +3142,8 @@ class ReproPlanaNEATPlus:
                 for nid in (g.in_node, g.out_node):
                     if nid not in child_nodes:
                         n = mother.nodes.get(nid) or father.nodes.get(nid)
-                        child_nodes[nid] = NodeGene(
-                            n.id,
-                            n.type,
-                            n.activation,
-                            getattr(n, 'backprop_sensitivity', 1.0),
-                            getattr(n, 'sensitivity_jitter', 0.0),
-                            getattr(n, 'sensitivity_momentum', 0.0),
-                            getattr(n, 'sensitivity_variance', 0.0),
-                        )
+                        if n is not None:
+                            child_nodes[nid] = _clone_node(n, nid, n.type, n.activation)
         child = Genome(child_nodes, child_conns)
         child.max_hidden_nodes = self.max_hidden_nodes
         child.max_edges = self.max_edges
@@ -3240,13 +3371,21 @@ class ReproPlanaNEATPlus:
         return (new_pop, events)
 
     def reproduce(self, species, fitnesses):
+        cleaned_species = []
+        for sp in species:
+            members = [(g, f) for g, f in sp.members if not getattr(g, 'selfish_culled', False)]
+            if members:
+                sp.members = members
+                cleaned_species.append(sp)
+        if cleaned_species:
+            species = cleaned_species
         total_adjusted = 0.0
-        species_adjusted = []
+        species_adjusted: List[float] = []
         for sp in species:
             adj = sum((f for _, f in sp.members)) / len(sp.members)
             species_adjusted.append(adj)
             total_adjusted += adj
-        if total_adjusted <= 0:
+        if total_adjusted <= 0.0:
             offspring_counts = [self.pop_size // len(species)] * len(species)
             for i in range(self.pop_size - sum(offspring_counts)):
                 offspring_counts[i % len(offspring_counts)] += 1
@@ -3261,7 +3400,7 @@ class ReproPlanaNEATPlus:
                 offspring_counts[idx] += 1 if diff > 0 else -1
                 diff += -1 if diff > 0 else 1
                 i += 1
-        new_pop = []
+        new_pop: List[Genome] = []
         gen_events = {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0, 'asexual_clone': 0}
         monitor = getattr(self, 'lcs_monitor', None)
         weight_tol = getattr(monitor, 'eps', 0.0) if monitor is not None else 0.0
@@ -3281,7 +3420,12 @@ class ReproPlanaNEATPlus:
                 child.parents = (parent.id, None)
                 child.birth_gen = self.generation + 1
                 self._assign_child_family(child, (parent,))
-                self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen, 'family_id': child.family_id}
+                self.node_registry[child.id] = {
+                    'sex': child.sex,
+                    'regen': child.regen,
+                    'birth_gen': child.birth_gen,
+                    'family_id': child.family_id,
+                }
                 parent_strength = float(getattr(parent, 'lazy_lineage_strength', 0.0) or 0.0)
                 inheritance_decay = float(np.clip(getattr(self, 'lazy_lineage_inheritance_decay', 0.24), 0.0, 0.95))
                 inheritance_gain = float(max(0.0, getattr(self, 'lazy_lineage_inheritance_gain', 0.0)))
@@ -3295,7 +3439,15 @@ class ReproPlanaNEATPlus:
                 if monitor is not None and pre_adj is not None:
                     post_adj = child.weighted_adjacency()
                     changed_nodes, changed_edges = summarize_graph_changes(pre_adj, post_adj, weight_tol)
-                    rows_clone = monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_asexual_clone', changed_edges=changed_edges)
+                    rows_clone = monitor.log_step(
+                        pre_adj,
+                        post_adj,
+                        changed_nodes,
+                        child.id,
+                        self.generation + 1,
+                        f'{child.id}_asexual_clone',
+                        changed_edges=changed_edges,
+                    )
                     summary = _summarize_lineage_rows(rows_clone)
                     summary = _merge_meta_summary(child, summary)
                     self._note_lineage(child.id, child.birth_gen, summary)
@@ -4189,6 +4341,11 @@ class ReproPlanaNEATPlus:
                         fitness_fn.set_noise_std(float(self.env.get('noise_std', 0.0)))
                     except Exception:
                         pass
+                if hasattr(fitness_fn, 'collective_signal'):
+                    try:
+                        fitness_fn.collective_signal = dict(getattr(self, '_collective_signal', {}))
+                    except Exception:
+                        fitness_fn.collective_signal = None
                 raw = self._evaluate_population(fitness_fn)
                 adjustments: Dict[int, float] = {}
                 manager = getattr(self, '_households', None)
@@ -4306,6 +4463,7 @@ class ReproPlanaNEATPlus:
                     'family_surplus_ratio_mean': float(family_surplus_ratio_mean),
                     'household_pressure': float(household_pressure),
                 }
+                self._update_collective_signal(diversity_entropy, diversity_scarcity, family_surplus_ratio_mean, gen)
                 self._diversity_snapshot = diversity_snapshot
                 self.diversity_history.append(diversity_snapshot)
                 if len(self.diversity_history) > int(getattr(self, 'diversity_history_limit', 4096)):
@@ -4422,6 +4580,7 @@ class ReproPlanaNEATPlus:
                         f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
                     fitnesses.append(f2)
                 baseline_fitnesses = list(fitnesses)
+                self._apply_selfish_leader_guard(fitnesses, baseline_fitnesses, gen)
                 family_metrics: Dict[int, Dict[str, Any]] = {}
                 if family_members:
                     try:
@@ -4482,6 +4641,7 @@ class ReproPlanaNEATPlus:
                 raw_avg = float(np.mean(baseline_fitnesses)) if baseline_fitnesses else avg_fit
                 self.raw_best_history.append((raw_best, raw_avg))
                 self._update_lazy_feedback(gen, fitnesses, best_idx, best_fit, avg_fit)
+                self._imprint_population_altruism(fitnesses)
                 context_best = self._contextual_best_axis(best_fit, avg_fit)
                 history.append((context_best, avg_fit))
                 self.context_best_history.append((context_best, avg_fit))
@@ -4586,6 +4746,7 @@ class ReproPlanaNEATPlus:
                     print('[WARN] species target learning skipped:', _spe)
                 self._adapt_compat_threshold(len(species))
                 self.reproduce(species, fitnesses)
+                self._trim_runtime_caches(gen)
                 self._resilience_eval_guard = 0
                 self._resilience_history = list(history)
             except Exception as gen_err:
@@ -4648,31 +4809,28 @@ def act_deriv(name, x):
     return 1.0 - y * y
 
 def compile_genome(g: Genome):
+    global _COMPILE_TICK
     rev = (getattr(g, '_structure_rev', -1), getattr(g, '_weights_rev', -1))
     cached = getattr(g, '_compiled_cache', None)
     cached_rev = getattr(g, '_compiled_cache_rev', (-1, -1))
+    _COMPILE_TICK += 1
     if cached is not None and cached_rev == rev:
+        try:
+            g._compiled_cache_tick = _COMPILE_TICK
+        except Exception:
+            pass
         return cached
     order = g.topological_order()
     idx_of = {nid: i for i, nid in enumerate(order)}
     types = [g.nodes[n].type for n in order]
     acts = [g.nodes[n].activation for n in order]
-    node_sensitivity = np.array(
-        [float(getattr(g.nodes[n], 'backprop_sensitivity', 1.0)) for n in order],
-        dtype=np.float64,
-    )
-    node_jitter = np.array(
-        [float(np.clip(getattr(g.nodes[n], 'sensitivity_jitter', 0.0), -0.25, 0.25)) for n in order],
-        dtype=np.float64,
-    )
-    node_momentum = np.array(
-        [float(getattr(g.nodes[n], 'sensitivity_momentum', 0.0)) for n in order],
-        dtype=np.float64,
-    )
-    node_variance = np.array(
-        [float(max(0.0, getattr(g.nodes[n], 'sensitivity_variance', 0.0))) for n in order],
-        dtype=np.float64,
-    )
+    node_sensitivity = _node_trait_array(g, order, 'backprop_sensitivity', 1.0)
+    node_jitter = _node_trait_array(g, order, 'sensitivity_jitter', 0.0, low=-0.25, high=0.25)
+    node_momentum = _node_trait_array(g, order, 'sensitivity_momentum', 0.0)
+    node_variance = _node_trait_array(g, order, 'sensitivity_variance', 0.0, low=0.0)
+    node_altruism = _node_trait_array(g, order, 'altruism', 0.5, low=0.0, high=1.0)
+    node_altruism_memory = _node_trait_array(g, order, 'altruism_memory', 0.0, low=-1.5, high=1.5)
+    node_altruism_span = _node_trait_array(g, order, 'altruism_span', 0.0, low=0.0, high=4.0)
     in_ids = [nid for nid in order if g.nodes[nid].type == 'input']
     bias_ids = [nid for nid in order if g.nodes[nid].type == 'bias']
     out_ids = [nid for nid in order if g.nodes[nid].type == 'output']
@@ -4725,10 +4883,14 @@ def compile_genome(g: Genome):
         'node_jitter': node_jitter,
         'node_momentum': node_momentum,
         'node_variance': node_variance,
+        'node_altruism': node_altruism,
+        'node_altruism_memory': node_altruism_memory,
+        'node_altruism_span': node_altruism_span,
     }
     try:
         g._compiled_cache = compiled
         g._compiled_cache_rev = rev
+        g._compiled_cache_tick = _COMPILE_TICK
     except Exception:
         pass
     return compiled
@@ -4841,6 +5003,21 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
         node_variance = _np.zeros(n, dtype=_np.float64)
     else:
         node_variance = _np.clip(_np.asarray(node_variance, dtype=_np.float64), 0.0, 5.0)
+    node_altruism = comp.get('node_altruism')
+    if node_altruism is None or getattr(node_altruism, 'shape', (0,))[0] != n:
+        node_altruism = _np.full(n, 0.5, dtype=_np.float64)
+    else:
+        node_altruism = _np.clip(_np.asarray(node_altruism, dtype=_np.float64), 0.0, 1.0)
+    node_altruism_memory = comp.get('node_altruism_memory')
+    if node_altruism_memory is None or getattr(node_altruism_memory, 'shape', (0,))[0] != n:
+        node_altruism_memory = _np.zeros(n, dtype=_np.float64)
+    else:
+        node_altruism_memory = _np.clip(_np.asarray(node_altruism_memory, dtype=_np.float64), -1.5, 1.5)
+    node_altruism_span = comp.get('node_altruism_span')
+    if node_altruism_span is None or getattr(node_altruism_span, 'shape', (0,))[0] != n:
+        node_altruism_span = _np.zeros(n, dtype=_np.float64)
+    else:
+        node_altruism_span = _np.clip(_np.asarray(node_altruism_span, dtype=_np.float64), 0.0, 4.0)
     node_signal = _np.zeros(n, dtype=_np.float64)
     node_push = _np.zeros(n, dtype=_np.float64)
     for j, oi in enumerate(comp['outputs']):
@@ -4855,12 +5032,17 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
             dz_raw = delta_a[:, j] * act_deriv(comp['acts'][j], Z[:, j])
         dest_mom = float(node_momentum[j])
         dest_var = float(node_variance[j])
+        altruism_level = float(node_altruism[j])
+        altruism_memory = float(node_altruism_memory[j])
+        altruism_span = float(node_altruism_span[j])
         dest_scale = float(node_scale[j]) * (1.0 + 0.04 * _np.tanh(dest_mom))
         dest_jitter = 1.0 + 0.05 * float(node_jitter[j]) + 0.03 * _np.tanh(dest_var)
-        dest_mix = dest_scale * dest_jitter
+        social_gain = 1.0 + 0.18 * (altruism_level - 0.5) + 0.05 * altruism_memory
+        social_damp = 1.0 / (1.0 + 0.25 * altruism_span)
+        dest_mix = dest_scale * dest_jitter * social_gain * social_damp
         dz = dz_raw * dest_mix
         delta_z[:, j] = dz
-        node_signal[j] += float(_np.mean(_np.abs(dz))) * (1.0 + 0.1 * _np.tanh(dest_var))
+        node_signal[j] += float(_np.mean(_np.abs(dz))) * (1.0 + 0.1 * _np.tanh(dest_var) + 0.06 * altruism_level)
         ptr = comp.get('in_edges_ptr')
         flat = comp.get('in_edges_flat')
         if ptr is not None and flat is not None and j < len(ptr) - 1:
@@ -4878,9 +5060,11 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
                 edge_scale = 0.5 * (dest_mix + src_mix)
                 contrib = A[:, src_idx].T @ dz
                 grad_w[idx] += edge_scale * contrib
-                flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom)
-                node_push[src_idx] += _np.mean(_np.abs(dz[:, None] * weights_local), axis=0) * edge_scale * flow_bias
-                delta_a[:, src_idx] += dz[:, None] * (weights_local * src_mix)
+                altruism_delta = altruism_level - node_altruism[src_idx]
+                flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom) + 0.1 * altruism_delta
+                mem_gain = 1.0 + 0.08 * node_altruism_memory[src_idx]
+                node_push[src_idx] += _np.mean(_np.abs(dz[:, None] * weights_local), axis=0) * edge_scale * flow_bias * mem_gain
+                delta_a[:, src_idx] += dz[:, None] * (weights_local * src_mix * mem_gain)
         else:
             for e in comp['in_edges'][j]:
                 s = comp['src'][e]
@@ -4892,9 +5076,11 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
                 edge_scale = 0.5 * (dest_mix + src_mix)
                 contrib = _np.dot(A[:, s], dz)
                 grad_w[e] += edge_scale * contrib
-                flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom)
-                node_push[s] += float(_np.mean(_np.abs(dz * w[e]))) * edge_scale * flow_bias
-                delta_a[:, s] += dz * w[e] * src_mix
+                altruism_delta = altruism_level - float(node_altruism[s])
+                flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom) + 0.1 * altruism_delta
+                mem_gain = 1.0 + 0.08 * float(node_altruism_memory[s])
+                node_push[s] += float(_np.mean(_np.abs(dz * w[e]))) * edge_scale * flow_bias * mem_gain
+                delta_a[:, s] += dz * w[e] * src_mix * mem_gain
     grad_w = grad_w / max(1, B) + l2 * w
     if not _np.all(_np.isfinite(grad_w)):
         grad_w = _np.nan_to_num(grad_w, nan=0.0, posinf=0.0, neginf=0.0)
@@ -4920,6 +5106,7 @@ def train_with_backprop_numpy(
     w_clip=12.0,
     profile_out: Optional[Dict[str, Any]]=None,
     rng: Optional[np.random.Generator]=None,
+    collective_signal: Optional[Dict[str, float]]=None,
 ):
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
@@ -4935,14 +5122,21 @@ def train_with_backprop_numpy(
         profile_out.clear()
         profile_out['node_order'] = list(comp['order'])
         profile_out['node_types'] = list(comp['types'])
-        init_sens = [float(getattr(genome.nodes[nid], 'backprop_sensitivity', 1.0)) for nid in comp['order']]
-        init_jit = [float(getattr(genome.nodes[nid], 'sensitivity_jitter', 0.0)) for nid in comp['order']]
-        init_mom = [float(getattr(genome.nodes[nid], 'sensitivity_momentum', 0.0)) for nid in comp['order']]
-        init_var = [float(getattr(genome.nodes[nid], 'sensitivity_variance', 0.0)) for nid in comp['order']]
-        profile_out['initial_sensitivity'] = np.asarray(init_sens, dtype=np.float64)
-        profile_out['initial_jitter'] = np.asarray(init_jit, dtype=np.float64)
-        profile_out['initial_momentum'] = np.asarray(init_mom, dtype=np.float64)
-        profile_out['initial_variance'] = np.asarray(init_var, dtype=np.float64)
+        init_sens = comp['node_sensitivity'].copy()
+        init_jit = comp['node_jitter'].copy()
+        init_mom = comp['node_momentum'].copy()
+        init_var = comp['node_variance'].copy()
+        profile_out['initial_sensitivity'] = init_sens.copy()
+        profile_out['initial_jitter'] = init_jit.copy()
+        profile_out['initial_momentum'] = init_mom.copy()
+        profile_out['initial_variance'] = init_var.copy()
+        init_alt = comp['node_altruism'].copy()
+        init_alt_mem = comp['node_altruism_memory'].copy()
+        init_alt_span = comp['node_altruism_span'].copy()
+        profile_out['initial_altruism'] = init_alt.copy()
+        profile_out['initial_altruism_memory'] = init_alt_mem.copy()
+        profile_out['initial_altruism_span'] = init_alt_span.copy()
+        profile_out['collective_signal'] = collective
     rng_local = rng or np.random.default_rng()
     if w.size == 0:
         return history
@@ -4994,25 +5188,27 @@ def train_with_backprop_numpy(
             jitter_drive = 0.15 * node.sensitivity_momentum
             jitter_target = float(np.clip(jitter_drive + rng_local.normal(0.0, jitter_scale), -0.3, 0.3))
             node.sensitivity_jitter = float(np.clip(0.74 * jitter_base + 0.26 * jitter_target, -0.25, 0.25))
+            prev_alt = float(np.clip(getattr(node, 'altruism', 0.5), 0.0, 1.0))
+            prev_mem = float(np.clip(getattr(node, 'altruism_memory', 0.0), -1.5, 1.5))
+            prev_span = float(np.clip(getattr(node, 'altruism_span', 0.0), 0.0, 4.0))
+            solidarity_gain = 0.5 * solidarity + 0.3 * (1.0 - advantage) + 0.2 * lazy_share
+            target_alt = float(np.clip(0.6 * altruism_target + 0.4 * solidarity_gain, 0.0, 1.0))
+            node.altruism = float(np.clip(0.72 * prev_alt + 0.28 * target_alt, 0.0, 1.0))
+            mem_target = float(np.clip(solidarity - stress, -1.5, 1.5))
+            node.altruism_memory = float(np.clip(0.6 * prev_mem + 0.4 * mem_target, -1.5, 1.5))
+            span_target = float(np.clip(stress + advantage, 0.0, 4.0))
+            node.altruism_span = float(np.clip(0.65 * prev_span + 0.35 * span_target, 0.0, 4.0))
         if profile_out is not None:
             profile_out['avg_profile'] = np.asarray(avg_profile, dtype=np.float64)
             profile_out['profile_var'] = np.asarray(var_profile, dtype=np.float64)
-            profile_out['final_sensitivity'] = np.asarray(
-                [float(getattr(genome.nodes[nid], 'backprop_sensitivity', 1.0)) for nid in comp['order']],
-                dtype=np.float64,
-            )
-            profile_out['final_jitter'] = np.asarray(
-                [float(getattr(genome.nodes[nid], 'sensitivity_jitter', 0.0)) for nid in comp['order']],
-                dtype=np.float64,
-            )
-            profile_out['final_momentum'] = np.asarray(
-                [float(getattr(genome.nodes[nid], 'sensitivity_momentum', 0.0)) for nid in comp['order']],
-                dtype=np.float64,
-            )
-            profile_out['final_variance'] = np.asarray(
-                [float(getattr(genome.nodes[nid], 'sensitivity_variance', 0.0)) for nid in comp['order']],
-                dtype=np.float64,
-            )
+            order = comp['order']
+            profile_out['final_sensitivity'] = _node_trait_array(genome, order, 'backprop_sensitivity', 1.0)
+            profile_out['final_jitter'] = _node_trait_array(genome, order, 'sensitivity_jitter', 0.0, low=-0.25, high=0.25)
+            profile_out['final_momentum'] = _node_trait_array(genome, order, 'sensitivity_momentum', 0.0)
+            profile_out['final_variance'] = _node_trait_array(genome, order, 'sensitivity_variance', 0.0, low=0.0)
+            profile_out['final_altruism'] = _node_trait_array(genome, order, 'altruism', 0.5, low=0.0, high=1.0)
+            profile_out['final_altruism_memory'] = _node_trait_array(genome, order, 'altruism_memory', 0.0, low=-1.5, high=1.5)
+            profile_out['final_altruism_span'] = _node_trait_array(genome, order, 'altruism_span', 0.0, low=0.0, high=4.0)
             if step_profiles:
                 profile_out['step_profiles'] = np.stack(step_profiles, axis=0)
             else:
@@ -5045,10 +5241,22 @@ def complexity_penalty(genome: Genome, alpha_nodes=0.001, alpha_edges=0.0005):
     edges = len(genome.enabled_connections())
     return alpha_nodes * hidden + alpha_edges * edges
 
-def fitness_backprop_classifier(genome: Genome, Xtr, ytr, Xva, yva, steps=40, lr=0.005, l2=0.0001, alpha_nodes=0.001, alpha_edges=0.0005):
+def fitness_backprop_classifier(
+    genome: Genome,
+    Xtr,
+    ytr,
+    Xva,
+    yva,
+    steps=40,
+    lr=0.005,
+    l2=0.0001,
+    alpha_nodes=0.001,
+    alpha_edges=0.0005,
+    collective_signal: Optional[Dict[str, float]]=None,
+):
     try:
         gg = genome.copy()
-        train_with_backprop_numpy(gg, Xtr, ytr, steps=steps, lr=lr, l2=l2)
+        train_with_backprop_numpy(gg, Xtr, ytr, steps=steps, lr=lr, l2=l2, collective_signal=collective_signal)
         pred = predict(gg, Xva)
         acc = (pred == (yva if yva.ndim == 1 else np.argmax(yva, 1))).mean()
         pen = complexity_penalty(gg, alpha_nodes=alpha_nodes, alpha_edges=alpha_edges)
@@ -5670,76 +5878,6 @@ def plot_learning_and_complexity(history: List[Tuple[float, float]], hidden_coun
     fig.tight_layout()
     _savefig(fig, out_path, dpi=200)
     plt.close(fig)
-    return (csv_path, png_path)
-
-
-def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: str, png_path: str, title: str='Diversity & Environment Trajectory') -> Tuple[Optional[str], Optional[str]]:
-    if not div_history:
-        return (None, None)
-    os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
-    os.makedirs(os.path.dirname(png_path) or '.', exist_ok=True)
-    fields = [
-        'gen',
-        'entropy',
-        'scarcity',
-        'complexity_mean',
-        'complexity_std',
-        'structural_spread',
-        'diversity_bonus',
-        'diversity_power',
-        'env_noise',
-        'env_focus',
-        'env_entropy',
-        'lazy_share',
-        'unique_signatures',
-        'complexity_baseline',
-        'complexity_span',
-        'complexity_span_quantile',
-        'complexity_max',
-        'complexity_bonus_limit',
-    ]
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for row in div_history:
-            payload = {key: row.get(key, '') for key in fields}
-            writer.writerow(payload)
-    gens = np.array([int(item.get('gen', idx)) for idx, item in enumerate(div_history)], dtype=np.int32)
-    entropy = np.array([float(item.get('entropy', 0.0)) for item in div_history], dtype=np.float64)
-    scarcity = np.array([float(item.get('scarcity', 0.0)) for item in div_history], dtype=np.float64)
-    spread = np.array([float(item.get('structural_spread', 0.0)) for item in div_history], dtype=np.float64)
-    bonus = np.array([float(item.get('diversity_bonus', 0.0)) for item in div_history], dtype=np.float64)
-    env_noise = np.array([float(item.get('env_noise', 0.0)) for item in div_history], dtype=np.float64)
-    env_focus = np.array([float(item.get('env_focus', 0.0)) for item in div_history], dtype=np.float64)
-    env_entropy = np.array([float(item.get('env_entropy', 0.0)) for item in div_history], dtype=np.float64)
-    lazy_share = np.array([float(item.get('lazy_share', 0.0)) for item in div_history], dtype=np.float64)
-    fig, axes = plt.subplots(2, 1, sharex=True, figsize=(7.4, 6.0))
-    ax_top, ax_bottom = axes
-    ax_top.plot(gens, entropy, label='entropy (structural)', color='#1f78b4', linewidth=1.8)
-    ax_top.plot(gens, scarcity, label='scarcity', color='#d62728', linewidth=1.6)
-    ax_top.fill_between(gens, 0.0, scarcity, color='#ff9896', alpha=0.25)
-    ax_top.set_ylabel('entropy / scarcity')
-    ax_top.legend(loc='upper right', frameon=False, fontsize=9)
-    ax_top.grid(True, linestyle='--', alpha=0.2)
-    ax_mid = ax_bottom.twinx()
-    ax_bottom.plot(gens, bonus, label='diversity bonus', color='#2ca02c', linewidth=1.7)
-    ax_bottom.plot(gens, spread, label='structural spread', color='#9467bd', linewidth=1.5, linestyle='--')
-    ax_bottom.plot(gens, lazy_share, label='lazy share', color='#8c564b', linewidth=1.3, linestyle=':')
-    ax_bottom.set_ylabel('bonus / spread / lazy share')
-    ax_bottom.legend(loc='upper left', frameon=False, fontsize=9)
-    ax_bottom.grid(True, linestyle='--', alpha=0.2)
-    ax_mid.plot(gens, env_noise, label='env noise', color='#17becf', linewidth=1.4)
-    ax_mid.plot(gens, env_focus, label='env focus', color='#ff7f0e', linewidth=1.2, linestyle='-.')
-    ax_mid.plot(gens, env_entropy, label='env entropy', color='#7f7f7f', linewidth=1.0, linestyle=':')
-    ax_mid.set_ylabel('environmental metrics')
-    ax_mid.legend(loc='upper right', frameon=False, fontsize=8)
-    ax_bottom.set_xlabel('generation')
-    if title:
-        fig.suptitle(title, fontsize=13)
-    fig.tight_layout(rect=[0, 0.02, 1, 0.98])
-    _savefig(fig, png_path, dpi=220)
-    plt.close(fig)
-    return (csv_path, png_path)
 
 
 def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: str, png_path: str, title: str='Diversity & Environment Trajectory') -> Tuple[Optional[str], Optional[str]]:
@@ -5850,6 +5988,7 @@ def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, c
     fig.tight_layout()
     _savefig(fig, out_path, dpi=220)
     plt.close(fig)
+    return {'figure': out_path, 'history': loss, 'profile': profile}
 
 def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
@@ -5874,6 +6013,9 @@ def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50
     final_momentum = np.asarray(profile.get('final_momentum', []), dtype=np.float64)
     final_variance = np.asarray(profile.get('final_variance', []), dtype=np.float64)
     final_jitter = np.asarray(profile.get('final_jitter', []), dtype=np.float64)
+    final_altruism = np.asarray(profile.get('final_altruism', []), dtype=np.float64)
+    final_altruism_mem = np.asarray(profile.get('final_altruism_memory', []), dtype=np.float64)
+    final_altruism_span = np.asarray(profile.get('final_altruism_span', []), dtype=np.float64)
     idx_pool = [i for i, t in enumerate(node_types) if t == 'hidden']
     if not idx_pool:
         idx_pool = list(range(len(labels)))
@@ -5935,8 +6077,10 @@ def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50
     if scatter_idx and final_momentum.size and final_variance.size:
         mom_vals = final_momentum[scatter_idx]
         var_vals = final_variance[scatter_idx]
-        jit_vals = final_jitter[scatter_idx] if final_jitter.size else np.zeros_like(mom_vals)
-        sc = ax_right.scatter(mom_vals, var_vals, c=jit_vals, cmap='coolwarm', s=60, edgecolors='k', linewidths=0.35)
+        color_vals = final_altruism[scatter_idx] if final_altruism.size else np.zeros_like(mom_vals)
+        span_vals = final_altruism_span[scatter_idx] if final_altruism_span.size else np.zeros_like(mom_vals)
+        sizes = 60.0 + 80.0 * np.clip(span_vals, 0.0, 4.0) / 4.0
+        sc = ax_right.scatter(mom_vals, var_vals, c=color_vals, cmap='viridis', s=sizes, edgecolors='k', linewidths=0.35)
         for k, idx in enumerate(scatter_idx):
             lbl = labels[idx] if idx < len(labels) else f'n{idx}'
             ax_right.text(mom_vals[k] + 0.02, var_vals[k] + 0.02, lbl, fontsize=8)
@@ -5945,7 +6089,7 @@ def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50
         ax_right.set_title('Post-train temperament field')
         if len(scatter_idx) >= 3:
             cb = fig.colorbar(sc, ax=ax_right, fraction=0.046, pad=0.04)
-            cb.set_label('jitter', fontsize=9)
+            cb.set_label('altruism', fontsize=9)
     else:
         ax_right.text(0.5, 0.5, 'No temperament statistics', ha='center', va='center', fontsize=10)
         ax_right.set_axis_off()
@@ -6098,12 +6242,38 @@ class FitnessBackpropShared:
 
     def __call__(self, g: 'Genome') -> float:
         Xtr, ytr, Xva, yva = self._load()
-        return fitness_backprop_classifier(g, self._aug(Xtr), ytr, self._aug(Xva), yva, steps=self.steps, lr=self.lr, l2=self.l2, alpha_nodes=self.alpha_nodes, alpha_edges=self.alpha_edges)
+        signal = getattr(self, 'collective_signal', None)
+        return fitness_backprop_classifier(
+            g,
+            self._aug(Xtr),
+            ytr,
+            self._aug(Xva),
+            yva,
+            steps=self.steps,
+            lr=self.lr,
+            l2=self.l2,
+            alpha_nodes=self.alpha_nodes,
+            alpha_edges=self.alpha_edges,
+            collective_signal=signal,
+        )
 
     def refine_raw(self, g: 'Genome', factor: float=2.0) -> float:
         Xtr, ytr, Xva, yva = self._load()
         steps = int(max(1, round(self.steps * float(factor))))
-        return fitness_backprop_classifier(g, self._aug(Xtr), ytr, self._aug(Xva), yva, steps=steps, lr=self.lr, l2=self.l2, alpha_nodes=self.alpha_nodes, alpha_edges=self.alpha_edges)
+        signal = getattr(self, 'collective_signal', None)
+        return fitness_backprop_classifier(
+            g,
+            self._aug(Xtr),
+            ytr,
+            self._aug(Xva),
+            yva,
+            steps=steps,
+            lr=self.lr,
+            l2=self.l2,
+            alpha_nodes=self.alpha_nodes,
+            alpha_edges=self.alpha_edges,
+            collective_signal=signal,
+        )
 
 class PerSampleSequenceStopperPro:
     """
@@ -7481,6 +7651,9 @@ def _genome_to_cyto(genome: Genome) -> dict:
             'jitter': float(getattr(node, 'sensitivity_jitter', 0.0)),
             'momentum': float(getattr(node, 'sensitivity_momentum', 0.0)),
             'variance': float(getattr(node, 'sensitivity_variance', 0.0)),
+            'altruism': float(np.clip(getattr(node, 'altruism', 0.5), 0.0, 1.0)),
+            'altruism_memory': float(np.clip(getattr(node, 'altruism_memory', 0.0), -1.5, 1.5)),
+            'altruism_span': float(np.clip(getattr(node, 'altruism_span', 0.0), 0.0, 4.0)),
         }
         nodes.append({'data': node_data})
     edges = []
@@ -7518,7 +7691,14 @@ def export_interactive_html_report(path: str, title: str, history, genomes, *, m
         genomes = [_genome_to_cyto(g) for g in genomes]
     build_id = _build_stamp_short()
     data = {'title': title, 'lc': {'x': xs, 'best': ys_best, 'avg': ys_avg}, 'genomes': genomes, 'build': build_id}
-    html = f"""<!doctype html>\n<html lang="ja">\n<head>\n  <meta charset="utf-8"/>\n  <title>{title}</title>\n  <meta name="viewport" content="width=device-width, initial-scale=1"/>\n  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>\n  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>\n  <style>\n    :root {{ --grid:#e5e5e5; --fg:#111; --muted:#666; --ok1:#0072B2; --ok2:#D55E00; --ok3:#009E73; --ok4:#CC79A7; --ok5:#F0E442; --ok6:#56B4E9; --ok7:#E69F00; --ok8:#000; }}\n    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--fg); }}\n    .container {{ max-width:1200px; margin:24px auto; padding:0 16px; }}\n    h1 {{ font-size:22px; margin:0 0 12px; }}\n    .card {{ border:1px solid var(--grid); border-radius:8px; padding:12px; background:#fff; margin-bottom:16px; }}\n    #lc {{ height:360px; }}\n    .panel {{ display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:16px; align-items:start; overflow:hidden; }}\n    .panel > * {{ min-width:0; }}\n    #cy {{ width:100%; height:560px; border:1px solid var(--grid); border-radius:6px; background:#fff; box-sizing:border-box; }}\n    .detail {{ border:1px dashed var(--grid); border-radius:6px; padding:8px; font-size:13px; height:560px; overflow:auto; background:#fafafa; box-sizing:border-box; }}\n    .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }}\n    .row.controls {{ margin-top:4px; font-size:13px; color:var(--muted); }}\n    .row.controls label {{ font-size:13px; color:var(--fg); display:flex; align-items:center; gap:4px; }}\n    select,button,input[type=range] {{ padding:6px 8px; font-size:14px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}\n    input[type=range] {{ padding:0; width:160px; accent-color:#0072B2; }}\n    .dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}\n    .legend {{ display:inline-flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:13px; }}\n    .legend-title {{ font-weight:600; color:var(--muted); margin-right:2px; }}\n    .legend-gradient {{ width:120px; height:10px; border-radius:4px; border:1px solid var(--grid); background:linear-gradient(90deg,#2c7bb6,#abd9e9,#ffffbf,#fdae61,#d7191c); }}\n    .legend-text {{ color:var(--muted); font-size:12px; }}\n    .checkbox {{ display:inline-flex; align-items:center; gap:6px; padding:4px 6px; border:1px solid var(--grid); border-radius:6px; background:#fff; color:var(--fg); }}\n    .checkbox input {{ margin:0; }}\n    #genomeStats {{ font-size:13px; color:var(--muted); margin-top:8px; display:grid; gap:4px; line-height:1.4; }}\n    @media (max-width: 900px) {{\n      .panel {{ grid-template-columns:1fr; }}\n      .detail {{ height:auto; min-height:220px; }}\n      #cy {{ height:420px; }}\n    }}\n    /* Tooltip */\n    .tip {{ position:fixed; pointer-events:none; background:rgba(0,0,0,.8); color:#fff; padding:6px 8px; font-size:12px; border-radius:4px; transform:translate(8px,8px); z-index:1000; display:none; max-width:320px; white-space:nowrap; }}\n    /* Context menu */\n    .ctx-menu {{\n      position: fixed; z-index: 2000; display: none; min-width: 220px;\n      background: #fff; color: var(--fg); border: 1px solid var(--grid); border-radius: 8px;\n      box-shadow: 0 8px 20px rgba(0,0,0,.12); padding: 6px;\n    }}\n    .ctx-item {{ font-size: 13px; padding: 8px 10px; cursor: pointer; border-radius:6px; }}\n    .ctx-item:hover {{ background: #f3f3f3; }}\n    .ctx-sep {{ height:1px; background: var(--grid); margin:6px 0; }}\n    .swatches {{ display:flex; flex-wrap:wrap; gap:6px; padding: 4px 2px 2px; }}\n    .swatch {{ width:18px; height:18px; border-radius:50%; cursor:pointer; border:1px solid rgba(0,0,0,.15); }}\n    .ctx-row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}\n  </style>\n</head>\n<body>\n  <div class="container">\n    <h1>{title}</h1>\n    <div class="card">\n      <h2>Learning Curve</h2>\n      <div id="lc"></div>\n    </div>\n    <div class="card">\n      <h2>Genome Viewer</h2>\n      <div class="row">\n        <label for="genomeSelect">Genome:</label>\n        <select id="genomeSelect"></select>\n        <button id="layoutBtn">Re-layout</button>\n        <span class="legend" id="legendBox"></span>\n      </div>\n      <div class="row controls">\n        <label for="nodeColorMode">ノード色:</label>\n        <select id="nodeColorMode">\n          <option value="type">種類</option>\n          <option value="sensitivity">感受性</option>\n          <option value="momentum">モメンタム</option>\n          <option value="variance">分散</option>\n        </select>\n        <label for="weightFilter">|weight| ≥ <span id="weightFilterValue">0</span></label>\n        <input type="range" id="weightFilter" min="0" max="100" step="1" value="0"/>\n        <label class="checkbox"><input type="checkbox" id="enabledOnly"/> 有効エッジのみ</label>\n      </div>\n      <div class="panel">\n        <div id="cy"></div>\n        <div class="detail" id="detail"><div class="fine">ノードやエッジを選択すると詳細が表示されます。</div></div>\n      </div>\n      <div id="genomeStats"></div>\n    </div>\n  </div>\n  <div class="tip" id="tip"></div>\n  <div class="ctx-menu" id="ctx"></div>\n\n  <script>\n    const DATA = {json.dumps(data, ensure_ascii=False)};\n    // Learning curve\n    (function(){{\n      const traces = [];\n      if (DATA.lc && DATA.lc.x.length) {{\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.best, mode:'lines', name:'best', line:{{width:2, color:'#0072B2'}},\n          hovertemplate:'gen=%{{x}}<br>best=%{{y:.4f}}<extra></extra>' }});\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.avg,  mode:'lines', name:'avg',  line:{{width:2, color:'#D55E00'}},\n          hovertemplate:'gen=%{{x}}<br>avg=%{{y:.4f}}<extra></extra>' }});\n      }}\n      Plotly.newPlot('lc', traces, {{\n        margin:{{l:40,r:10,t:10,b:40}},\n        xaxis:{{title:'Generation', gridcolor:'#eee'}},\n        yaxis:{{title:'Fitness', gridcolor:'#eee'}},\n        legend:{{orientation:'h'}}\n      }}, {{displayModeBar:true, responsive:true}});\n    }})();\n\n    // Genome viewer\n    const cyContainer = document.getElementById('cy');\n    const detail = document.getElementById('detail');\n    const tip = document.getElementById('tip');\n    const sel = document.getElementById('genomeSelect');\n    const layoutBtn = document.getElementById('layoutBtn');\n    const ctx = document.getElementById('ctx');\n    const colorModeSelect = document.getElementById('nodeColorMode');\n    const weightSlider = document.getElementById('weightFilter');\n    const weightLabel = document.getElementById('weightFilterValue');\n    const enabledOnly = document.getElementById('enabledOnly');\n    const legendBox = document.getElementById('legendBox');\n    const statsBox = document.getElementById('genomeStats');\n    let cy = null;\n    let currentGenome = null; // store current genome object\n    let ctxNode = null;\n    const globalStats = computeGlobalStats();\n    let currentEdgeMax = globalStats.maxAbsWeight || 0;\n    let activeColorMode = (colorModeSelect && colorModeSelect.value) || 'type';\n    updateLegend(activeColorMode);\n    applyEdgeFilters();\n\n    function lsKey(gid) {{ return 'NEAT_REPORT_GENOME_STATE::' + String(gid); }}\n    function saveState() {{\n      if (!cy || !currentGenome) return;\n      const st = {{}};\n      cy.nodes().forEach(n => {{\n        st[n.id()] = {{\n          pos: n.position(),\n          locked: n.locked(),\n          color: n.data('color') || null,\n          note: n.data('note') || null\n        }};\n      }});\n      try {{ localStorage.setItem(lsKey(currentGenome.id || 'genome'), JSON.stringify(st)); }} catch(e){{}}\n    }}\n    function applyState() {{\n      if (!cy || !currentGenome) return;\n      let raw = null;\n      try {{ raw = localStorage.getItem(lsKey(currentGenome.id || 'genome')); }} catch(e){{}}\n      if (!raw) return;\n      let st = null;\n      try {{ st = JSON.parse(raw); }} catch(e) {{ return; }}\n      if (!st) return;\n      cy.batch(() => {{\n        cy.nodes().forEach(n => {{\n          const s = st[n.id()]; if (!s) return;\n          if (s.pos && Number.isFinite(s.pos.x) && Number.isFinite(s.pos.y)) n.position(s.pos);\n          if (s.locked) n.lock(); else n.unlock();\n          if (s.color) {{ n.data('color', s.color); n.style('background-color', s.color); }}\n          if (s.note) {{\n            n.data('note', s.note);\n            const orig = n.data('orig_label') || n.data('label') || n.id();\n            n.data('label', orig + '\\n' + s.note);\n          }}\n        }});\n      }});\n    }}\n\n    
+    html = f"""<!doctype html>\n<html lang="ja">\n<head>\n  <meta charset="utf-8"/>\n  <title>{title}</title>\n  <meta name="viewport" content="width=device-width, initial-scale=1"/>\n  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>\n  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>\n  <style>\n    :root {{ --grid:#e5e5e5; --fg:#111; --muted:#666; --ok1:#0072B2; --ok2:#D55E00; --ok3:#009E73; --ok4:#CC79A7; --ok5:#F0E442; --ok6:#56B4E9; --ok7:#E69F00; --ok8:#000; }}\n    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--fg); }}\n    .container {{ max-width:1200px; margin:24px auto; padding:0 16px; }}\n    h1 {{ font-size:22px; margin:0 0 12px; }}\n    .card {{ border:1px solid var(--grid); border-radius:8px; padding:12px; background:#fff; margin-bottom:16px; }}\n    #altruismCard {{ margin-top:12px; }}
+    #altruismSummary {{ font-size:12px; color:var(--muted); margin-bottom:8px; }}
+    #altruismPlot {{ width:100%; height:200px; }}
+    #lc {{ height:360px; }}\n    .panel {{ display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:16px; align-items:start; overflow:hidden; }}\n    .panel > * {{ min-width:0; }}\n    #cy {{ width:100%; height:560px; border:1px solid var(--grid); border-radius:6px; background:#fff; box-sizing:border-box; }}\n    .detail {{ border:1px dashed var(--grid); border-radius:6px; padding:8px; font-size:13px; height:560px; overflow:auto; background:#fafafa; box-sizing:border-box; }}\n    .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }}\n    .row.controls {{ margin-top:4px; font-size:13px; color:var(--muted); }}\n    .row.controls label {{ font-size:13px; color:var(--fg); display:flex; align-items:center; gap:4px; }}\n    select,button,input[type=range] {{ padding:6px 8px; font-size:14px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}\n    input[type=range] {{ padding:0; width:160px; accent-color:#0072B2; }}\n    .dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}\n    .legend {{ display:inline-flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:13px; }}\n    .legend-title {{ font-weight:600; color:var(--muted); margin-right:2px; }}\n    .legend-gradient {{ width:120px; height:10px; border-radius:4px; border:1px solid var(--grid); background:linear-gradient(90deg,#2c7bb6,#abd9e9,#ffffbf,#fdae61,#d7191c); }}\n    .legend-text {{ color:var(--muted); font-size:12px; }}\n    .checkbox {{ display:inline-flex; align-items:center; gap:6px; padding:4px 6px; border:1px solid var(--grid); border-radius:6px; background:#fff; color:var(--fg); }}\n    .checkbox input {{ margin:0; }}\n    #genomeStats {{ font-size:13px; color:var(--muted); margin-top:8px; display:grid; gap:4px; line-height:1.4; }}\n    @media (max-width: 900px) {{\n      .panel {{ grid-template-columns:1fr; }}\n      .detail {{ height:auto; min-height:220px; }}\n      #cy {{ height:420px; }}\n    }}\n    /* Tooltip */\n    .tip {{ position:fixed; pointer-events:none; background:rgba(0,0,0,.8); color:#fff; padding:6px 8px; font-size:12px; border-radius:4px; transform:translate(8px,8px); z-index:1000; display:none; max-width:320px; white-space:nowrap; }}\n    /* Context menu */\n    .ctx-menu {{\n      position: fixed; z-index: 2000; display: none; min-width: 220px;\n      background: #fff; color: var(--fg); border: 1px solid var(--grid); border-radius: 8px;\n      box-shadow: 0 8px 20px rgba(0,0,0,.12); padding: 6px;\n    }}\n    .ctx-item {{ font-size: 13px; padding: 8px 10px; cursor: pointer; border-radius:6px; }}\n    .ctx-item:hover {{ background: #f3f3f3; }}\n    .ctx-sep {{ height:1px; background: var(--grid); margin:6px 0; }}\n    .swatches {{ display:flex; flex-wrap:wrap; gap:6px; padding: 4px 2px 2px; }}\n    .swatch {{ width:18px; height:18px; border-radius:50%; cursor:pointer; border:1px solid rgba(0,0,0,.15); }}\n    .ctx-row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}\n  </style>\n</head>\n<body>\n  <div class="container">\n    <h1>{title}</h1>\n    <div class="card">\n      <h2>Learning Curve</h2>\n      <div id="lc"></div>\n    </div>\n    <div class="card">\n      <h2>Genome Viewer</h2>\n      <div class="row">\n        <label for="genomeSelect">Genome:</label>\n        <select id="genomeSelect"></select>\n        <button id="layoutBtn">Re-layout</button>\n        <span class="legend" id="legendBox"></span>\n      </div>\n      <div class="row controls">\n        <label for="nodeColorMode">ノード色:</label>\n        <select id="nodeColorMode">\n          <option value="type">種類</option>\n          <option value="sensitivity">感受性</option>\n          <option value="momentum">モメンタム</option>\n          <option value="variance">分散</option>\n          <option value="altruism">利他性</option>\n          <option value="altruism_memory">利他メモリ</option>\n          <option value="altruism_span">利他スパン</option>\n        </select>\n        <label for="weightFilter">|weight| ≥ <span id="weightFilterValue">0</span></label>\n        <input type="range" id="weightFilter" min="0" max="100" step="1" value="0"/>\n        <label class="checkbox"><input type="checkbox" id="enabledOnly"/> 有効エッジのみ</label>\n      </div>\n      <div class="panel">\n        <div id="cy"></div>\n        <div class="detail" id="detail"><div class="fine">ノードやエッジを選択すると詳細が表示されます。</div></div>\n      </div>\n      <div id="genomeStats"></div>
+      <div class="card" id="altruismCard">
+        <div class="fine" id="altruismSummary">利他性と集団信号の要約がここに表示されます。</div>
+        <div id="altruismPlot"></div>
+      </div>\n    </div>\n  </div>\n  <div class="tip" id="tip"></div>\n  <div class="ctx-menu" id="ctx"></div>\n\n  <script>\n    const DATA = {json.dumps(data, ensure_ascii=False)};\n    // Learning curve\n    (function(){{\n      const traces = [];\n      if (DATA.lc && DATA.lc.x.length) {{\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.best, mode:'lines', name:'best', line:{{width:2, color:'#0072B2'}},\n          hovertemplate:'gen=%{{x}}<br>best=%{{y:.4f}}<extra></extra>' }});\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.avg,  mode:'lines', name:'avg',  line:{{width:2, color:'#D55E00'}},\n          hovertemplate:'gen=%{{x}}<br>avg=%{{y:.4f}}<extra></extra>' }});\n      }}\n      Plotly.newPlot('lc', traces, {{\n        margin:{{l:40,r:10,t:10,b:40}},\n        xaxis:{{title:'Generation', gridcolor:'#eee'}},\n        yaxis:{{title:'Fitness', gridcolor:'#eee'}},\n        legend:{{orientation:'h'}}\n      }}, {{displayModeBar:true, responsive:true}});\n    }})();\n\n    // Genome viewer\n    const cyContainer = document.getElementById('cy');\n    const detail = document.getElementById('detail');\n    const tip = document.getElementById('tip');\n    const sel = document.getElementById('genomeSelect');\n    const layoutBtn = document.getElementById('layoutBtn');\n    const ctx = document.getElementById('ctx');\n    const colorModeSelect = document.getElementById('nodeColorMode');\n    const weightSlider = document.getElementById('weightFilter');\n    const weightLabel = document.getElementById('weightFilterValue');\n    const enabledOnly = document.getElementById('enabledOnly');\n    const legendBox = document.getElementById('legendBox');\n    const statsBox = document.getElementById('genomeStats');\n    const altruismSummaryBox = document.getElementById('altruismSummary');\n    const altruismPlotBox = document.getElementById('altruismPlot');\n    let cy = null;\n    let currentGenome = null; // store current genome object\n    let ctxNode = null;\n    const globalStats = computeGlobalStats();\n    let currentEdgeMax = globalStats.maxAbsWeight || 0;\n    let activeColorMode = (colorModeSelect && colorModeSelect.value) || 'type';\n    updateLegend(activeColorMode);\n    applyEdgeFilters();\n\n    function lsKey(gid) {{ return 'NEAT_REPORT_GENOME_STATE::' + String(gid); }}\n    function saveState() {{\n      if (!cy || !currentGenome) return;\n      const st = {{}};\n      cy.nodes().forEach(n => {{\n        st[n.id()] = {{\n          pos: n.position(),\n          locked: n.locked(),\n          color: n.data('color') || null,\n          note: n.data('note') || null\n        }};\n      }});\n      try {{ localStorage.setItem(lsKey(currentGenome.id || 'genome'), JSON.stringify(st)); }} catch(e){{}}\n    }}\n    function applyState() {{\n      if (!cy || !currentGenome) return;\n      let raw = null;\n      try {{ raw = localStorage.getItem(lsKey(currentGenome.id || 'genome')); }} catch(e){{}}\n      if (!raw) return;\n      let st = null;\n      try {{ st = JSON.parse(raw); }} catch(e) {{ return; }}\n      if (!st) return;\n      cy.batch(() => {{\n        cy.nodes().forEach(n => {{\n          const s = st[n.id()]; if (!s) return;\n          if (s.pos && Number.isFinite(s.pos.x) && Number.isFinite(s.pos.y)) n.position(s.pos);\n          if (s.locked) n.lock(); else n.unlock();\n          if (s.color) {{ n.data('color', s.color); n.style('background-color', s.color); }}\n          if (s.note) {{\n            n.data('note', s.note);\n            const orig = n.data('orig_label') || n.data('label') || n.id();\n            n.data('label', orig + '\\n' + s.note);\n          }}\n        }});\n      }});\n    }}\n\n    
 function updateRange(range, value) {{
   if (!Number.isFinite(value)) return;
   if (value < range[0]) range[0] = value;
@@ -7535,6 +7715,9 @@ function computeGlobalStats() {{
     sensitivity: [Infinity, -Infinity],
     momentum: [Infinity, -Infinity],
     variance: [Infinity, -Infinity],
+    altruism: [Infinity, -Infinity],
+    altruism_memory: [Infinity, -Infinity],
+    altruism_span: [Infinity, -Infinity],
   }};
   let maxAbsWeight = 0;
   (DATA.genomes || []).forEach(g => {{
@@ -7543,6 +7726,9 @@ function computeGlobalStats() {{
       updateRange(ranges.sensitivity, Number(d.sensitivity));
       updateRange(ranges.momentum, Number(d.momentum));
       updateRange(ranges.variance, Number(d.variance));
+      updateRange(ranges.altruism, Number(d.altruism));
+      updateRange(ranges.altruism_memory, Number(d.altruism_memory));
+      updateRange(ranges.altruism_span, Number(d.altruism_span));
     }});
     (g.edges || []).forEach(e => {{
       const d = e.data || e;
@@ -7553,6 +7739,9 @@ function computeGlobalStats() {{
   normalizeRange(ranges.sensitivity, 1);
   normalizeRange(ranges.momentum, 0);
   normalizeRange(ranges.variance, 0);
+  normalizeRange(ranges.altruism, 0.5);
+  normalizeRange(ranges.altruism_memory, 0);
+  normalizeRange(ranges.altruism_span, 0);
   return {{ ranges, maxAbsWeight }};
 }}
 function formatNumber(value, digits) {{
@@ -7596,7 +7785,7 @@ function applyNodeColorMode(mode) {{
   activeColorMode = mode || 'type';
   updateLegend(activeColorMode);
   if (!cy) return;
-  const keyMap = {{ sensitivity: 'sensitivity', momentum: 'momentum', variance: 'variance' }};
+  const keyMap = {{ sensitivity: 'sensitivity', momentum: 'momentum', variance: 'variance', altruism: 'altruism', altruism_memory: 'altruism_memory', altruism_span: 'altruism_span' }};
   const range = globalStats.ranges[activeColorMode] || [0, 1];
   cy.batch(() => {{
     cy.nodes().forEach(n => {{
@@ -7687,13 +7876,56 @@ function updateGenomeStats(g) {{
   const momentum = calcStats(values('momentum'));
   const jitter = calcStats(values('jitter'));
   const variance = calcStats(values('variance'));
+  const altruism = calcStats(values('altruism'));
+  const altruismMem = calcStats(values('altruism_memory'));
+  const altruismSpan = calcStats(values('altruism_span'));
   const parts = [
     `<div>Nodes: ${{nodes.length}} / Edges: ${{edges.length}} (enabled ${{enabledCount}})</div>`,
     `<div>感受性 μ=${{formatNumber(sens.mean, 3)}} σ=${{formatNumber(sens.std, 3)}}</div>`,
-    `<div>モメンタム μ=${{formatNumber(momentum.mean, 3)}} σ=${{formatNumber(momentum.std, 3)}} ・ ジッター μ=${{formatNumber(jitter.mean, 3)}} σ=${{formatNumber(jitter.std, 3)}} ・ 分散 μ=${{formatNumber(variance.mean, 3)}}</div>`
+    `<div>モメンタム μ=${{formatNumber(momentum.mean, 3)}} σ=${{formatNumber(momentum.std, 3)}} ・ ジッター μ=${{formatNumber(jitter.mean, 3)}} σ=${{formatNumber(jitter.std, 3)}} ・ 分散 μ=${{formatNumber(variance.mean, 3)}}</div>`,
+    `<div>利他性 μ=${{formatNumber(altruism.mean, 3)}} σ=${{formatNumber(altruism.std, 3)}} ・ メモリ μ=${{formatNumber(altruismMem.mean, 3)}} σ=${{formatNumber(altruismMem.std, 3)}} ・ スパン μ=${{formatNumber(altruismSpan.mean, 3)}} σ=${{formatNumber(altruismSpan.std, 3)}}</div>`
   ];
   statsBox.innerHTML = parts.join('');
 }}
+function updateAltruismPanel(g) {{
+  if (!altruismSummaryBox) return;
+  const nodes = (g.nodes || []).map(n => n.data || n);
+  const hidden = nodes.filter(d => d.type === 'hidden');
+  if (!hidden.length) {{
+    altruismSummaryBox.textContent = '利他性データがありません。';
+    if (altruismPlotBox) altruismPlotBox.innerHTML = '<div class="fine">hiddenノードなし</div>';
+    return;
+  }}
+  const idxs = [];
+  const altSeries = [];
+  const memSeries = [];
+  const spanSeries = [];
+  hidden.forEach((d, i) => {{
+    idxs.push(i + 1);
+    const alt = Number(d.altruism);
+    const mem = Number(d.altruism_memory);
+    const span = Number(d.altruism_span);
+    altSeries.push(Number.isFinite(alt) ? alt : 0);
+    memSeries.push(Number.isFinite(mem) ? mem : 0);
+    spanSeries.push(Number.isFinite(span) ? span : 0);
+  }});
+  const altStats = calcStats(altSeries);
+  const memStats = calcStats(memSeries);
+  const spanStats = calcStats(spanSeries);
+  altruismSummaryBox.innerHTML = `利他性 μ=${{formatNumber(altStats.mean, 3)}} σ=${{formatNumber(altStats.std, 3)}} / メモリ μ=${{formatNumber(memStats.mean, 3)}} σ=${{formatNumber(memStats.std, 3)}} / スパン μ=${{formatNumber(spanStats.mean, 3)}} σ=${{formatNumber(spanStats.std, 3)}}`;
+  if (typeof Plotly !== 'undefined' && altruismPlotBox) {{
+    const traces = [
+      {{ x: idxs, y: altSeries, name: 'altruism', mode: 'lines+markers', line: {{ color: '#219ebc' }}, marker: {{ size: 5 }} }},
+      {{ x: idxs, y: memSeries, name: 'memory', mode: 'lines', line: {{ color: '#8ecae6', dash: 'dot' }} }},
+      {{ x: idxs, y: spanSeries, name: 'span', mode: 'lines', line: {{ color: '#ffb703', dash: 'dash' }} }},
+    ];
+    const layout = {{ margin: {{ l: 36, r: 12, t: 24, b: 28 }}, height: 220, paper_bgcolor: '#fff', plot_bgcolor: '#fff', legend: {{ orientation: 'h', x: 0, y: 1.18 }}, xaxis: {{ title: 'hidden index' }}, yaxis: {{ title: 'value' }} }};
+    Plotly.react(altruismPlotBox, traces, layout, {{ displayModeBar: false, responsive: true }});
+  }} else if (altruismPlotBox) {{
+    altruismPlotBox.textContent = 'Plotly unavailable';
+  }}
+}}
+
 function genomeToElements(g) {{
       const nodes = (g.nodes||[]).map(n => {{
         const d = Object.assign({{}}, n.data || n);
@@ -7736,7 +7968,7 @@ function populateSelect() {{\n      sel.innerHTML = '';\n      if (!DATA.genomes
         }}
       }}
 
-      function showDetail(html) {{ detail.innerHTML = html; }}\n      function nodeHtml(d) {{\n        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');\n        return `<div><b>Node</b></div>\n          <div>ID: ${{a('id')}}</div>\n          <div>Label: ${{a('label')}}</div>\n          <div>Type: ${{a('type')}}</div>\n          <div>Bias: ${{a('bias')}}</div>\n          <div>Activation: ${{a('activation')}}</div>\n          <div>Sensitivity: ${{a('sensitivity')}}</div>\n          <div>Jitter: ${{a('jitter')}}</div>\n          <div>Momentum: ${{a('momentum')}}</div>\n          <div>Variance: ${{a('variance')}}</div>\n          <div>Note: ${{a('note')}}</div>`;\n      }}\n      function edgeHtml(d) {{
+      function showDetail(html) {{ detail.innerHTML = html; }}\n      function nodeHtml(d) {{\n        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');\n        return `<div><b>Node</b></div>\n          <div>ID: ${{a('id')}}</div>\n          <div>Label: ${{a('label')}}</div>\n          <div>Type: ${{a('type')}}</div>\n          <div>Bias: ${{a('bias')}}</div>\n          <div>Activation: ${{a('activation')}}</div>\n          <div>Sensitivity: ${{a('sensitivity')}}</div>\n          <div>Jitter: ${{a('jitter')}}</div>\n          <div>Momentum: ${{a('momentum')}}</div>\n          <div>Variance: ${{a('variance')}}</div>\n          <div>Altruism: ${{a('altruism')}}</div>\n          <div>Altruism memory: ${{a('altruism_memory')}}</div>\n          <div>Altruism span: ${{a('altruism_span')}}</div>\n          <div>Note: ${{a('note')}}</div>`;\n      }}\n      function edgeHtml(d) {{
         const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');
         return `<div><b>Edge</b></div>
           <div>Source: ${{a('source')}}</div>
@@ -7758,7 +7990,8 @@ function populateSelect() {{\n      sel.innerHTML = '';\n      if (!DATA.genomes
         tip.innerHTML = text;
         tip.style.display='block';
         moveTip(evt);
-      }});\n      cy.on('mousemove','node',(evt)=> moveTip(evt));\n      cy.on('mouseout','node',()=> {{ tip.style.display='none'; }});\n\n      // Persist position/color/note\n      cy.on('free', 'node', saveState);\n      cy.on('lock unlock', 'node', saveState);\n\n      // Apply saved state for this genome\n      applyState();\n\n      applyNodeColorMode(activeColorMode);\n      applyEdgeFilters();\n      updateGenomeStats(g);\n      // Context menu handlers\n      cy.on('cxttapstart', 'node', (evt) => {{\n        ctxNode = evt.target;\n        openCtxAt(evt.renderedPosition);\n      }});\n      cy.on('cxttapstart', (evt) => {{\n        if (evt.target === cy) closeCtx();\n      }});\n      document.addEventListener('click', (e) => {{\n        if (!ctx.contains(e.target)) closeCtx();\n      }});\n      window.addEventListener('resize', closeCtx);\n      document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeCtx(); }});\n    }}\n\n    // UI wiring\n    populateSelect();\n    if (DATA.genomes && DATA.genomes.length>0) renderGenome(0);\n    sel.addEventListener('change', ()=> {{ const idx=parseInt(sel.value,10); if(!Number.isNaN(idx)) renderGenome(idx); }});\n    layoutBtn.addEventListener('click', ()=> {{ if (cy) cy.layout({{name:'cose', animate:true}}).run(); }});\n    if (colorModeSelect) colorModeSelect.addEventListener('change', ()=> {{
+      }});\n      cy.on('mousemove','node',(evt)=> moveTip(evt));\n      cy.on('mouseout','node',()=> {{ tip.style.display='none'; }});\n\n      // Persist position/color/note\n      cy.on('free', 'node', saveState);\n      cy.on('lock unlock', 'node', saveState);\n\n      // Apply saved state for this genome\n      applyState();\n\n      applyNodeColorMode(activeColorMode);\n      applyEdgeFilters();\n      updateGenomeStats(g);
+      updateAltruismPanel(g);\n      // Context menu handlers\n      cy.on('cxttapstart', 'node', (evt) => {{\n        ctxNode = evt.target;\n        openCtxAt(evt.renderedPosition);\n      }});\n      cy.on('cxttapstart', (evt) => {{\n        if (evt.target === cy) closeCtx();\n      }});\n      document.addEventListener('click', (e) => {{\n        if (!ctx.contains(e.target)) closeCtx();\n      }});\n      window.addEventListener('resize', closeCtx);\n      document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeCtx(); }});\n    }}\n\n    // UI wiring\n    populateSelect();\n    if (DATA.genomes && DATA.genomes.length>0) renderGenome(0);\n    sel.addEventListener('change', ()=> {{ const idx=parseInt(sel.value,10); if(!Number.isNaN(idx)) renderGenome(idx); }});\n    layoutBtn.addEventListener('click', ()=> {{ if (cy) cy.layout({{name:'cose', animate:true}}).run(); }});\n    if (colorModeSelect) colorModeSelect.addEventListener('change', ()=> {{
       activeColorMode = colorModeSelect.value || 'type';
       applyNodeColorMode(activeColorMode);
     }});\n    if (weightSlider) weightSlider.addEventListener('input', ()=> {{ applyEdgeFilters(); }});\n    if (enabledOnly) enabledOnly.addEventListener('change', ()=> {{ applyEdgeFilters(); }});\n\n    // Context menu building\n    const PALETTE = ['#0072B2','#D55E00','#009E73','#CC79A7','#F0E442','#56B4E9','#E69F00','#000000','#777777','#999999'];\n    const hiddenColorPicker = document.createElement('input'); hiddenColorPicker.type='color'; hiddenColorPicker.style.display='none'; document.body.appendChild(hiddenColorPicker);\n\n    function openCtxAt(renderedPos) {{\n      if (!ctxNode) return;\n      const rect = cyContainer.getBoundingClientRect();\n      const x = rect.left + renderedPos.x;\n      const y = rect.top + renderedPos.y;\n      ctx.innerHTML = '';\n      const menu = document.createElement('div');\n\n      // Title\n      const title = document.createElement('div');\n      title.className='ctx-item';\n      title.style.cursor='default';\n      title.innerHTML = '<b>Node:</b> ' + (ctxNode.data('label') || ctxNode.id());\n      ctx.appendChild(title);\n\n      // Fix/Unfix\n      const fix = document.createElement('div');\n      fix.className='ctx-item';\n      const locked = ctxNode.locked();\n      fix.textContent = locked ? '位置の固定を解除' : '位置を固定';\n      fix.onclick = () => {{\n        if (ctxNode.locked()) ctxNode.unlock(); else ctxNode.lock();\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(fix);\n\n      // Color row\n      const colorRow = document.createElement('div');\n      colorRow.className='ctx-item';\n      colorRow.innerHTML = '<div class="ctx-row"><span>色を変更</span><span style="font-size:12px;color:var(--muted)">クリックで適用</span></div>';\n      const sw = document.createElement('div'); sw.className='swatches';\n      PALETTE.forEach(c => {{\n        const d = document.createElement('div'); d.className='swatch'; d.style.background=c;\n        d.title = c;\n        d.onclick = () => {{ ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx(); }};\n        sw.appendChild(d);\n      }});\n      // Custom picker\n      const custom = document.createElement('div');\n      custom.className='ctx-item';\n      custom.textContent='カスタムカラー…';\n      custom.onclick = () => {{\n        hiddenColorPicker.value = ctxNode.data('color') || '#999999';\n        hiddenColorPicker.onchange = () => {{\n          const c = hiddenColorPicker.value;\n          ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx();\n        }};\n        hiddenColorPicker.click();\n      }};\n      colorRow.appendChild(sw);\n      ctx.appendChild(colorRow);\n      ctx.appendChild(custom);\n\n      // Note editor\n      const noteBtn = document.createElement('div');\n      noteBtn.className='ctx-item';\n      noteBtn.textContent='注釈を追加/編集…';\n      noteBtn.onclick = () => {{\n        const cur = ctxNode.data('note') || '';\n        const txt = window.prompt('ノードの注釈（空で削除）', cur);\n        if (txt === null) return;\n        const orig = ctxNode.data('orig_label') || ctxNode.data('label') || ctxNode.id();\n        if (txt.trim() === '') {{\n          ctxNode.data('note', null);\n          ctxNode.data('label', orig);\n        }} else {{\n          ctxNode.data('note', txt);\n          ctxNode.data('label', orig + '\\n' + txt);\n        }}\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(noteBtn);\n\n      // Reset color\n      const resetColor = document.createElement('div');\n      resetColor.className='ctx-item';\n      resetColor.textContent='色をリセット';\n      resetColor.onclick = () => {{\n        ctxNode.data('color', null);\n        // Revert to type-based color by removing inline style\n        ctxNode.removeStyle('background-color');\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(resetColor);\n\n      // Separator\n      const sep = document.createElement('div'); sep.className='ctx-sep'; ctx.appendChild(sep);\n\n      // Save layout now\n      const saveBtn = document.createElement('div');\n      saveBtn.className='ctx-item';\n      saveBtn.textContent='レイアウトを保存';\n      saveBtn.onclick = () => {{ saveState(); closeCtx(); }};\n      ctx.appendChild(saveBtn);\n\n      // Open\n      ctx.style.left = Math.round(x) + 'px';\n      ctx.style.top  = Math.round(y) + 'px';\n      ctx.style.display = 'block';\n    }}\n\n    function closeCtx() {{ ctx.style.display='none'; ctxNode = null; }}\n\n  </script>\n</body>\n</html>"""
@@ -8888,6 +9121,12 @@ class NomologyEnv:
                     pass
         self._noise_counter = 0.0
         self._refresh_noise(surge=True)
+        self.last_advantage_score = 0.0
+        self.last_altruism_signal = 0.5
+        self.last_selfish_drive = 0.0
+        self.last_env_shift = 0.0
+        self.last_leader_id = None
+        self.last_advantage_penalty = False
 
     def noise_style(self, kind: Optional[str]=None) -> Dict[str, Any]:
         target = kind or self.noise_kind
@@ -9281,6 +9520,19 @@ class SelfReproducingEvaluator:
         env.lazy_anchor = float(anchor)
         env.lazy_gap = float(gap)
         env.lazy_stasis = float(stasis)
+        env_shift = (
+            abs(env.noise - prev_noise) * 4.0
+            + abs(env.turns - prev_turns)
+            + 0.5 * abs(rot_blend - prev_rot)
+        )
+        selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - share))
+        advantage_score = float(np.clip(selfish_drive * (max(0.0, gap) + 0.35 * scarcity) * (0.5 + env_shift), 0.0, 3.0))
+        altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0))
+        self.last_advantage_score = advantage_score
+        self.last_leader_id = leader.id
+        self.last_altruism_signal = altruism_signal
+        self.last_selfish_drive = selfish_drive
+        self.last_env_shift = env_shift
         try:
             summary = self._mutate_child(leader, bundle, feats, out, generation)
         except Exception as mutate_err:
@@ -9310,12 +9562,17 @@ class SelfReproducingEvaluator:
             summary = f'{summary} | stasis {stasis:.2f}'
         if abs(gap) > 0.01:
             summary = f'{summary} | gap {gap:+.2f}'
+        if advantage_score > 0.05:
+            summary = f'{summary} | adv {advantage_score:.2f}'
         self.last_event = summary
         return {
             'genome_id': leader.id,
             'note': summary,
             'resilience': resilience_flag,
             'latency_ms': latency_ms,
+            'advantage': advantage_score,
+            'selfish_drive': selfish_drive,
+            'altruism_signal': altruism_signal,
         }
 
     @property
@@ -9536,6 +9793,7 @@ class SpinorNomologyDatasetController:
         self.lazy_feedback_smoothing = 0.4
         self._lazy_feedback: Dict[str, Any] = {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0}
         self._diversity_state: Dict[str, Any] = {'generation': -1}
+        self.last_evaluator_meta: Optional[Dict[str, Any]] = None
         try:
             self.env.lazy_share = 0.0
             self.env.lazy_anchor = 0.0
@@ -9675,6 +9933,7 @@ class SpinorNomologyDatasetController:
                 group_energy=group_energy,
                 evaluator_meta=evaluator_meta,
             )
+        self.last_evaluator_meta = evaluator_meta
     on_regime_switch = lambda self, gen: self.telemetry and self.telemetry.log_regime(gen, self.env)
 
 class SpinorNomologyFitness(neat.FitnessBackpropShared):
