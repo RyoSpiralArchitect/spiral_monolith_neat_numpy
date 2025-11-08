@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
+from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any, Sequence
 from collections import deque, defaultdict, OrderedDict
 import math, argparse, os, mimetypes, csv
 import sys
@@ -2383,6 +2383,11 @@ class ReproPlanaNEATPlus:
             'spread': 0.0,
         }
         self._lazy_fraction_carry = 0.0
+        self.raw_best_history: List[Tuple[float, float]] = []
+        self.context_best_history: List[Tuple[float, float]] = []
+        self._lazy_env_feedback: Dict[str, Any] = {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0}
+        self.spinor_controller: Optional[Any] = None
+        self._best_context_value = -1000000000.0
 
     def _heterosis_scale(self, mother: Genome, father: Genome) -> float:
         d = self._compat_distance(mother, father)
@@ -2399,6 +2404,68 @@ class ReproPlanaNEATPlus:
         notes.append((gen, summary))
         if len(notes) > 6:
             self.lineage_annotations[gid] = notes[-6:]
+
+    def _update_lazy_feedback(self, generation: int, fitnesses: Sequence[float], best_idx: int, best_fit: float, avg_fit: float) -> None:
+        total = len(self.population)
+        if total <= 0:
+            return
+        lazy_indices = [i for i, g in enumerate(self.population) if getattr(g, 'lazy_lineage', False)]
+        share = float(len(lazy_indices)) / float(total)
+        lazy_scores = [float(fitnesses[i]) for i in lazy_indices] if lazy_indices else []
+        if lazy_scores:
+            lazy_avg = float(np.mean(lazy_scores))
+            lazy_best = float(np.max(lazy_scores))
+            spread = float(np.std(lazy_scores))
+        else:
+            lazy_avg = float(avg_fit)
+            lazy_best = float(best_fit)
+            spread = 0.0
+        scale = max(1.0, abs(best_fit) + abs(avg_fit) + abs(lazy_avg))
+        anchor = float(np.clip(lazy_avg / scale, -1.0, 1.0))
+        gap = float(np.clip((best_fit - lazy_avg) / scale, -1.0, 1.0))
+        stasis = float(np.clip(1.0 - min(1.0, spread / scale), 0.0, 1.0))
+        payload = {
+            'generation': int(generation),
+            'share': float(np.clip(share, 0.0, 1.0)),
+            'anchor': anchor,
+            'gap': gap,
+            'stasis': stasis,
+            'lazy_avg': float(lazy_avg),
+            'lazy_best': float(lazy_best),
+            'spread': float(spread),
+            'raw_best': float(best_fit),
+            'raw_avg': float(avg_fit),
+            'count': int(len(lazy_indices)),
+            'population': int(total),
+        }
+        self._lazy_env_feedback = payload
+        controller = getattr(self, 'spinor_controller', None)
+        if controller is not None and hasattr(controller, 'set_lazy_feedback'):
+            try:
+                controller.set_lazy_feedback(generation, payload)
+            except Exception:
+                pass
+
+    def _contextual_best_axis(self, best_fit: float, avg_fit: float) -> float:
+        env = getattr(self, 'env', {})
+        if isinstance(env, dict):
+            diff = float(env.get('difficulty', 0.0))
+            noise = float(env.get('noise_std', 0.0))
+        else:
+            diff = 0.0
+            noise = 0.0
+        lazy = getattr(self, '_lazy_env_feedback', {}) or {}
+        share = float(np.clip(lazy.get('share', 0.0), 0.0, 1.0))
+        stasis = float(np.clip(lazy.get('stasis', 0.0), 0.0, 1.0))
+        gap = float(np.clip(lazy.get('gap', 0.0), -1.0, 1.0))
+        anchor = float(np.clip(lazy.get('anchor', 0.0), -1.0, 1.0))
+        momentum = float(np.clip(lazy.get('spread', 0.0), 0.0, 5.0))
+        difficulty_penalty = 0.07 * diff + 0.04 * noise
+        cohesion_bonus = 0.05 * share * stasis
+        anchor_bonus = 0.02 * anchor
+        gap_penalty = 0.03 * abs(gap)
+        variance_penalty = 0.01 * momentum
+        return float(best_fit - difficulty_penalty - gap_penalty - variance_penalty + cohesion_bonus + anchor_bonus)
 
     def _compat_distance(self, g1: Genome, g2: Genome) -> float:
         try:
@@ -3369,6 +3436,11 @@ class ReproPlanaNEATPlus:
                 best_idx = int(np.argmax(fitnesses))
                 best_fit = float(fitnesses[best_idx])
                 avg_fit = float(np.mean(fitnesses))
+                self.raw_best_history.append((best_fit, avg_fit))
+                self._update_lazy_feedback(gen, fitnesses, best_idx, best_fit, avg_fit)
+                context_best = self._contextual_best_axis(best_fit, avg_fit)
+                history.append((context_best, avg_fit))
+                self.context_best_history.append((context_best, avg_fit))
 
                 def genome_complexity(g):
                     n_hidden = sum((1 for n in g.nodes.values() if n.type == 'hidden'))
@@ -3411,7 +3483,6 @@ class ReproPlanaNEATPlus:
                     prev_best = curr_best
                 except Exception:
                     pass
-                history.append((best_fit, avg_fit))
                 self.best_ids.append(self.population[best_idx].id)
                 try:
                     self.hidden_counts_history.append([sum((1 for n in g.nodes.values() if n.type == 'hidden')) for g in self.population])
@@ -3428,9 +3499,9 @@ class ReproPlanaNEATPlus:
                     if len(top3_best) >= 3:
                         complexities = [(sum((1 for n in g.nodes.values() if n.type == 'hidden')), sum((1 for c in g.connections.values() if c.enabled))) for g, _, _ in top3_best]
                         top3_str = f' | top3: [{complexities[0][0]}n,{complexities[0][1]}e] [{complexities[1][0]}n,{complexities[1][1]}e] [{complexities[2][0]}n,{complexities[2][1]}e]'
-                    print(f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}")
-                if best_fit > best_ever_fit:
-                    best_ever_fit = best_fit
+                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}")
+                if context_best > best_ever_fit:
+                    best_ever_fit = context_best
                     best_ever = self.population[best_idx].copy()
                 if target_fitness is not None and best_fit >= target_fitness:
                     self._resilience_eval_guard = 0
@@ -3438,7 +3509,7 @@ class ReproPlanaNEATPlus:
                     break
                 species = self.speciate(fitnesses)
                 try:
-                    self._learn_species_target(len(species), best_fit, gen)
+                    self._learn_species_target(len(species), context_best, gen)
                 except Exception as _spe:
                     print('[WARN] species target learning skipped:', _spe)
                 self._adapt_compat_threshold(len(species))
@@ -3476,6 +3547,7 @@ class ReproPlanaNEATPlus:
             self._close_pool()
         except Exception:
             pass
+        self._best_context_value = float(best_ever_fit)
         return (best_ever, history)
 
 def act_forward(name, x):
@@ -6502,6 +6574,7 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     out_dim = 2
     neat_inst = neat.ReproPlanaNEATPlus(num_inputs=controller.feature_dim, num_outputs=out_dim, population_size=pop, output_activation='identity', rng=rng)
     neat._apply_stable_neat_defaults(neat_inst)
+    neat_inst.spinor_controller = controller
     neat_inst.max_hidden_nodes = max(getattr(neat_inst, 'max_hidden_nodes', 128), 192)
     neat_inst.max_edges = max(getattr(neat_inst, 'max_edges', 1024), 2048)
     fit = SpinorNomologyFitness(controller=controller, get_generation=lambda: neat_inst.generation, steps=40, lr=0.005, l2=0.0001, alpha_nodes=0.001, alpha_edges=0.0005)
@@ -6926,6 +6999,10 @@ class NomologyEnv:
     noise: float = 0.06
     turns: float = 1.6
     rot_bias: float = 0.0
+    lazy_share: float = 0.0
+    lazy_anchor: float = 0.0
+    lazy_gap: float = 0.0
+    lazy_stasis: float = 0.0
     regime_id: int = 0
     noise_kind: str = 'white'
     noise_profile: Dict[str, Any] = field(
@@ -7085,6 +7162,13 @@ class SelfReproducingEvaluator:
     _leader_cache_rev: Tuple[int, int] = field(default=(-1, -1), init=False, repr=False)
     _leader_compiled: Optional[Dict[str, Any]] = field(default=None, init=False, repr=False)
     _resilience_notes: deque = field(default_factory=lambda: deque(maxlen=16), init=False, repr=False)
+    lazy_feedback_smoothing: float = 0.35
+    lazy_feedback_decay: float = 0.25
+    _lazy_feedback: Dict[str, Any] = field(
+        default_factory=lambda: {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0},
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._rng = self.rng if self.rng is not None else np.random.default_rng()
@@ -7193,6 +7277,29 @@ class SelfReproducingEvaluator:
         self._leader_cache_rev = rev
         return compiled
 
+    def update_lazy_feedback(self, feedback: Dict[str, Any]) -> None:
+        if not isinstance(feedback, dict):
+            return
+        payload = dict(feedback)
+        prev = getattr(self, '_lazy_feedback', {})
+        if not isinstance(prev, dict):
+            prev = {}
+        alpha = float(np.clip(self.lazy_feedback_smoothing, 0.0, 0.95))
+        if prev:
+            blended: Dict[str, Any] = {}
+            for key, val in payload.items():
+                if isinstance(val, (int, float)):
+                    old = prev.get(key, val)
+                    if isinstance(old, (int, float)):
+                        blended[key] = float(old) * alpha + float(val) * (1.0 - alpha)
+                    else:
+                        blended[key] = float(val)
+                else:
+                    blended[key] = val
+            payload.update(blended)
+        payload.setdefault('generation', prev.get('generation', payload.get('generation', -1)))
+        self._lazy_feedback = payload
+
     def _record_resilience(self, err: BaseException, generation: int) -> str:
         label = f'{type(err).__name__}@{generation}'
         self.last_resilience = label
@@ -7225,10 +7332,43 @@ class SelfReproducingEvaluator:
             resilience_flag = self._record_resilience(err, generation)
             out = np.zeros(3, dtype=np.float32)
         latency_ms = (time.perf_counter() - start) * 1000.0
+        lazy = getattr(self, '_lazy_feedback', {}) or {}
+        share = float(np.clip(lazy.get('share', 0.0), 0.0, 1.0))
+        stasis = float(np.clip(lazy.get('stasis', 0.0), 0.0, 1.0))
+        anchor = float(np.clip(lazy.get('anchor', 0.0), -1.0, 1.0))
+        gap = float(np.clip(lazy.get('gap', 0.0), -1.0, 1.0))
+        lazy_gen = int(lazy.get('generation', generation)) if isinstance(lazy, dict) else generation
+        age = max(0, int(generation) - lazy_gen)
+        decay = math.exp(-float(np.clip(self.lazy_feedback_decay, 0.05, 1.0)) * age)
+        share *= decay
+        stasis *= decay
+        anchor *= decay
+        gap *= decay
+        prev_noise = float(getattr(env, 'noise', 0.05))
+        prev_turns = float(getattr(env, 'turns', 1.6))
+        prev_rot = float(getattr(env, 'rot_bias', 0.0))
         scale_noise, scale_turns, scale_rot = self.output_scale
-        env.noise = float(np.clip(0.05 + scale_noise * float(out[0]), 0.0, 0.25))
-        env.turns = float(np.clip(1.6 + scale_turns * float(out[1]), 0.6, 3.2))
-        env.rot_bias = float(((env.rot_bias + scale_rot * float(out[2])) + math.pi) % (2.0 * math.pi) - math.pi)
+        mod_out0 = float(out[0] * (1.0 - 0.35 * share) + anchor * 0.35)
+        mod_out1 = float(out[1] * (1.0 - 0.3 * share) + (anchor + gap * 0.5) * 0.3)
+        mod_out2 = float(out[2] * (1.0 - 0.3 * share) + gap * 0.6)
+        target_noise = float(np.clip(0.05 + scale_noise * mod_out0, 0.0, 0.25))
+        target_turns = float(np.clip(1.6 + scale_turns * mod_out1, 0.6, 3.2))
+        rot_target = prev_rot + scale_rot * mod_out2
+        anchor_noise = float(np.clip(0.05 + scale_noise * anchor, 0.0, 0.25))
+        anchor_turns = float(np.clip(1.6 + scale_turns * (anchor + gap * 0.25), 0.6, 3.2))
+        rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6)
+        inertia = float(np.clip(0.25 + 0.5 * share + 0.25 * stasis, 0.0, 0.9))
+        slip = max(0.0, 1.0 - inertia)
+        anchor_mix = slip * 0.5 * stasis
+        leader_mix = slip - anchor_mix
+        env.noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
+        env.turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
+        rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
+        env.rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+        env.lazy_share = float(share)
+        env.lazy_anchor = float(anchor)
+        env.lazy_gap = float(gap)
+        env.lazy_stasis = float(stasis)
         try:
             summary = self._mutate_child(leader, bundle, feats, out, generation)
         except Exception as mutate_err:
@@ -7248,6 +7388,12 @@ class SelfReproducingEvaluator:
             summary = f'{summary} | weave {str(weave_err).split(':', 1)[0]}'
         if resilience_flag:
             summary = f'{summary} | resilience {resilience_flag}'
+        if share > 0.0:
+            summary = f'{summary} | lazy {share:.2f}'
+        if stasis > 0.0:
+            summary = f'{summary} | stasis {stasis:.2f}'
+        if abs(gap) > 0.01:
+            summary = f'{summary} | gap {gap:+.2f}'
         self.last_event = summary
         return {
             'genome_id': leader.id,
@@ -7267,7 +7413,7 @@ class Telemetry:
     def __init__(self, tel_csv: str, regime_csv: str) -> None:
         self.tel_csv = tel_csv
         self.reg_csv = regime_csv
-        expected_cols = 22
+        expected_cols = 26
         if os.path.exists(self.tel_csv):
             try:
                 with open(self.tel_csv, 'r', newline='') as f:
@@ -7304,6 +7450,10 @@ class Telemetry:
                     'group_idx',
                     'group_label',
                     'group_energy',
+                    'lazy_share',
+                    'lazy_anchor',
+                    'lazy_gap',
+                    'lazy_stasis',
                     'evaluator_id',
                     'evaluator_note',
                 ])
@@ -7343,6 +7493,10 @@ class Telemetry:
             harm_payload = _json.dumps({k: float(v) for k, v in harmonics.items()})
         else:
             harm_payload = '{}'
+        lazy_share = float(getattr(env, 'lazy_share', 0.0))
+        lazy_anchor = float(getattr(env, 'lazy_anchor', 0.0))
+        lazy_gap = float(getattr(env, 'lazy_gap', 0.0))
+        lazy_stasis = float(getattr(env, 'lazy_stasis', 0.0))
         with open(self.tel_csv, 'a', newline='') as f:
             csv.writer(f).writerow([
                 gen,
@@ -7365,6 +7519,10 @@ class Telemetry:
                 '' if group_idx is None else int(group_idx),
                 group_label or '',
                 float(group_energy),
+                lazy_share,
+                lazy_anchor,
+                lazy_gap,
+                lazy_stasis,
                 eval_id,
                 eval_note,
             ])
@@ -7397,6 +7555,15 @@ class SpinorNomologyDatasetController:
         self.feature_dim = 5 + embed_dim
         self.evaluator_feature_dim = 8 + embed_dim
         self.last_bundle: Optional[Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]] = None
+        self.lazy_feedback_smoothing = 0.4
+        self._lazy_feedback: Dict[str, Any] = {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0}
+        try:
+            self.env.lazy_share = 0.0
+            self.env.lazy_anchor = 0.0
+            self.env.lazy_gap = 0.0
+            self.env.lazy_stasis = 0.0
+        except Exception:
+            pass
         if self.evaluator is None and self.evaluator_feature_dim > 0:
             eval_rng = np.random.default_rng(int(self.rng.integers(1 << 30)))
             self.evaluator = SelfReproducingEvaluator(self.evaluator_feature_dim, self.spin, self.env, rng=eval_rng)
@@ -7427,6 +7594,39 @@ class SpinorNomologyDatasetController:
         X_aug, _ = augment_with_spinor(X, theta, parity=parity, group_embed=group_embed)
         return (X_aug.astype(np.float32), y.astype(np.int64))
 
+    def set_lazy_feedback(self, generation: int, feedback: Dict[str, Any]) -> None:
+        if feedback is None:
+            return
+        payload = dict(feedback)
+        payload['generation'] = int(generation)
+        prev = getattr(self, '_lazy_feedback', None)
+        if isinstance(prev, dict) and prev:
+            mix = {}
+            alpha = float(np.clip(self.lazy_feedback_smoothing, 0.0, 0.95))
+            for key, val in payload.items():
+                if isinstance(val, (int, float)):
+                    old = prev.get(key, val)
+                    if isinstance(old, (int, float)):
+                        mix[key] = float(old) * alpha + float(val) * (1.0 - alpha)
+                    else:
+                        mix[key] = float(val)
+                else:
+                    mix[key] = val
+            payload.update(mix)
+        self._lazy_feedback = payload
+        try:
+            self.env.lazy_share = float(payload.get('share', 0.0))
+            self.env.lazy_anchor = float(payload.get('anchor', 0.0))
+            self.env.lazy_gap = float(payload.get('gap', 0.0))
+            self.env.lazy_stasis = float(payload.get('stasis', 0.0))
+        except Exception:
+            pass
+        if self.evaluator is not None:
+            try:
+                self.evaluator.update_lazy_feedback(payload)
+            except Exception:
+                pass
+
     def update_for_generation(self, gen: int, shmem=False) -> None:
         if self.last_gen == gen:
             return
@@ -7438,6 +7638,10 @@ class SpinorNomologyDatasetController:
             self.on_regime_switch(gen)
         evaluator_meta = None
         if self.evaluator is not None:
+            try:
+                self.evaluator.update_lazy_feedback(getattr(self, '_lazy_feedback', {}))
+            except Exception:
+                pass
             evaluator_meta = self.evaluator.step(bundle, self.env, generation=gen)
         self.env.drift()
         Xtr, ytr = self._dataset_core(self.n_tr, theta, parity, group_idx, group_embed, group_matrix)
