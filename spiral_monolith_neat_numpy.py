@@ -7087,6 +7087,192 @@ class SelfReproducingEvaluator:
             self._population.append(self._seed_genome())
         return self._population[0]
 
+@dataclass
+class SelfReproducingEvaluator:
+    feature_dim: int
+    spin: SpinorScheduler
+    base_env: NomologyEnv
+    population_size: int = 4
+    rng: Optional[np.random.Generator] = None
+    mutate_weights_prob: float = 0.65
+    mutate_connection_prob: float = 0.35
+    mutate_node_prob: float = 0.2
+    output_scale: Tuple[float, float, float] = (0.08, 1.0, math.pi / 4.0)
+    _population: List[Genome] = field(default_factory=list, init=False, repr=False)
+    _rng: np.random.Generator = field(init=False, repr=False)
+    _innov: InnovationTracker = field(init=False, repr=False)
+    _next_gid: int = field(init=False, repr=False)
+    last_event: Optional[str] = field(default=None, init=False)
+    last_resilience: Optional[str] = field(default=None, init=False)
+    _leader_cache_id: Optional[int] = field(default=None, init=False, repr=False)
+    _leader_cache_rev: Tuple[int, int] = field(default=(-1, -1), init=False, repr=False)
+    _leader_compiled: Optional[Dict[str, Any]] = field(default=None, init=False, repr=False)
+    _resilience_notes: deque = field(default_factory=lambda: deque(maxlen=16), init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._rng = self.rng if self.rng is not None else np.random.default_rng()
+        bias = self.feature_dim + 1
+        outputs = 3
+        self._innov = InnovationTracker(next_node_id=bias + outputs)
+        self._next_gid = int(self._rng.integers(1 << 30))
+        if not self._population:
+            for _ in range(self.population_size):
+                self._population.append(self._seed_genome())
+
+    def _seed_genome(self) -> Genome:
+        nodes: Dict[int, NodeGene] = {}
+        for i in range(self.feature_dim):
+            nodes[i] = NodeGene(i, 'input', 'identity')
+        bias_id = self.feature_dim
+        nodes[bias_id] = NodeGene(bias_id, 'bias', 'identity')
+        out_ids = []
+        for j in range(3):
+            nid = self.feature_dim + 1 + j
+            nodes[nid] = NodeGene(nid, 'output', 'tanh')
+            out_ids.append(nid)
+        conns: Dict[int, ConnectionGene] = {}
+        for src in range(self.feature_dim + 1):
+            for dst in out_ids:
+                inn = self._innov.get_conn_innovation(src, dst)
+                weight = float(self._rng.normal(0.0, 0.5))
+                conns[inn] = ConnectionGene(src, dst, weight, True, inn)
+        gid = self._next_gid
+        self._next_gid += 1
+        g = Genome(nodes, conns, gid=gid, birth_gen=0, parents=(None, None), cooperative=True)
+        g.meta_reflect('init_env_genome', {'role': 'environment'})
+        return g
+
+    def _feature_vector(
+        self,
+        bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
+        env: NomologyEnv,
+        generation: int,
+    ) -> np.ndarray:
+        theta, parity, _, _, embed, energy = bundle
+        gen_norm = float((generation % max(1, self.spin.period_gens)) / max(1, self.spin.period_gens))
+        noise_norm = float(np.clip(env.noise / 0.2, 0.0, 1.0))
+        turns_norm = float(np.clip((env.turns - 0.6) / (3.2 - 0.6 + 1e-09), 0.0, 1.0))
+        rot_norm = float((env.rot_bias + math.pi) / (2.0 * math.pi))
+        base = [
+            math.cos(theta),
+            math.sin(theta),
+            float(parity),
+            gen_norm,
+            noise_norm,
+            turns_norm,
+            rot_norm,
+            float(energy / 4.0),
+        ]
+        if embed is not None:
+            base.extend(embed.tolist())
+        vec = np.asarray(base, dtype=np.float32)
+        if vec.size < self.feature_dim:
+            vec = np.pad(vec, (0, self.feature_dim - vec.size))
+        elif vec.size > self.feature_dim:
+            vec = vec[:self.feature_dim]
+        return vec.astype(np.float32)
+
+    def _mutate_child(self, parent: Genome, bundle, features: np.ndarray, outputs: np.ndarray, generation: int) -> str:
+        child = parent.copy()
+        changed = False
+        if self._rng.random() < self.mutate_weights_prob:
+            child.mutate_weights(self._rng)
+            changed = True
+        if self._rng.random() < self.mutate_connection_prob:
+            changed = child.mutate_add_connection(self._rng, self._innov) or changed
+        if self._rng.random() < self.mutate_node_prob:
+            changed = child.mutate_add_node(self._rng, self._innov) or changed
+        if not changed:
+            return 'steady-state'
+        child.parents = (parent.id, None)
+        child.id = self._next_gid
+        self._next_gid += 1
+        child.birth_gen = generation + 1
+        child.meta_reflect(
+            'env_self_reproduce',
+            {
+                'features': features.tolist(),
+                'outputs': outputs.tolist(),
+                'generation': generation,
+                'parent': parent.id,
+            },
+        )
+        self._population.insert(0, child)
+        if len(self._population) > self.population_size:
+            self._population.pop()
+        return f'spawned {child.id} ← {parent.id}'
+
+    def _compiled_leader(self, leader: Genome):
+        rev = (getattr(leader, '_structure_rev', -1), getattr(leader, '_weights_rev', -1))
+        if (
+            self._leader_compiled is not None
+            and self._leader_cache_id == leader.id
+            and self._leader_cache_rev == rev
+        ):
+            return self._leader_compiled
+        compiled = compile_genome(leader)
+        self._leader_compiled = compiled
+        self._leader_cache_id = leader.id
+        self._leader_cache_rev = rev
+        return compiled
+
+    def _record_resilience(self, err: BaseException, generation: int) -> str:
+        label = f'{type(err).__name__}@{generation}'
+        self.last_resilience = label
+        try:
+            self._resilience_notes.append(label)
+        except Exception:
+            pass
+        return label
+
+    def resilience_history(self) -> List[str]:
+        return list(self._resilience_notes)
+
+    def step(
+        self,
+        bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
+        env: NomologyEnv,
+        generation: int,
+    ) -> Dict[str, Any]:
+        if not self._population:
+            self._population.append(self._seed_genome())
+        leader = self._population[0]
+        feats = self._feature_vector(bundle, env, generation)
+        resilience_flag = ''
+        start = time.perf_counter()
+        try:
+            compiled = self._compiled_leader(leader)
+            out = forward_batch(compiled, feats.reshape(1, -1))[0]
+            out = np.asarray(out, dtype=np.float32)
+        except Exception as err:
+            resilience_flag = self._record_resilience(err, generation)
+            out = np.zeros(3, dtype=np.float32)
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        scale_noise, scale_turns, scale_rot = self.output_scale
+        env.noise = float(np.clip(0.05 + scale_noise * float(out[0]), 0.0, 0.25))
+        env.turns = float(np.clip(1.6 + scale_turns * float(out[1]), 0.6, 3.2))
+        env.rot_bias = float(((env.rot_bias + scale_rot * float(out[2])) + math.pi) % (2.0 * math.pi) - math.pi)
+        try:
+            summary = self._mutate_child(leader, bundle, feats, out, generation)
+        except Exception as mutate_err:
+            resilience_flag = resilience_flag or self._record_resilience(mutate_err, generation)
+            summary = f'mutate-failed {type(mutate_err).__name__}'
+        if resilience_flag:
+            summary = f'{summary} | resilience {resilience_flag}'
+        self.last_event = summary
+        return {
+            'genome_id': leader.id,
+            'note': summary,
+            'resilience': resilience_flag,
+            'latency_ms': latency_ms,
+        }
+
+    @property
+    def leader(self) -> Genome:
+        if not self._population:
+            self._population.append(self._seed_genome())
+        return self._population[0]
+
 class Telemetry:
 
     def __init__(self, tel_csv: str, regime_csv: str) -> None:
