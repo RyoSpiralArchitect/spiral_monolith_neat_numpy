@@ -292,6 +292,7 @@ class Genome:
         self.max_edges: Optional[int] = None
         self.mutation_will = float(mutation_will) if mutation_will is not None else float(np.random.uniform(0.0, 1.0))
         self.cooperative = bool(cooperative)
+        self._compat_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
     def copy(self):
         nodes = {nid: NodeGene(n.id, n.type, n.activation) for nid, n in self.nodes.items()}
@@ -300,7 +301,24 @@ class Genome:
         g.origin_mode = getattr(self, 'origin_mode', 'initial')
         g.max_hidden_nodes = self.max_hidden_nodes
         g.max_edges = self.max_edges
+        g._compat_cache = None
         return g
+
+    def _invalidate_cache(self):
+        self._compat_cache = None
+
+    def _compat_signature(self) -> Tuple[np.ndarray, np.ndarray]:
+        cache = getattr(self, '_compat_cache', None)
+        if cache is not None:
+            return cache
+        if not self.connections:
+            cache = (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64))
+        else:
+            innovs = np.fromiter(sorted(self.connections.keys()), dtype=np.int64, count=len(self.connections))
+            weights = np.asarray([self.connections[int(inn)].weight for inn in innovs], dtype=np.float64)
+            cache = (innovs, weights)
+        self._compat_cache = cache
+        return cache
 
     def enabled_connections(self):
         return [c for c in self.connections.values() if c.enabled]
@@ -406,6 +424,8 @@ class Genome:
                     c.enabled = False
                     disabled_any = True
                     break
+        if disabled_any:
+            self._invalidate_cache()
         return disabled_any
 
     def node_depths(self):
@@ -436,15 +456,21 @@ class Genome:
                 c.weight += float(rng.normal(0, sigma))
             else:
                 c.weight = float(rng.uniform(-reset_range, reset_range))
+        self._invalidate_cache()
 
     def mutate_toggle_enable(self, rng: np.random.Generator, prob=0.01):
+        changed = False
         for c in self.connections.values():
             if rng.random() >= prob:
                 continue
             if c.enabled:
                 c.enabled = False
+                changed = True
             elif not self._creates_cycle(c.in_node, c.out_node):
                 c.enabled = True
+                changed = True
+        if changed:
+            self._invalidate_cache()
 
     def _choose_conn_for_node_add(self, rng: np.random.Generator, bias: str):
         enabled = [c for c in self.connections.values() if c.enabled]
@@ -491,6 +517,7 @@ class Genome:
             w = float(rng.uniform(-2.0, 2.0))
             inn = innov.get_conn_innovation(in_id, out_id)
             self.connections[inn] = ConnectionGene(in_id, out_id, w, True, inn)
+            self._invalidate_cache()
             return True
         return False
 
@@ -512,6 +539,7 @@ class Genome:
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
         self.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
         self.connections[inn2] = ConnectionGene(new_nid, c.out_node, c.weight, True, inn2)
+        self._invalidate_cache()
         return True
 
     def mutate_sex(self, rng: np.random.Generator):
@@ -897,36 +925,53 @@ def export_lcs_timeline_gif(lcs_rows: List[Dict[str, Any]], path: str, series: O
     return path
 
 def compatibility_distance(g1: Genome, g2: Genome, c1=1.0, c2=1.0, c3=0.4):
-    innovs1 = sorted(g1.connections.keys())
-    innovs2 = sorted(g2.connections.keys())
-    i = j = 0
-    E = D = 0
-    W_diffs = []
-    max_innov1 = innovs1[-1] if innovs1 else -1
-    max_innov2 = innovs2[-1] if innovs2 else -1
-    while i < len(innovs1) and j < len(innovs2):
-        in1 = innovs1[i]
-        in2 = innovs2[j]
-        if in1 == in2:
-            W_diffs.append(abs(g1.connections[in1].weight - g2.connections[in2].weight))
-            i += 1
-            j += 1
-        elif in1 < in2:
-            if in1 > max_innov2:
-                E += 1
-            else:
-                D += 1
-            i += 1
-        else:
-            if in2 > max_innov1:
-                E += 1
-            else:
-                D += 1
-            j += 1
-    E += len(innovs1) - i + (len(innovs2) - j)
-    N = max(len(innovs1), len(innovs2))
-    N = 1 if N < 20 else N
-    W = sum(W_diffs) / len(W_diffs) if W_diffs else 0.0
+    innovs1, weights1 = g1._compat_signature()
+    innovs2, weights2 = g2._compat_signature()
+    len1 = innovs1.size
+    len2 = innovs2.size
+    if len1 == 0 and len2 == 0:
+        return 0.0
+    max_innov1 = int(innovs1[-1]) if len1 else -1
+    max_innov2 = int(innovs2[-1]) if len2 else -1
+    if len1 and len2:
+        common, idx1, idx2 = np.intersect1d(innovs1, innovs2, assume_unique=True, return_indices=True)
+    else:
+        common = np.empty(0, dtype=np.int64)
+        idx1 = np.empty(0, dtype=np.int64)
+        idx2 = np.empty(0, dtype=np.int64)
+    if common.size:
+        W = float(np.mean(np.abs(weights1[idx1] - weights2[idx2])))
+    else:
+        W = 0.0
+    if len1:
+        mask1 = np.ones(len1, dtype=bool)
+        mask1[idx1] = False
+        rem1 = innovs1[mask1]
+    else:
+        rem1 = np.empty(0, dtype=np.int64)
+    if len2:
+        mask2 = np.ones(len2, dtype=bool)
+        mask2[idx2] = False
+        rem2 = innovs2[mask2]
+    else:
+        rem2 = np.empty(0, dtype=np.int64)
+    if len2:
+        excess1 = int(np.count_nonzero(rem1 > max_innov2))
+        disjoint1 = int(rem1.size - excess1)
+    else:
+        excess1 = int(rem1.size)
+        disjoint1 = 0
+    if len1:
+        excess2 = int(np.count_nonzero(rem2 > max_innov1))
+        disjoint2 = int(rem2.size - excess2)
+    else:
+        excess2 = int(rem2.size)
+        disjoint2 = 0
+    E = excess1 + excess2
+    D = disjoint1 + disjoint2
+    N = max(len1, len2)
+    if N < 20:
+        N = 1
     return c1 * E / N + c2 * D / N + c3 * W
 
 def _regenerate_head(g: Genome, rng: np.random.Generator, innov: InnovationTracker, intensity=0.5):
@@ -1060,6 +1105,8 @@ def _connectivity_guard(g, innov, rng, min_frac=0.6, max_new_edges=16, eps=0.0):
                         q.append(v)
             unreachable = [o for o in outputs if o not in seen]
         attempts += 1
+    if hasattr(g, '_invalidate_cache'):
+        g._invalidate_cache()
 
 def _soft_regenerate_head(g, rng, innov, intensity=0.5):
     inputs = [nid for nid, n in g.nodes.items() if n.type in ('input', 'bias')]
@@ -1089,6 +1136,8 @@ def _soft_regenerate_head(g, rng, innov, intensity=0.5):
         inn2 = innov.get_conn_innovation(new_id, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_id, 1.0, True, inn1)
         g.connections[inn2] = ConnectionGene(new_id, c.out_node, c.weight, True, inn2)
+    if hasattr(g, '_invalidate_cache'):
+        g._invalidate_cache()
     return g
 
 def _soft_regenerate_tail(g, rng, innov, intensity=0.5):
@@ -1107,6 +1156,8 @@ def _soft_regenerate_tail(g, rng, innov, intensity=0.5):
             if not g.has_connection(new_src, c.out_node) and (not g._creates_cycle(new_src, c.out_node)):
                 inn = innov.get_conn_innovation(new_src, c.out_node)
                 g.connections[inn] = ConnectionGene(new_src, c.out_node, float(rng_local.uniform(-1.6, 1.6)), True, inn)
+    if hasattr(g, '_invalidate_cache'):
+        g._invalidate_cache()
     return g
 
 def _soft_regenerate_split(g, rng, innov, intensity=0.5):
@@ -1125,6 +1176,8 @@ def _soft_regenerate_split(g, rng, innov, intensity=0.5):
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
         g.connections[inn2] = ConnectionGene(new_nid, c.out_node, c.weight, True, inn2)
+        if hasattr(g, '_invalidate_cache'):
+            g._invalidate_cache()
         return g
     target = int(rng_local.choice(hidden))
     dup_id = innov.new_node_id()
@@ -1145,6 +1198,8 @@ def _soft_regenerate_split(g, rng, innov, intensity=0.5):
         if not g.has_connection(target, pick.out_node) and (not g._creates_cycle(target, pick.out_node)):
             inn = innov.get_conn_innovation(target, pick.out_node)
             g.connections[inn] = ConnectionGene(target, pick.out_node, pick.weight, True, inn)
+    if hasattr(g, '_invalidate_cache'):
+        g._invalidate_cache()
     return g
 
 def platyregenerate(genome: Genome, rng: np.random.Generator, innov: InnovationTracker, intensity=0.5) -> Genome:
@@ -1164,6 +1219,8 @@ def platyregenerate(genome: Genome, rng: np.random.Generator, innov: InnovationT
     except Exception:
         pass
     _connectivity_guard(g, innov, rng, min_frac=getattr(genome, 'min_conn_after_regen', 0.65), eps=eps)
+    if hasattr(g, '_invalidate_cache'):
+        g._invalidate_cache()
     return g
 
 @dataclass
@@ -2233,24 +2290,27 @@ class ReproPlanaNEATPlus:
         """並列評価（thread/process）。process は SHM メタを初期化し、必要なら持ち回りプールを再起動。"""
         workers = int(getattr(self, 'eval_workers', 1))
         lazy_penalty = float(getattr(self, 'lazy_individual_fitness', 0.0))
-        coop_pairs: List[Tuple[int, Genome]] = []
-        out: List[Optional[float]] = [lazy_penalty] * len(self.population)
-        for idx, g in enumerate(self.population):
-            if getattr(g, 'cooperative', True):
-                out[idx] = None
-                coop_pairs.append((idx, g))
-        if not coop_pairs:
+        population = self.population
+        n = len(population)
+        if n == 0:
+            return []
+        out = np.full(n, lazy_penalty, dtype=float)
+        coop_mask = np.fromiter((getattr(g, 'cooperative', True) for g in population), dtype=bool, count=n)
+        coop_idx = np.flatnonzero(coop_mask)
+        if coop_idx.size == 0:
             return [float(x) for x in out]
-        genomes_to_eval = [g for _, g in coop_pairs]
+        indices = [int(i) for i in coop_idx]
+        genomes_to_eval = [population[i] for i in indices]
+        idx_genome_pairs = list(zip(indices, genomes_to_eval))
         if workers <= 1:
-            for idx, g in coop_pairs:
+            for idx, g in idx_genome_pairs:
                 try:
                     out[idx] = float(fitness_fn(g))
                 except Exception as _e:
                     _tb = traceback.format_exc()
                     print(f"[ERROR] fitness exception gid={getattr(g, 'id', '?')}: {_e}\n{_tb}")
                     out[idx] = float(-1000000000.0)
-            return [float(x if x is not None else lazy_penalty) for x in out]
+            return [float(x) for x in out]
         backend = getattr(self, 'parallel_backend', 'thread')
         if backend == 'process' and (not _is_picklable(fitness_fn)):
             print('[WARN] fitness_fn is not picklable; falling back to threads')
@@ -2273,7 +2333,7 @@ class ReproPlanaNEATPlus:
                         self._proc_pool_age = 0
                     ex = self._proc_pool
                     futs = [ex.submit(fitness_fn, g) for g in genomes_to_eval]
-                    for (idx, g), fut in zip(coop_pairs, futs):
+                    for (idx, g), fut in zip(idx_genome_pairs, futs):
                         try:
                             out[idx] = float(fut.result())
                         except Exception as _e:
@@ -2281,41 +2341,41 @@ class ReproPlanaNEATPlus:
                             print(f"[ERROR] fitness exception (proc) gid={getattr(g, 'id', '?')}: {_e}\n{_tb}")
                             out[idx] = float(-1000000000.0)
                     self._proc_pool_age += 1
-                    return [float(x if x is not None else lazy_penalty) for x in out]
+                    return [float(x) for x in out]
                 else:
                     with _cf.ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=_proc_init_worker, initargs=initargs) as ex:
                         futs = [ex.submit(fitness_fn, g) for g in genomes_to_eval]
-                        for (idx, g), fut in zip(coop_pairs, futs):
+                        for (idx, g), fut in zip(idx_genome_pairs, futs):
                             try:
                                 out[idx] = float(fut.result())
                             except Exception as _e:
                                 _tb = traceback.format_exc()
                                 print(f"[ERROR] fitness exception (proc) gid={getattr(g, 'id', '?')}: {_e}\n{_tb}")
                                 out[idx] = float(-1000000000.0)
-                    return [float(x if x is not None else lazy_penalty) for x in out]
+                    return [float(x) for x in out]
             else:
                 if backend != 'thread':
                     print(f"[WARN] Unknown backend '{backend}', defaulting to threads")
                 with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
                     futs = [ex.submit(fitness_fn, g) for g in genomes_to_eval]
-                    for (idx, g), fut in zip(coop_pairs, futs):
+                    for (idx, g), fut in zip(idx_genome_pairs, futs):
                         try:
                             out[idx] = float(fut.result())
                         except Exception as _e:
                             _tb = traceback.format_exc()
                             print(f"[ERROR] fitness exception (thread) gid={getattr(g, 'id', '?')}: {_e}\n{_tb}")
                             out[idx] = float(-1000000000.0)
-                return [float(x if x is not None else lazy_penalty) for x in out]
+                return [float(x) for x in out]
         except Exception as e:
             print('[WARN] parallel evaluation disabled:', e)
-            for idx, g in coop_pairs:
+            for idx, g in idx_genome_pairs:
                 try:
                     out[idx] = float(fitness_fn(g))
                 except Exception as _e:
                     _tb = traceback.format_exc()
                     print(f"[ERROR] fitness exception gid={getattr(g, 'id', '?')}: {_e}\n{_tb}")
                     out[idx] = float(-1000000000.0)
-            return [float(x if x is not None else lazy_penalty) for x in out]
+            return [float(x) for x in out]
 
     def _close_pool(self):
         ex = getattr(self, '_proc_pool', None)
