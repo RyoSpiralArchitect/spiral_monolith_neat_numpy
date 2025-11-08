@@ -14,11 +14,12 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any
-from collections import deque, defaultdict, OrderedDict
+from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any, Sequence
+from collections import deque, defaultdict, OrderedDict, Counter
 import math, argparse, os, mimetypes, csv
 import sys
 import time
+import subprocess
 import matplotlib
 import warnings
 import pickle as _pickle
@@ -28,12 +29,98 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
 from matplotlib import font_manager as _font_manager
+from matplotlib import gridspec as _gridspec
+from matplotlib.lines import Line2D
 import csv
 import json
 import math
 import os
 from typing import Dict, Optional, Tuple
 import importlib.util
+from datetime import datetime, timezone
+
+_BUILD_INFO_CACHE: Optional[Dict[str, Any]] = None
+_SPINOR_BOUND_SEED: Optional[int] = None
+
+
+_NOISE_STYLE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    'white': {'label': 'White', 'symbol': 'W', 'color': '#f6f7fb', 'index': 0, 'bias': 0.0},
+    'alpha': {'label': 'Alpha', 'symbol': 'α', 'color': '#8ecae6', 'index': 1, 'bias': -0.06},
+    'beta': {'label': 'Beta', 'symbol': 'β', 'color': '#ffb703', 'index': 2, 'bias': 0.04},
+    'black': {'label': 'Black', 'symbol': '♭', 'color': '#1f1f1f', 'index': 3, 'bias': -0.12},
+}
+_NOISE_STYLE_FALLBACK: Dict[str, Any] = {'label': 'Unknown', 'symbol': '?', 'color': '#9e9e9e', 'index': -1, 'bias': 0.0}
+
+
+def _resolve_noise_style(kind: Optional[str], overrides: Optional[Dict[str, Dict[str, Any]]]=None) -> Dict[str, Any]:
+    key = (kind or '').strip().lower()
+    base = dict(_NOISE_STYLE_DEFAULTS.get(key, _NOISE_STYLE_FALLBACK))
+    if overrides:
+        override = overrides.get(key) or overrides.get(kind or '')
+        if override:
+            base.update({k: v for k, v in override.items() if v is not None})
+    label_source = kind or base.get('label') or 'Unknown'
+    if not base.get('label'):
+        base['label'] = str(label_source).title()
+    if not base.get('symbol'):
+        base['symbol'] = (label_source[:1].upper() if label_source else '?')
+    base['index'] = int(base.get('index', _NOISE_STYLE_FALLBACK['index']))
+    base['color'] = str(base.get('color', _NOISE_STYLE_FALLBACK['color']))
+    base['bias'] = float(base.get('bias', _NOISE_STYLE_FALLBACK['bias']))
+    base['kind'] = kind or ''
+    return base
+
+
+def _resolve_build_info() -> Dict[str, Any]:
+    """Return cached build metadata including git short hash and UTC timestamp."""
+
+    global _BUILD_INFO_CACHE
+    if _BUILD_INFO_CACHE is not None:
+        return _BUILD_INFO_CACHE
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    stamp_ts = now_utc.strftime('%Y%m%dT%H%M%SZ')
+    short_hash = 'nogit'
+    repo_root = None
+    try:
+        here = os.path.abspath(__file__)
+        repo_root = os.path.dirname(here)
+    except Exception:
+        repo_root = os.getcwd()
+    probe = repo_root
+    while probe and not os.path.isdir(os.path.join(probe, '.git')):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            probe = None
+            break
+        probe = parent
+    if probe:
+        try:
+            raw = subprocess.check_output(
+                ['git', 'rev-parse', '--short', 'HEAD'],
+                cwd=probe,
+                stderr=subprocess.DEVNULL,
+            )
+            short_hash = raw.decode('ascii', errors='ignore').strip() or 'nogit'
+        except Exception:
+            short_hash = 'nogit'
+    build_id = f'{short_hash}-{stamp_ts}'
+    _BUILD_INFO_CACHE = {
+        'hash': short_hash,
+        'timestamp': stamp_ts,
+        'datetime': now_utc,
+        'id': build_id,
+    }
+    return _BUILD_INFO_CACHE
+
+
+def _build_stamp_text(prefix: str='Spiral Monolith NEAT') -> str:
+    info = _resolve_build_info()
+    return f"{prefix} build {info['id']}"
+
+
+def _build_stamp_short() -> str:
+    info = _resolve_build_info()
+    return info['id']
 
 def _is_picklable(obj) -> bool:
     """Process 並列に切り替える前に picklable かを事前検査（非picklableなら thread に自動フォールバック）"""
@@ -224,18 +311,85 @@ def _imread_image(src):
 
 def _imwrite_image(path, array):
     """Write an image array using imageio or Pillow."""
+    stamped = _stamp_image_array(np.asarray(array))
     if imageio is not None:
-        imageio.imwrite(path, array)
+        imageio.imwrite(path, stamped)
         return
     if Image is None:
         raise RuntimeError('imageio is unavailable and Pillow is not installed; cannot write image')
-    Image.fromarray(np.asarray(array)).save(path)
+    Image.fromarray(stamped).save(path)
+
+
+def _stamp_figure(fig: 'plt.Figure') -> 'plt.Figure':
+    """Watermark a matplotlib figure with the current build stamp."""
+
+    if fig is None:
+        return fig
+    if getattr(fig, '_build_stamp_applied', False):
+        return fig
+    text = _build_stamp_text()
+    try:
+        fig.text(
+            0.995,
+            0.01,
+            text,
+            ha='right',
+            va='bottom',
+            fontsize=6,
+            color='#4a4a4a',
+            alpha=0.78,
+        )
+    except Exception:
+        pass
+    else:
+        setattr(fig, '_build_stamp_applied', True)
+    return fig
+
+
+def _savefig(fig: 'plt.Figure', path: str, **kwargs) -> None:
+    """Save a matplotlib figure with a build watermark."""
+
+    _stamp_figure(fig)
+    fig.savefig(path, **kwargs)
+
+
+def _stamp_image_array(arr: np.ndarray) -> np.ndarray:
+    """Overlay the build stamp onto a numpy image array when Pillow is available."""
+
+    try:
+        from PIL import Image as _PILImage, ImageDraw
+    except Exception:
+        return np.asarray(arr)
+    if arr.ndim < 2:
+        return np.asarray(arr)
+    try:
+        img = _PILImage.fromarray(np.asarray(arr))
+    except Exception:
+        return np.asarray(arr)
+    draw = ImageDraw.Draw(img)
+    text = _build_stamp_text()
+    w, h = img.size
+    margin = max(3, int(min(w, h) * 0.01))
+    anchor_point = (w - margin, h - margin)
+    try:
+        draw.text(anchor_point, text, anchor='rd', fill=(68, 68, 68))
+    except Exception:
+        try:
+            x, y = anchor_point
+            draw.text((x - margin, y - margin), text, fill=(68, 68, 68))
+        except Exception:
+            pass
+    return np.asarray(img)
 
 @dataclass
 class NodeGene:
     id: int
     type: str
     activation: str = 'tanh'
+    backprop_sensitivity: float = 1.0
+    sensitivity_jitter: float = 0.0
+    sensitivity_momentum: float = 0.0
+    sensitivity_variance: float = 0.0
 
 @dataclass
 class ConnectionGene:
@@ -402,6 +556,10 @@ class Genome:
         self._struct_sig_rev = -1
         self._complexity_cache: Optional[Tuple[int, int, float, float, float]] = None
         self._complexity_rev = -1
+        self._compiled_cache: Optional[Dict[str, Any]] = None
+        self._compiled_cache_rev: Tuple[int, int] = (-1, -1)
+        self._compat_token: Optional[Tuple[int, int, int]] = None
+        self._compat_token_rev: Tuple[int, int] = (-1, -1)
         self.nodes = _GenomeNodeDict(nodes, self)
         self.connections = _GenomeConnDict(connections, self)
         self.sex = sex or ('female' if np.random.random() < 0.5 else 'male')
@@ -417,9 +575,49 @@ class Genome:
         self.max_edges: Optional[int] = None
         self.mutation_will = float(mutation_will) if mutation_will is not None else float(np.random.uniform(0.0, 1.0))
         self.cooperative = bool(cooperative)
+        self.meta_reflections: List[Dict[str, Any]] = []
+        self._meta_revision = 0
+
+    def meta_reflect(self, event: str, payload: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+        info = dict(payload or {})
+        comp_before = self.structural_complexity_stats()
+        info.setdefault('structure_rev', self._structure_rev)
+        info.setdefault('weights_rev', self._weights_rev)
+        info['complexity'] = self._complexity_dict(comp_before)
+        try:
+            info['signature'] = self.structural_signature()
+        except Exception:
+            info['signature'] = None
+        info['event'] = event
+        info['timestamp'] = time.time()
+        self.meta_reflections.append(info)
+        self._meta_revision += 1
+        return info
+
+    @staticmethod
+    def _complexity_dict(stats: Tuple[int, int, float, float, float]) -> Dict[str, float]:
+        hidden, edges, branching, depth_spread, score = stats
+        return {
+            'hidden': int(hidden),
+            'edges': int(edges),
+            'branching': float(branching),
+            'depth_spread': float(depth_spread),
+            'score': float(score),
+        }
 
     def copy(self):
-        nodes = {nid: NodeGene(n.id, n.type, n.activation) for nid, n in self.nodes.items()}
+        nodes = {
+            nid: NodeGene(
+                n.id,
+                n.type,
+                n.activation,
+                getattr(n, 'backprop_sensitivity', 1.0),
+                getattr(n, 'sensitivity_jitter', 0.0),
+                getattr(n, 'sensitivity_momentum', 0.0),
+                getattr(n, 'sensitivity_variance', 0.0),
+            )
+            for nid, n in self.nodes.items()
+        }
         conns = {innov: ConnectionGene(c.in_node, c.out_node, c.weight, c.enabled, c.innovation) for innov, c in self.connections.items()}
         g = Genome(nodes, conns, self.sex, self.regen, self.regen_mode, self.embryo_bias, self.id, self.birth_gen, self.hybrid_scale, self.parents, mutation_will=self.mutation_will, cooperative=self.cooperative)
         g.origin_mode = getattr(self, 'origin_mode', 'initial')
@@ -445,6 +643,13 @@ class Genome:
             self._weights_rev += 1
         elif weights:
             self._weights_rev += 1
+        self._compiled_cache = None
+        self._compiled_cache_rev = (-1, -1)
+        self._compat_token = None
+        self._compat_token_rev = (-1, -1)
+
+    def _invalidate_cache(self):
+        self.invalidate_caches(structure=True)
 
     def enabled_connections(self):
         return [c for c in self.connections.values() if c.enabled]
@@ -639,6 +844,17 @@ class Genome:
         self._complexity_rev = self._structure_rev
         return self._complexity_cache
 
+    def compat_token(self) -> Tuple[int, int, int]:
+        rev = (self._structure_rev, self._weights_rev)
+        if self._compat_token is not None and self._compat_token_rev == rev:
+            return self._compat_token
+        sig = self.structural_signature()
+        weights = tuple(sorted((inn, float(round(conn.weight, 6)), bool(conn.enabled)) for inn, conn in self.connections.items()))
+        token = (hash(sig), hash(weights), len(weights))
+        self._compat_token = token
+        self._compat_token_rev = rev
+        return token
+
     def structural_complexity_score(self) -> float:
         return float(self.structural_complexity_stats()[-1])
 
@@ -650,6 +866,7 @@ class Genome:
             if len(hidden_ids) >= int(self.max_hidden_nodes):
                 return False
         template_id = int(rng.choice(hidden_ids))
+        baseline = self.structural_complexity_stats()
         incoming = [c for c in self.connections.values() if c.enabled and c.out_node == template_id]
         outgoing = [c for c in self.connections.values() if c.enabled and c.in_node == template_id]
         if not incoming and not outgoing:
@@ -674,7 +891,16 @@ class Genome:
             proposals = list(proposals)
             order = rng.permutation(len(proposals))[:budget]
             proposals = [proposals[int(i)] for i in order]
-        self.nodes[new_node_id] = NodeGene(new_node_id, 'hidden', self.nodes[template_id].activation)
+        template = self.nodes[template_id]
+        self.nodes[new_node_id] = NodeGene(
+            new_node_id,
+            'hidden',
+            template.activation,
+            getattr(template, 'backprop_sensitivity', 1.0),
+            getattr(template, 'sensitivity_jitter', 0.0),
+            getattr(template, 'sensitivity_momentum', 0.0),
+            getattr(template, 'sensitivity_variance', 0.0),
+        )
         added = 0
         for src, dst, weight in proposals:
             if budget is not None and added >= budget:
@@ -693,29 +919,52 @@ class Genome:
                     self.connections[bridge_inn] = ConnectionGene(template_id, new_node_id, bridge_w, True, bridge_inn)
                 except Exception:
                     pass
+        self.invalidate_caches(structure=True)
+        after = self.structural_complexity_stats()
+        payload = {
+            'template': template_id,
+            'new_node': new_node_id,
+            'before': self._complexity_dict(baseline),
+            'after': self._complexity_dict(after),
+            'delta_score': float(after[-1] - baseline[-1]),
+        }
+        self.meta_reflect('duplicate_node', payload)
         return True
 
     def mutate_weights(self, rng: np.random.Generator, perturb_chance=0.9, sigma=0.8, reset_range=2.0):
+        before = {inn: c.weight for inn, c in self.connections.items()}
         for c in self.connections.values():
             if rng.random() < perturb_chance:
                 c.weight += float(rng.normal(0, sigma))
             else:
                 c.weight = float(rng.uniform(-reset_range, reset_range))
         self.invalidate_caches(weights=True)
+        deltas = [abs(self.connections[inn].weight - w) for inn, w in before.items()]
+        payload = {
+            'mean_abs_delta': float(np.mean(deltas)) if deltas else 0.0,
+            'max_abs_delta': float(np.max(deltas)) if deltas else 0.0,
+            'changed': len(deltas),
+        }
+        self.meta_reflect('mutate_weights', payload)
 
     def mutate_toggle_enable(self, rng: np.random.Generator, prob=0.01):
         changed = False
+        toggled = 0
         for c in self.connections.values():
             if rng.random() >= prob:
                 continue
             if c.enabled:
                 c.enabled = False
                 changed = True
+                toggled += 1
             elif not self._creates_cycle(c.in_node, c.out_node):
                 c.enabled = True
                 changed = True
+                toggled += 1
         if changed:
             self.invalidate_caches(structure=True)
+            payload = {'toggled': toggled, 'prob': prob}
+            self.meta_reflect('toggle_enable', payload)
 
     def _choose_conn_for_node_add(self, rng: np.random.Generator, bias: str):
         enabled = [c for c in self.connections.values() if c.enabled]
@@ -744,6 +993,7 @@ class Genome:
             if sum((1 for c in self.connections.values() if c.enabled)) >= int(self.max_edges):
                 return False
         node_ids = list(self.nodes.keys())
+        baseline = self.structural_complexity_stats()
         for _ in range(tries):
             in_id = int(rng.choice(node_ids))
             out_id = int(rng.choice(node_ids))
@@ -763,6 +1013,16 @@ class Genome:
             inn = innov.get_conn_innovation(in_id, out_id)
             self.connections[inn] = ConnectionGene(in_id, out_id, w, True, inn)
             self._invalidate_cache()
+            after = self.structural_complexity_stats()
+            payload = {
+                'in': in_id,
+                'out': out_id,
+                'weight': w,
+                'before': self._complexity_dict(baseline),
+                'after': self._complexity_dict(after),
+                'delta_score': float(after[-1] - baseline[-1]),
+            }
+            self.meta_reflect('add_connection', payload)
             return True
         return False
 
@@ -776,15 +1036,34 @@ class Genome:
         c = chosen
         if not c.enabled:
             return False
+        baseline = self.structural_complexity_stats()
+        split_edge = (c.in_node, c.out_node)
         c.enabled = False
         new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_nid not in self.nodes:
-            self.nodes[new_nid] = NodeGene(new_nid, 'hidden', 'tanh')
+            self.nodes[new_nid] = NodeGene(
+                new_nid,
+                'hidden',
+                'tanh',
+                float(rng.uniform(0.9, 1.1)),
+                float(np.clip(rng.normal(0.0, 0.04), -0.15, 0.15)),
+                0.0,
+                0.0,
+            )
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
         self.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
         self.connections[inn2] = ConnectionGene(new_nid, c.out_node, c.weight, True, inn2)
         self.invalidate_caches(structure=True)
+        after = self.structural_complexity_stats()
+        payload = {
+            'new_node': new_nid,
+            'split_edge': split_edge,
+            'before': self._complexity_dict(baseline),
+            'after': self._complexity_dict(after),
+            'delta_score': float(after[-1] - baseline[-1]),
+        }
+        self.meta_reflect('add_node', payload)
         return True
 
     def mutate_sex(self, rng: np.random.Generator):
@@ -1082,7 +1361,7 @@ def export_lcs_ribbon_png(lcs_rows: List[Dict[str, Any]], path: str, series: Opt
     fig.suptitle('Local Continuity Signature overview', y=0.98, fontsize=12)
     fig.text(0.02, 0.03, summary_text, fontsize=9, family='monospace')
     fig.tight_layout(rect=[0, 0.06, 1, 0.95])
-    fig.savefig(path, dpi=dpi)
+    _savefig(fig, path, dpi=dpi)
     _plt.close(fig)
     return path
 
@@ -1202,6 +1481,111 @@ def compatibility_distance(g1: Genome, g2: Genome, c1=1.0, c2=1.0, c3=0.4):
     W = sum(W_diffs) / len(W_diffs) if W_diffs else 0.0
     return c1 * E / N + c2 * D / N + c3 * W
 
+
+class HouseholdManager:
+
+    """Track structural "households" to drive environment diversity and reuse stats.
+
+    The manager clusters genomes by a hashed structural signature, remembers their
+    rolling fitness and complexity, and provides difficulty nudges per household.
+    """
+
+    def __init__(self, max_households: int=256, smoothing: float=0.6, difficulty_push: float=0.12):
+        self.max_households = int(max(1, max_households))
+        self.smoothing = float(np.clip(smoothing, 0.0, 0.99))
+        self.difficulty_push = float(difficulty_push)
+        self._stats: "OrderedDict[Tuple[int, int, int, str], Dict[str, float]]" = OrderedDict()
+
+    def _key(self, genome: Genome) -> Tuple[int, int, int, str]:
+        token = genome.compat_token()
+        comp = genome.structural_complexity_stats()[-1]
+        band = int(comp // 1.5)
+        regen = 1 if getattr(genome, 'regen', False) else 0
+        sex = str(getattr(genome, 'sex', 'unknown'))
+        return (token[0], token[1], band * 2 + regen, sex)
+
+    def _prune(self):
+        while len(self._stats) > self.max_households:
+            oldest = min(self._stats.items(), key=lambda kv: kv[1].get('last_seen', 0.0))[0]
+            self._stats.pop(oldest, None)
+
+    def update(self, genomes: List[Genome], fitnesses: List[float], env_difficulty: float) -> None:
+        if not genomes:
+            return
+        now = time.time()
+        smooth = self.smoothing
+        for g, fit in zip(genomes, fitnesses):
+            if not np.isfinite(fit):
+                continue
+            key = self._key(g)
+            entry = self._stats.get(key)
+            weight = 0.6 if not getattr(g, 'cooperative', True) else 1.0
+            comp = float(g.structural_complexity_stats()[-1])
+            if entry is None:
+                entry = {
+                    'mean_fit': float(fit),
+                    'trend': 0.0,
+                    'complexity': comp,
+                    'count': weight,
+                    'last_seen': now,
+                    'last_fit': float(fit),
+                    'env_difficulty': float(env_difficulty),
+                }
+            else:
+                entry['mean_fit'] = entry['mean_fit'] * smooth + float(fit) * (1.0 - smooth) * weight
+                delta = float(fit) - float(entry.get('last_fit', fit))
+                entry['trend'] = entry['trend'] * smooth + delta * (1.0 - smooth)
+                entry['complexity'] = entry['complexity'] * smooth + comp * (1.0 - smooth)
+                entry['count'] = entry.get('count', 0.0) * smooth + weight * (1.0 - smooth)
+                entry['last_seen'] = now
+                entry['last_fit'] = float(fit)
+                entry['env_difficulty'] = float(env_difficulty)
+            self._stats[key] = entry
+        self._prune()
+
+    def environment_adjustments(self, genomes: List[Genome], fitnesses: List[float], env: Dict[str, Any]) -> Dict[int, float]:
+        if not self._stats:
+            return {}
+        means = np.array([entry['mean_fit'] for entry in self._stats.values()], dtype=float)
+        if means.size == 0:
+            return {}
+        base_mean = float(means.mean())
+        spread = float(np.std(means)) if means.size > 1 else 0.0
+        env_diff = 0.0
+        if isinstance(env, dict):
+            env_diff = float(env.get('difficulty', 0.0))
+        else:
+            env_diff = float(env)
+        adjustments: Dict[int, float] = {}
+        push = self.difficulty_push * (1.0 + 0.25 * np.tanh(spread))
+        for g, fit in zip(genomes, fitnesses):
+            key = self._key(g)
+            entry = self._stats.get(key)
+            if entry is None:
+                continue
+            comp = float(entry.get('complexity', 0.0))
+            trend = float(entry.get('trend', 0.0))
+            normalized = 0.0
+            if spread > 1e-09:
+                normalized = (entry['mean_fit'] - base_mean) / spread
+            else:
+                normalized = entry['mean_fit'] - base_mean
+            boost = push * np.tanh(normalized + 0.2 * trend)
+            boost *= 1.0 + 0.15 * np.tanh((comp - (2.0 + env_diff)) / 3.0)
+            if not getattr(g, 'cooperative', True):
+                boost *= 0.5
+            adjustments[g.id] = float(boost)
+        return adjustments
+
+    def global_pressure(self) -> float:
+        if not self._stats:
+            return 0.0
+        means = np.array([entry['mean_fit'] for entry in self._stats.values()], dtype=float)
+        if means.size <= 1:
+            return 0.0
+        spread = float(np.std(means))
+        return float(np.tanh(spread * 1.2))
+
 def _regenerate_head(g: Genome, rng: np.random.Generator, innov: InnovationTracker, intensity=0.5):
     inputs = [nid for nid, n in g.nodes.items() if n.type in ('input', 'bias')]
     candidates = [c for c in g.enabled_connections() if c.in_node in inputs]
@@ -1214,7 +1598,15 @@ def _regenerate_head(g: Genome, rng: np.random.Generator, innov: InnovationTrack
         c.enabled = False
     chosen = rng.choice(candidates)
     new_id = innov.new_node_id()
-    g.nodes[new_id] = NodeGene(new_id, 'hidden', 'tanh')
+    g.nodes[new_id] = NodeGene(
+        new_id,
+        'hidden',
+        'tanh',
+        float(rng.uniform(0.9, 1.1)),
+        float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
+        0.0,
+        0.0,
+    )
     inn1 = innov.get_conn_innovation(chosen.in_node, new_id)
     inn2 = innov.get_conn_innovation(new_id, chosen.out_node)
     g.connections[inn1] = ConnectionGene(chosen.in_node, new_id, 1.0, True, inn1)
@@ -1254,7 +1646,15 @@ def _regenerate_split(g: Genome, rng: np.random.Generator, innov: InnovationTrac
         c.enabled = False
         new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_nid not in g.nodes:
-            g.nodes[new_nid] = NodeGene(new_nid, 'hidden', 'tanh')
+            g.nodes[new_nid] = NodeGene(
+                new_nid,
+                'hidden',
+                'tanh',
+                float(rng.uniform(0.9, 1.1)),
+                float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
+                0.0,
+                0.0,
+            )
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
@@ -1263,7 +1663,15 @@ def _regenerate_split(g: Genome, rng: np.random.Generator, innov: InnovationTrac
         return g
     target = int(rng.choice(hidden))
     dup_id = innov.new_node_id()
-    g.nodes[dup_id] = NodeGene(dup_id, 'hidden', 'tanh')
+    g.nodes[dup_id] = NodeGene(
+        dup_id,
+        'hidden',
+        'tanh',
+        float(rng.uniform(0.9, 1.1)),
+        float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
+        0.0,
+        0.0,
+    )
     incomings = [c for c in g.enabled_connections() if c.out_node == target]
     for cin in incomings:
         inn = innov.get_conn_innovation(cin.in_node, dup_id)
@@ -1375,7 +1783,15 @@ def _soft_regenerate_head(g, rng, innov, intensity=0.5):
         c = candidates[int(rng_local.integers(n))]
         new_id = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_id not in g.nodes:
-            g.nodes[new_id] = NodeGene(new_id, 'hidden', 'tanh')
+            g.nodes[new_id] = NodeGene(
+                new_id,
+                'hidden',
+                'tanh',
+                float(rng_local.uniform(0.9, 1.1)),
+                float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
+                0.0,
+                0.0,
+            )
         inn1 = innov.get_conn_innovation(c.in_node, new_id)
         inn2 = innov.get_conn_innovation(new_id, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_id, 1.0, True, inn1)
@@ -1419,7 +1835,15 @@ def _soft_regenerate_split(g, rng, innov, intensity=0.5):
         c.enabled = False
         new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_nid not in g.nodes:
-            g.nodes[new_nid] = NodeGene(new_nid, 'hidden', 'tanh')
+            g.nodes[new_nid] = NodeGene(
+                new_nid,
+                'hidden',
+                'tanh',
+                float(rng_local.uniform(0.9, 1.1)),
+                float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
+                0.0,
+                0.0,
+            )
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
         g.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
@@ -1428,7 +1852,15 @@ def _soft_regenerate_split(g, rng, innov, intensity=0.5):
         return g
     target = int(rng_local.choice(hidden))
     dup_id = innov.new_node_id()
-    g.nodes[dup_id] = NodeGene(dup_id, 'hidden', 'tanh')
+    g.nodes[dup_id] = NodeGene(
+        dup_id,
+        'hidden',
+        'tanh',
+        float(rng_local.uniform(0.9, 1.1)),
+        float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
+        0.0,
+        0.0,
+    )
     incomings = [c for c in g.enabled_connections() if c.out_node == target]
     changed = False
     for cin in incomings:
@@ -1891,7 +2323,7 @@ class LCSMonitor:
         for _r in rows:
             _r['birth_mode'] = birth_mode or ''
             _r['is_regen_child'] = int(bool(is_regen_child)) if is_regen_child is not None else 0
-        header = ['birth_mode', 'is_regen_child', 'gen', 'lineage_id', 'mut_id', 'o', 'changed_nodes', 'changed_edges', 'R0', 'R1', 'P0', 'P1', 'd0', 'd1', 'detour', 'delta_paths', 'delta_sp', 'heal_flag', 'time_to_heal', 'disjoint_paths0', 'disjoint_paths1']
+        header = ['birth_mode', 'is_regen_child', 'gen', 'lineage_id', 'mut_id', 'o', 'changed_nodes', 'changed_edges', 'R0', 'R1', 'P0', 'P1', 'd0', 'd1', 'detour', 'delta_paths', 'delta_sp', 'heal_flag', 'time_to_heal', 'disjoint_paths0', 'disjoint_paths1', 'build_id']
         need_header = not os.path.exists(self.csv_path)
         try:
             with open(self.csv_path, 'a', newline='') as f:
@@ -1899,6 +2331,7 @@ class LCSMonitor:
                 if need_header:
                     writer.writeheader()
                 for row in rows:
+                    row['build_id'] = _build_stamp_short()
                     writer.writerow(row)
         except Exception as exc:
             print(f'[LCS] CSV write error: {exc}')
@@ -2046,7 +2479,18 @@ class ReproPlanaNEATPlus:
         self.lazy_complexity_target_scale = 1.18
         self.lazy_complexity_duplicate_bias = 0.45
         self.lazy_complexity_min_growth = 0.0
-        self.env = {'difficulty': 0.0, 'noise_std': 0.0}
+        self.env = {
+            'difficulty': 0.0,
+            'noise_std': 0.0,
+            'noise_kind': 'white',
+            'noise_profile': {
+                'cycle_phase': 0.0,
+                'envelope': 0.0,
+                'jitter': 0.0,
+                'spectral_bias': 0.0,
+                'band_label': 'white',
+            },
+        }
         self.mix_asexual_base = 0.1
         self.mix_asexual_gain = 0.4
         self.injury_intensity_base = 0.25
@@ -2062,14 +2506,57 @@ class ReproPlanaNEATPlus:
         self.edge_counts_history = []
         self.best_ids = []
         self.lineage_edges = []
+        self.lineage_annotations: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
         self.env_history = []
         self.snapshots_genomes: List[Genome] = []
         self.snapshots_scars: List[Dict[int, 'Scar']] = []
         self.node_registry: Dict[int, Dict[str, Any]] = {}
         self.top3_best_topologies = []
+        self._compat_cache: 'OrderedDict[Tuple[Tuple[int, int, int], Tuple[int, int, int]], float]' = OrderedDict()
+        self._compat_cache_limit = max(1024, population_size * 8)
+        self._households = HouseholdManager(max_households=max(population_size * 4, 256))
+        self._last_household_adjustments: Dict[int, float] = {}
         for g in self.population:
             self.node_registry[g.id] = {'sex': g.sex, 'regen': g.regen, 'birth_gen': g.birth_gen}
         self._assign_lazy_individuals(self.population)
+        self.monodromy_top_ratio = 0.12
+        self.monodromy_span = 6.0
+        self.monodromy_pressure_base = 0.018
+        self.monodromy_pressure_range = 0.06
+        self.monodromy_penalty_cap = 0.42
+        self.monodromy_phase_step = 0.38196601125
+        self.monodromy_smoothing = 0.4
+        self.monodromy_decay = 0.55
+        self.monodromy_release = 0.35
+        self.monodromy_momentum_decay = 0.65
+        self.monodromy_growth_weight = 0.85
+        self.monodromy_slump_gain = 0.6
+        self.monodromy_fast_release = 0.25
+        self.monodromy_diversity_weight = 0.45
+        self.monodromy_diversity_floor = 0.22
+        self.monodromy_diversity_grace = 2.5
+        self.monodromy_diversity_grace_decay = 0.6
+        self.monodromy_diversity_grace_strength = 0.3
+        self.monodromy_noise_weight = 0.25
+        self.monodromy_noise_style_overrides: Dict[str, Dict[str, Any]] = {}
+        self._monodromy_registry: Dict[int, Dict[str, float]] = {}
+        self._monodromy_snapshot: Dict[str, float] = {
+            'pressure_mean': 0.0,
+            'pressure_max': 0.0,
+            'active': 0,
+            'release': 0,
+            'relief_mean': 0.0,
+            'momentum_mean': 0.0,
+            'momentum_max': 0.0,
+            'diversity_mean': 0.0,
+            'diversity_max': 0.0,
+            'grace_mean': 0.0,
+            'noise_factor': 1.0,
+            'noise_kind': '',
+            'noise_focus': 0.0,
+            'noise_entropy': 0.0,
+        }
+        self._monodromy_noise_tag = ''
         self._auto_complexity_bonus_state = {
             'baseline': 0.0,
             'bonus_scale': float(self.complexity_survivor_bonus),
@@ -2084,14 +2571,110 @@ class ReproPlanaNEATPlus:
             'spread': 0.0,
         }
         self._lazy_fraction_carry = 0.0
+        self.raw_best_history: List[Tuple[float, float]] = []
+        self.context_best_history: List[Tuple[float, float]] = []
+        self._lazy_env_feedback: Dict[str, Any] = {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0}
+        self.spinor_controller: Optional[Any] = None
+        self._best_context_value = -1000000000.0
 
     def _heterosis_scale(self, mother: Genome, father: Genome) -> float:
-        d = compatibility_distance(mother, father, self.c1, self.c2, self.c3)
+        d = self._compat_distance(mother, father)
         peak = 1.0 + self.heterosis_gain * np.exp(-0.5 * ((d - self.heterosis_center) / self.heterosis_width) ** 2)
         if d > self.distance_cutoff:
             penalty = max(0.0, self.penalty_far * (d - self.distance_cutoff) / self.distance_cutoff)
             peak *= 1.0 - min(0.9, penalty)
         return float(peak)
+
+    def _note_lineage(self, gid: int, gen: int, summary: str) -> None:
+        if not summary:
+            return
+        notes = self.lineage_annotations.setdefault(gid, [])
+        notes.append((gen, summary))
+        if len(notes) > 6:
+            self.lineage_annotations[gid] = notes[-6:]
+
+    def _update_lazy_feedback(self, generation: int, fitnesses: Sequence[float], best_idx: int, best_fit: float, avg_fit: float) -> None:
+        total = len(self.population)
+        if total <= 0:
+            return
+        lazy_indices = [i for i, g in enumerate(self.population) if getattr(g, 'lazy_lineage', False)]
+        share = float(len(lazy_indices)) / float(total)
+        lazy_scores = [float(fitnesses[i]) for i in lazy_indices] if lazy_indices else []
+        if lazy_scores:
+            lazy_avg = float(np.mean(lazy_scores))
+            lazy_best = float(np.max(lazy_scores))
+            spread = float(np.std(lazy_scores))
+        else:
+            lazy_avg = float(avg_fit)
+            lazy_best = float(best_fit)
+            spread = 0.0
+        scale = max(1.0, abs(best_fit) + abs(avg_fit) + abs(lazy_avg))
+        anchor = float(np.clip(lazy_avg / scale, -1.0, 1.0))
+        gap = float(np.clip((best_fit - lazy_avg) / scale, -1.0, 1.0))
+        stasis = float(np.clip(1.0 - min(1.0, spread / scale), 0.0, 1.0))
+        payload = {
+            'generation': int(generation),
+            'share': float(np.clip(share, 0.0, 1.0)),
+            'anchor': anchor,
+            'gap': gap,
+            'stasis': stasis,
+            'lazy_avg': float(lazy_avg),
+            'lazy_best': float(lazy_best),
+            'spread': float(spread),
+            'raw_best': float(best_fit),
+            'raw_avg': float(avg_fit),
+            'count': int(len(lazy_indices)),
+            'population': int(total),
+        }
+        self._lazy_env_feedback = payload
+        controller = getattr(self, 'spinor_controller', None)
+        if controller is not None and hasattr(controller, 'set_lazy_feedback'):
+            try:
+                controller.set_lazy_feedback(generation, payload)
+            except Exception:
+                pass
+
+    def _contextual_best_axis(self, best_fit: float, avg_fit: float) -> float:
+        env = getattr(self, 'env', {})
+        if isinstance(env, dict):
+            diff = float(env.get('difficulty', 0.0))
+            noise = float(env.get('noise_std', 0.0))
+        else:
+            diff = 0.0
+            noise = 0.0
+        lazy = getattr(self, '_lazy_env_feedback', {}) or {}
+        share = float(np.clip(lazy.get('share', 0.0), 0.0, 1.0))
+        stasis = float(np.clip(lazy.get('stasis', 0.0), 0.0, 1.0))
+        gap = float(np.clip(lazy.get('gap', 0.0), -1.0, 1.0))
+        anchor = float(np.clip(lazy.get('anchor', 0.0), -1.0, 1.0))
+        momentum = float(np.clip(lazy.get('spread', 0.0), 0.0, 5.0))
+        difficulty_penalty = 0.07 * diff + 0.04 * noise
+        cohesion_bonus = 0.05 * share * stasis
+        anchor_bonus = 0.02 * anchor
+        gap_penalty = 0.03 * abs(gap)
+        variance_penalty = 0.01 * momentum
+        return float(best_fit - difficulty_penalty - gap_penalty - variance_penalty + cohesion_bonus + anchor_bonus)
+
+    def _compat_distance(self, g1: Genome, g2: Genome) -> float:
+        try:
+            token1 = g1.compat_token()
+            token2 = g2.compat_token()
+            key = (token1, token2) if token1 <= token2 else (token2, token1)
+        except Exception:
+            return compatibility_distance(g1, g2, self.c1, self.c2, self.c3)
+        cache = self._compat_cache
+        dist = cache.get(key)
+        if dist is not None:
+            cache.move_to_end(key)
+            return dist
+        dist = compatibility_distance(g1, g2, self.c1, self.c2, self.c3)
+        cache[key] = dist
+        if len(cache) > self._compat_cache_limit:
+            try:
+                cache.popitem(last=False)
+            except Exception:
+                pass
+        return dist
 
     def _regen_intensity(self) -> float:
         return float(min(1.0, max(0.0, self.injury_intensity_base + self.injury_intensity_gain * self.env['difficulty'])))
@@ -2118,7 +2701,7 @@ class ReproPlanaNEATPlus:
         for genome, fit in zip(self.population, fitnesses):
             placed = False
             for sp in species:
-                delta = compatibility_distance(genome, sp.representative, self.c1, self.c2, self.c3)
+                delta = self._compat_distance(genome, sp.representative)
                 if delta < self.compatibility_threshold:
                     sp.add(genome, fit)
                     placed = True
@@ -2270,7 +2853,15 @@ class ReproPlanaNEATPlus:
         child_conns = {}
         for nid, n in mother.nodes.items():
             if n.type in ('input', 'output', 'bias'):
-                child_nodes[nid] = NodeGene(n.id, n.type, n.activation)
+                child_nodes[nid] = NodeGene(
+                    n.id,
+                    n.type,
+                    n.activation,
+                    getattr(n, 'backprop_sensitivity', 1.0),
+                    getattr(n, 'sensitivity_jitter', 0.0),
+                    getattr(n, 'sensitivity_momentum', 0.0),
+                    getattr(n, 'sensitivity_variance', 0.0),
+                )
         all_innovs = sorted(set(mother.connections.keys()).union(father.connections.keys()))
         for inn in all_innovs:
             if inn in mother.connections and inn in father.connections:
@@ -2295,7 +2886,15 @@ class ReproPlanaNEATPlus:
                 for nid in (g.in_node, g.out_node):
                     if nid not in child_nodes:
                         n = mother.nodes.get(nid) or father.nodes.get(nid)
-                        child_nodes[nid] = NodeGene(n.id, n.type, n.activation)
+                        child_nodes[nid] = NodeGene(
+                            n.id,
+                            n.type,
+                            n.activation,
+                            getattr(n, 'backprop_sensitivity', 1.0),
+                            getattr(n, 'sensitivity_jitter', 0.0),
+                            getattr(n, 'sensitivity_momentum', 0.0),
+                            getattr(n, 'sensitivity_variance', 0.0),
+                        )
         child = Genome(child_nodes, child_conns)
         child.max_hidden_nodes = self.max_hidden_nodes
         child.max_edges = self.max_edges
@@ -2463,13 +3062,22 @@ class ReproPlanaNEATPlus:
             if monitor is not None and parent_adj_before_regen is not None:
                 regen_adj = child.weighted_adjacency()
                 changed_nodes, changed_edges = summarize_graph_changes(parent_adj_before_regen, regen_adj, weight_tol)
-                monitor.log_step(parent_adj_before_regen, regen_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_regen', changed_edges=changed_edges)
+                rows_regen = monitor.log_step(parent_adj_before_regen, regen_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_regen', changed_edges=changed_edges)
+                regen_summary = _summarize_lineage_rows(rows_regen)
+                if regen_summary:
+                    self._note_lineage(child.id, child.birth_gen, regen_summary)
             pre_adj = child.weighted_adjacency() if monitor is not None else None
             self._mutate(child, context='regen' if mode == 'asexual_regen' else None)
             if monitor is not None and pre_adj is not None:
                 post_adj = child.weighted_adjacency()
                 changed_nodes, changed_edges = summarize_graph_changes(pre_adj, post_adj, weight_tol)
-                monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_{mode}', changed_edges=changed_edges)
+                rows_mut = monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_{mode}', changed_edges=changed_edges)
+                summary = _summarize_lineage_rows(rows_mut)
+                summary = _merge_meta_summary(child, summary)
+                self._note_lineage(child.id, child.birth_gen, summary)
+            elif monitor is None:
+                summary = _merge_meta_summary(child, '')
+                self._note_lineage(child.id, child.birth_gen, summary)
             if mode is None:
                 mode = 'asexual_clone'
             new_pop.append(child)
@@ -2524,7 +3132,13 @@ class ReproPlanaNEATPlus:
                 if monitor is not None and pre_adj is not None:
                     post_adj = child.weighted_adjacency()
                     changed_nodes, changed_edges = summarize_graph_changes(pre_adj, post_adj, weight_tol)
-                    monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_asexual_clone', changed_edges=changed_edges)
+                    rows_clone = monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_asexual_clone', changed_edges=changed_edges)
+                    summary = _summarize_lineage_rows(rows_clone)
+                    summary = _merge_meta_summary(child, summary)
+                    self._note_lineage(child.id, child.birth_gen, summary)
+                elif monitor is None:
+                    summary = _merge_meta_summary(child, '')
+                    self._note_lineage(child.id, child.birth_gen, summary)
                 new_pop.append(child)
                 gen_events['asexual_clone'] += 1
         elif len(new_pop) > self.pop_size:
@@ -2831,9 +3445,20 @@ class ReproPlanaNEATPlus:
             diff = max(diff, 0.5)
         else:
             diff = diff + bump
+        diff += 0.08 * self._household_pressure()
+        diff = float(np.clip(diff, 0.0, 5.0))
         enable_regen = bool(diff >= 0.85)
         noise_std = 0.01 + 0.05 * diff
         return {'difficulty': float(diff), 'noise_std': float(noise_std), 'enable_regen': enable_regen}
+
+    def _household_pressure(self) -> float:
+        manager = getattr(self, '_households', None)
+        if manager is None:
+            return 0.0
+        try:
+            return float(manager.global_pressure())
+        except Exception:
+            return 0.0
 
     def _adaptive_refine_fitness(self, fitnesses: List[float], fitness_fn: Callable[[Genome], float]) -> List[float]:
         """上位個体にだけ backprop ステップを追加して再評価（軽量な二段評価）。"""
@@ -2863,6 +3488,250 @@ class ReproPlanaNEATPlus:
             except Exception:
                 pass
         return improved
+
+    def _apply_monodromy_pressure(
+        self,
+        fitnesses: Sequence[float],
+        baseline: Sequence[float],
+        signature_map: Dict[int, Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]]],
+        generation: int,
+        signature_counts: Optional[Dict[Any, int]]=None,
+    ) -> List[float]:
+        def _reset_snapshot() -> None:
+            self._monodromy_snapshot = {
+                'pressure_mean': 0.0,
+                'pressure_max': 0.0,
+                'active': 0,
+                'release': 0,
+                'relief_mean': 0.0,
+                'momentum_mean': 0.0,
+                'momentum_max': 0.0,
+                'diversity_mean': 0.0,
+                'diversity_max': 0.0,
+                'grace_mean': 0.0,
+                'noise_factor': 1.0,
+                'noise_kind': '',
+                'noise_focus': 0.0,
+                'noise_entropy': 0.0,
+            }
+
+        n = len(fitnesses)
+        if n == 0:
+            _reset_snapshot()
+            return list(fitnesses)
+        base = float(getattr(self, 'monodromy_pressure_base', 0.0))
+        rng = float(getattr(self, 'monodromy_pressure_range', 0.0))
+        if base <= 0.0 and rng <= 0.0:
+            _reset_snapshot()
+            return list(fitnesses)
+        try:
+            baseline_arr = np.asarray(baseline, dtype=float)
+        except Exception:
+            baseline_arr = np.array(list(map(float, baseline)), dtype=float)
+        if baseline_arr.size == 0:
+            _reset_snapshot()
+            return list(fitnesses)
+        overrides = getattr(self, 'monodromy_noise_style_overrides', None)
+        controller = getattr(self, 'spinor_controller', None)
+        env_obj = getattr(controller, 'env', None) if controller is not None else None
+        noise_kind = ''
+        noise_focus = 0.0
+        noise_entropy = 0.0
+        if env_obj is not None:
+            noise_kind = getattr(env_obj, 'noise_kind', '') or ''
+            noise_focus = float(getattr(env_obj, 'noise_focus', 0.0) or 0.0)
+            noise_entropy = float(getattr(env_obj, 'noise_entropy', 0.0) or 0.0)
+        else:
+            noise_kind = str(self.env.get('noise_kind', ''))
+            noise_focus = float(self.env.get('noise_focus', 0.0) or 0.0)
+            noise_entropy = float(self.env.get('noise_entropy', 0.0) or 0.0)
+        style = _resolve_noise_style(noise_kind, overrides)
+        noise_bias = float(style.get('bias', 0.0))
+        noise_weight = float(np.clip(getattr(self, 'monodromy_noise_weight', 0.0), 0.0, 2.0))
+        entropy_excess = max(0.0, float(noise_entropy) - float(noise_focus))
+        noise_factor = float(np.clip(1.0 + noise_weight * (noise_bias - 0.3 * entropy_excess), 0.2, 1.6))
+        self._monodromy_noise_tag = style.get('symbol', noise_kind or '')
+        if signature_counts is None:
+            signature_counts = Counter(signature_map.values()) if signature_map else Counter()
+        else:
+            signature_counts = Counter(signature_counts)
+        div_weight = float(np.clip(getattr(self, 'monodromy_diversity_weight', 0.0), 0.0, 2.0))
+        unique_relief = float(np.clip(getattr(self, 'monodromy_diversity_floor', 0.0), 0.0, 0.9))
+        grace_init = float(max(0.0, getattr(self, 'monodromy_diversity_grace', 0.0)))
+        grace_decay = float(np.clip(getattr(self, 'monodromy_diversity_grace_decay', 0.0), 0.05, 0.99))
+        grace_strength = float(np.clip(getattr(self, 'monodromy_diversity_grace_strength', 0.0), 0.0, 1.0))
+        try:
+            top_ratio = float(getattr(self, 'monodromy_top_ratio', 0.1))
+        except Exception:
+            top_ratio = 0.1
+        top_k = max(1, min(n, int(round(top_ratio * n))))
+        if top_k >= n:
+            order = np.argsort(baseline_arr)[::-1]
+        else:
+            partition = np.argpartition(baseline_arr, -top_k)[-top_k:]
+            order = partition[np.argsort(baseline_arr[partition])[::-1]]
+        top_indices = [int(i) for i in order[:top_k]]
+        if not top_indices:
+            _reset_snapshot()
+            return list(fitnesses)
+        median = float(np.median(baseline_arr))
+        best_val = float(baseline_arr[order[0]]) if order.size else median
+        span_scale = abs(best_val - median)
+        if not math.isfinite(span_scale) or span_scale < 1e-6:
+            span_scale = max(1e-6, abs(best_val) if math.isfinite(best_val) else 1.0)
+        phase_step = float(getattr(self, 'monodromy_phase_step', 0.38196601125))
+        smoothing = float(np.clip(getattr(self, 'monodromy_smoothing', 0.4), 0.0, 1.0))
+        span = float(max(1.0, getattr(self, 'monodromy_span', 4.0)))
+        decay = float(np.clip(getattr(self, 'monodromy_decay', 0.5), 0.0, 1.0))
+        release = float(np.clip(getattr(self, 'monodromy_release', 0.35), 0.0, 1.0))
+        cap = float(max(0.0, getattr(self, 'monodromy_penalty_cap', 1.0)))
+        momentum_decay = float(np.clip(getattr(self, 'monodromy_momentum_decay', 0.65), 0.0, 1.0))
+        growth_weight = float(np.clip(getattr(self, 'monodromy_growth_weight', 0.0), 0.0, 1.5))
+        slump_gain = float(np.clip(getattr(self, 'monodromy_slump_gain', 0.0), 0.0, 1.5))
+        fast_release = float(np.clip(getattr(self, 'monodromy_fast_release', 0.0), 0.0, 1.0))
+        registry = getattr(self, '_monodromy_registry', None)
+        if registry is None:
+            registry = {}
+            self._monodromy_registry = registry
+        adjusted = list(fitnesses)
+        seen: Set[int] = set()
+        total_penalty = 0.0
+        max_penalty = 0.0
+        release_count = 0
+        relief_total = 0.0
+        momentum_total = 0.0
+        momentum_max = 0.0
+        diversity_total = 0.0
+        diversity_max = 0.0
+        grace_total = 0.0
+        span_scale_safe = max(span_scale, 1e-6)
+        for idx in top_indices:
+            if idx < 0 or idx >= n:
+                continue
+            genome = self.population[idx]
+            gid = genome.id
+            state = registry.get(gid)
+            sig = signature_map.get(gid)
+            if state is None:
+                phase = float(self.rng.random())
+                state = {'phase': phase, 'stasis': 0.0, 'signature': sig, 'pressure': 0.0, 'momentum': 0.0, 'diversity_grace': grace_init}
+            phase = (float(state.get('phase', 0.0)) + phase_step) % 1.0
+            state['phase'] = phase
+            prev_sig = state.get('signature')
+            stasis = float(state.get('stasis', 0.0))
+            if sig is not None and prev_sig is not None and sig != prev_sig:
+                stasis = stasis * release
+                state['signature'] = sig
+                state['diversity_grace'] = grace_init
+                release_count += 1
+            elif sig is not None and prev_sig is None:
+                state['signature'] = sig
+                stasis += 1.0
+                state['diversity_grace'] = grace_init
+            else:
+                stasis += 1.0
+            current_fit = float(baseline_arr[idx])
+            prev_baseline = float(state.get('last_baseline', current_fit))
+            delta = current_fit - prev_baseline
+            state['last_baseline'] = current_fit
+            momentum = float(state.get('momentum', 0.0))
+            momentum = momentum * momentum_decay + delta * (1.0 - momentum_decay)
+            state['momentum'] = momentum
+            relief_gain = 0.0
+            if delta > 0.0 and fast_release > 0.0:
+                relief_gain = fast_release * math.tanh(delta / span_scale_safe)
+                stasis *= max(0.0, 1.0 - relief_gain)
+            elif delta < 0.0 and slump_gain > 0.0:
+                stasis += slump_gain * math.tanh(-delta / span_scale_safe)
+            state['stasis'] = stasis
+            crowd = 1
+            if sig is not None:
+                try:
+                    crowd = int(signature_counts.get(sig, 1))
+                except Exception:
+                    crowd = 1
+            crowd = max(1, crowd)
+            div_log = math.log1p(max(0.0, crowd - 1.0))
+            div_factor = (1.0 + div_weight * div_log) * max(0.1, 1.0 - unique_relief / max(1.0, float(crowd)))
+            state['diversity_factor'] = div_factor
+            state['diversity_crowd'] = float(crowd)
+            grace_val = float(state.get('diversity_grace', 0.0))
+            grace_factor = 1.0
+            if grace_val > 0.0:
+                grace_factor = max(0.2, 1.0 - grace_strength * min(1.0, grace_val))
+                grace_val *= grace_decay
+            state['diversity_grace'] = grace_val
+            envelope = min(1.0, stasis / span)
+            osc = 0.5 - 0.5 * math.cos(2.0 * math.pi * phase)
+            target = (base + rng * osc) * envelope
+            if growth_weight > 0.0:
+                grow = math.tanh(max(0.0, momentum) / span_scale_safe)
+                target *= max(0.0, 1.0 - growth_weight * grow)
+            if slump_gain > 0.0:
+                slump = math.tanh(max(0.0, -momentum) / span_scale_safe)
+                target *= 1.0 + slump_gain * slump
+            if relief_gain > 0.0:
+                target *= max(0.0, 1.0 - relief_gain)
+            target *= div_factor
+            target *= grace_factor
+            target *= noise_factor
+            pressure_prev = float(state.get('pressure', 0.0))
+            pressure = pressure_prev * (1.0 - smoothing) + target * smoothing
+            state['pressure'] = pressure
+            penalty = min(cap * span_scale, pressure * span_scale)
+            if penalty > 0.0 and math.isfinite(penalty):
+                adjusted[idx] = float(adjusted[idx] - penalty)
+                total_penalty += penalty
+                if penalty > max_penalty:
+                    max_penalty = penalty
+                state['last_penalty'] = penalty
+            state['last_seen'] = int(generation)
+            registry[gid] = state
+            seen.add(gid)
+            relief_total += relief_gain
+            momentum_total += momentum
+            if abs(momentum) > momentum_max:
+                momentum_max = abs(momentum)
+            diversity_total += float(div_factor)
+            if div_factor > diversity_max:
+                diversity_max = float(div_factor)
+            grace_total += float(grace_factor)
+        if registry:
+            to_remove = []
+            for gid, state in list(registry.items()):
+                if gid in seen:
+                    continue
+                state['stasis'] = float(state.get('stasis', 0.0)) * decay
+                state['pressure'] = float(state.get('pressure', 0.0)) * decay
+                state['momentum'] = float(state.get('momentum', 0.0)) * decay
+                state['diversity_grace'] = float(state.get('diversity_grace', 0.0)) * grace_decay
+                if state.get('stasis', 0.0) < 0.05:
+                    to_remove.append(gid)
+                else:
+                    registry[gid] = state
+            for gid in to_remove:
+                registry.pop(gid, None)
+        active = len(seen)
+        mean_penalty = float(total_penalty / max(1, active)) if active else 0.0
+        relief_mean = float(relief_total / max(1, active)) if active else 0.0
+        momentum_mean = float(momentum_total / max(1, active)) if active else 0.0
+        self._monodromy_snapshot = {
+            'pressure_mean': mean_penalty,
+            'pressure_max': float(max_penalty),
+            'active': int(active),
+            'release': int(release_count),
+            'relief_mean': relief_mean,
+            'momentum_mean': momentum_mean,
+            'momentum_max': float(momentum_max),
+            'diversity_mean': float(diversity_total / max(1, active)) if active else 0.0,
+            'diversity_max': float(diversity_max),
+            'grace_mean': float(grace_total / max(1, active)) if active else 0.0,
+            'noise_factor': float(noise_factor),
+            'noise_kind': style.get('symbol', noise_kind or ''),
+            'noise_focus': float(noise_focus),
+            'noise_entropy': float(noise_entropy),
+        }
+        return adjusted
 
     def evolve(self, fitness_fn: Callable[[Genome], float], n_generations=100, target_fitness=None, verbose=True, env_schedule=None):
         history = []
@@ -2900,6 +3769,19 @@ class ReproPlanaNEATPlus:
                     except Exception:
                         pass
                 raw = self._evaluate_population(fitness_fn)
+                adjustments: Dict[int, float] = {}
+                manager = getattr(self, '_households', None)
+                if manager is not None:
+                    try:
+                        manager.update(self.population, raw, float(self.env.get('difficulty', 0.0)))
+                        adjustments = manager.environment_adjustments(self.population, raw, self.env)
+                    except Exception as _hm_err:
+                        if getattr(self, 'debug_households', False):
+                            print(f"[WARN] household manager failed: {_hm_err}")
+                        adjustments = {}
+                self._last_household_adjustments = dict(adjustments)
+                if adjustments:
+                    raw = [float(r + adjustments.get(g.id, 0.0)) for g, r in zip(self.population, raw)]
                 signature_map: Dict[int, Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]]] = {}
                 signature_counts: Dict[Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]], int] = {}
                 complexity_stats: Dict[int, Tuple[int, int, float, float, float]] = {}
@@ -2979,13 +3861,26 @@ class ReproPlanaNEATPlus:
                     if not np.isfinite(f2):
                         f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
                     fitnesses.append(f2)
+                baseline_fitnesses = list(fitnesses)
                 try:
                     fitnesses = self._adaptive_refine_fitness(fitnesses, fitness_fn)
                 except Exception:
                     pass
+                try:
+                    fitnesses = self._apply_monodromy_pressure(fitnesses, baseline_fitnesses, signature_map, gen, signature_counts=signature_counts)
+                except Exception as _mono_err:
+                    if getattr(self, 'debug_monodromy', False):
+                        print('[WARN] monodromy pressure skipped:', _mono_err)
                 best_idx = int(np.argmax(fitnesses))
                 best_fit = float(fitnesses[best_idx])
                 avg_fit = float(np.mean(fitnesses))
+                raw_best = float(np.max(baseline_fitnesses)) if baseline_fitnesses else best_fit
+                raw_avg = float(np.mean(baseline_fitnesses)) if baseline_fitnesses else avg_fit
+                self.raw_best_history.append((raw_best, raw_avg))
+                self._update_lazy_feedback(gen, fitnesses, best_idx, best_fit, avg_fit)
+                context_best = self._contextual_best_axis(best_fit, avg_fit)
+                history.append((context_best, avg_fit))
+                self.context_best_history.append((context_best, avg_fit))
 
                 def genome_complexity(g):
                     n_hidden = sum((1 for n in g.nodes.values() if n.type == 'hidden'))
@@ -3028,7 +3923,6 @@ class ReproPlanaNEATPlus:
                     prev_best = curr_best
                 except Exception:
                     pass
-                history.append((best_fit, avg_fit))
                 self.best_ids.append(self.population[best_idx].id)
                 try:
                     self.hidden_counts_history.append([sum((1 for n in g.nodes.values() if n.type == 'hidden')) for g in self.population])
@@ -3045,9 +3939,21 @@ class ReproPlanaNEATPlus:
                     if len(top3_best) >= 3:
                         complexities = [(sum((1 for n in g.nodes.values() if n.type == 'hidden')), sum((1 for c in g.connections.values() if c.enabled))) for g, _, _ in top3_best]
                         top3_str = f' | top3: [{complexities[0][0]}n,{complexities[0][1]}e] [{complexities[1][0]}n,{complexities[1][1]}e] [{complexities[2][0]}n,{complexities[2][1]}e]'
-                    print(f"Gen {gen:3d} | best {best_fit:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}")
-                if best_fit > best_ever_fit:
-                    best_ever_fit = best_fit
+                    mono = getattr(self, '_monodromy_snapshot', None)
+                    mono_str = ''
+                    if mono and mono.get('active'):
+                        mono_str = (
+                            f" | mono {mono.get('pressure_mean', 0.0):.3f}/{mono.get('pressure_max', 0.0):.3f}"
+                            f"~{int(mono.get('release', 0))}"
+                            f" Δ{mono.get('relief_mean', 0.0):.3f} μ{mono.get('momentum_mean', 0.0):.3f}"
+                            f" div{mono.get('diversity_mean', 0.0):.2f} gr{mono.get('grace_mean', 0.0):.2f} nf{mono.get('noise_factor', 1.0):.2f}"
+                        )
+                        nk = mono.get('noise_kind')
+                        if nk:
+                            mono_str = f"{mono_str} {nk}"
+                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}")
+                if context_best > best_ever_fit:
+                    best_ever_fit = context_best
                     best_ever = self.population[best_idx].copy()
                 if target_fitness is not None and best_fit >= target_fitness:
                     self._resilience_eval_guard = 0
@@ -3055,7 +3961,7 @@ class ReproPlanaNEATPlus:
                     break
                 species = self.speciate(fitnesses)
                 try:
-                    self._learn_species_target(len(species), best_fit, gen)
+                    self._learn_species_target(len(species), context_best, gen)
                 except Exception as _spe:
                     print('[WARN] species target learning skipped:', _spe)
                 self._adapt_compat_threshold(len(species))
@@ -3093,6 +3999,7 @@ class ReproPlanaNEATPlus:
             self._close_pool()
         except Exception:
             pass
+        self._best_context_value = float(best_ever_fit)
         return (best_ever, history)
 
 def act_forward(name, x):
@@ -3121,10 +4028,31 @@ def act_deriv(name, x):
     return 1.0 - y * y
 
 def compile_genome(g: Genome):
+    rev = (getattr(g, '_structure_rev', -1), getattr(g, '_weights_rev', -1))
+    cached = getattr(g, '_compiled_cache', None)
+    cached_rev = getattr(g, '_compiled_cache_rev', (-1, -1))
+    if cached is not None and cached_rev == rev:
+        return cached
     order = g.topological_order()
     idx_of = {nid: i for i, nid in enumerate(order)}
     types = [g.nodes[n].type for n in order]
     acts = [g.nodes[n].activation for n in order]
+    node_sensitivity = np.array(
+        [float(getattr(g.nodes[n], 'backprop_sensitivity', 1.0)) for n in order],
+        dtype=np.float64,
+    )
+    node_jitter = np.array(
+        [float(np.clip(getattr(g.nodes[n], 'sensitivity_jitter', 0.0), -0.25, 0.25)) for n in order],
+        dtype=np.float64,
+    )
+    node_momentum = np.array(
+        [float(getattr(g.nodes[n], 'sensitivity_momentum', 0.0)) for n in order],
+        dtype=np.float64,
+    )
+    node_variance = np.array(
+        [float(max(0.0, getattr(g.nodes[n], 'sensitivity_variance', 0.0))) for n in order],
+        dtype=np.float64,
+    )
     in_ids = [nid for nid in order if g.nodes[nid].type == 'input']
     bias_ids = [nid for nid in order if g.nodes[nid].type == 'bias']
     out_ids = [nid for nid in order if g.nodes[nid].type == 'output']
@@ -3139,7 +4067,31 @@ def compile_genome(g: Genome):
     for e, (s, d) in enumerate(zip(src, dst)):
         in_edges[d].append(e)
         out_edges[s].append(e)
-    return {'order': order, 'idx_of': idx_of, 'types': types, 'acts': acts, 'inputs': [idx_of[i] for i in sorted(in_ids)], 'biases': [idx_of[i] for i in bias_ids], 'outputs': [idx_of[i] for i in sorted(out_ids)], 'src': src, 'dst': dst, 'w': w, 'eid': eid, 'in_edges': in_edges, 'out_edges': out_edges}
+    compiled = {
+        'order': order,
+        'idx_of': idx_of,
+        'types': types,
+        'acts': acts,
+        'inputs': [idx_of[i] for i in sorted(in_ids)],
+        'biases': [idx_of[i] for i in bias_ids],
+        'outputs': [idx_of[i] for i in sorted(out_ids)],
+        'src': src,
+        'dst': dst,
+        'w': w,
+        'eid': eid,
+        'in_edges': in_edges,
+        'out_edges': out_edges,
+        'node_sensitivity': node_sensitivity,
+        'node_jitter': node_jitter,
+        'node_momentum': node_momentum,
+        'node_variance': node_variance,
+    }
+    try:
+        g._compiled_cache = compiled
+        g._compiled_cache_rev = rev
+    except Exception:
+        pass
+    return compiled
 
 def forward_batch(comp, X, w=None):
     if w is None:
@@ -3217,21 +4169,59 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
     grad_w = _np.zeros_like(w)
     delta_z = _np.zeros((B, n), dtype=_np.float64)
     delta_a = _np.zeros((B, n), dtype=_np.float64)
+    node_scale = comp.get('node_sensitivity')
+    if node_scale is None or getattr(node_scale, 'shape', (0,))[0] != n:
+        node_scale = _np.ones(n, dtype=_np.float64)
+    else:
+        node_scale = _np.clip(_np.asarray(node_scale, dtype=_np.float64), 0.2, 5.0)
+    node_jitter = comp.get('node_jitter')
+    if node_jitter is None or getattr(node_jitter, 'shape', (0,))[0] != n:
+        node_jitter = _np.zeros(n, dtype=_np.float64)
+    else:
+        node_jitter = _np.clip(_np.asarray(node_jitter, dtype=_np.float64), -0.3, 0.3)
+    node_momentum = comp.get('node_momentum')
+    if node_momentum is None or getattr(node_momentum, 'shape', (0,))[0] != n:
+        node_momentum = _np.zeros(n, dtype=_np.float64)
+    else:
+        node_momentum = _np.asarray(node_momentum, dtype=_np.float64)
+    node_variance = comp.get('node_variance')
+    if node_variance is None or getattr(node_variance, 'shape', (0,))[0] != n:
+        node_variance = _np.zeros(n, dtype=_np.float64)
+    else:
+        node_variance = _np.clip(_np.asarray(node_variance, dtype=_np.float64), 0.0, 5.0)
+    node_signal = _np.zeros(n, dtype=_np.float64)
+    node_push = _np.zeros(n, dtype=_np.float64)
     for j, oi in enumerate(comp['outputs']):
         delta_z[:, oi] = delta_out[:, j:j + 1].reshape(B)
     for j in reversed(range(n)):
         t = comp['types'][j]
-        if t == 'output':
-            dz = delta_z[:, j]
-        elif t in ('input', 'bias'):
+        if t in ('input', 'bias'):
             continue
+        if t == 'output':
+            dz_raw = delta_z[:, j]
         else:
-            dz = delta_a[:, j] * act_deriv(comp['acts'][j], Z[:, j])
-            delta_z[:, j] = dz
+            dz_raw = delta_a[:, j] * act_deriv(comp['acts'][j], Z[:, j])
+        dest_mom = float(node_momentum[j])
+        dest_var = float(node_variance[j])
+        dest_scale = float(node_scale[j]) * (1.0 + 0.04 * _np.tanh(dest_mom))
+        dest_jitter = 1.0 + 0.05 * float(node_jitter[j]) + 0.03 * _np.tanh(dest_var)
+        dest_mix = dest_scale * dest_jitter
+        dz = dz_raw * dest_mix
+        delta_z[:, j] = dz
+        node_signal[j] += float(_np.mean(_np.abs(dz))) * (1.0 + 0.1 * _np.tanh(dest_var))
         for e in comp['in_edges'][j]:
             s = comp['src'][e]
-            grad_w[e] += _np.dot(A[:, s], dz)
-            delta_a[:, s] += dz * w[e]
+            src_mom = float(node_momentum[s])
+            src_var = float(node_variance[s])
+            src_scale = float(node_scale[s]) * (1.0 + 0.04 * _np.tanh(src_mom))
+            src_jitter = 1.0 + 0.05 * float(node_jitter[s]) + 0.03 * _np.tanh(src_var)
+            src_mix = src_scale * src_jitter
+            edge_scale = 0.5 * (dest_mix + src_mix)
+            contrib = _np.dot(A[:, s], dz)
+            grad_w[e] += edge_scale * contrib
+            flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom)
+            node_push[s] += float(_np.mean(_np.abs(dz * w[e]))) * edge_scale * flow_bias
+            delta_a[:, s] += dz * w[e] * src_mix
     grad_w = grad_w / max(1, B) + l2 * w
     if not _np.all(_np.isfinite(grad_w)):
         grad_w = _np.nan_to_num(grad_w, nan=0.0, posinf=0.0, neginf=0.0)
@@ -3242,9 +4232,22 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
     w_new = w - float(lr) * grad_w
     if w_clip and w_clip > 0:
         _np.clip(w_new, -float(w_clip), float(w_clip), out=w_new)
-    return (w_new, float(loss))
+    profile = node_signal + 0.5 * node_push
+    profile = _np.nan_to_num(profile, nan=0.0, posinf=0.0, neginf=0.0)
+    return (w_new, float(loss), profile)
 
-def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=0.01, l2=0.0001, grad_clip=5.0, w_clip=12.0):
+def train_with_backprop_numpy(
+    genome: Genome,
+    X,
+    y,
+    steps=50,
+    lr=0.01,
+    l2=0.0001,
+    grad_clip=5.0,
+    w_clip=12.0,
+    profile_out: Optional[Dict[str, Any]]=None,
+    rng: Optional[np.random.Generator]=None,
+):
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
     np.nan_to_num(X, copy=False)
@@ -3252,15 +4255,100 @@ def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=0.01, l2=0.0001
     comp = compile_genome(genome)
     w = comp['w'].copy()
     history = []
+    node_profile_accum = np.zeros(len(comp['order']), dtype=np.float64)
+    node_profile_sumsq = np.zeros(len(comp['order']), dtype=np.float64)
+    step_profiles: List[np.ndarray] = [] if profile_out is not None else []
+    if profile_out is not None:
+        profile_out.clear()
+        profile_out['node_order'] = list(comp['order'])
+        profile_out['node_types'] = list(comp['types'])
+        init_sens = [float(getattr(genome.nodes[nid], 'backprop_sensitivity', 1.0)) for nid in comp['order']]
+        init_jit = [float(getattr(genome.nodes[nid], 'sensitivity_jitter', 0.0)) for nid in comp['order']]
+        init_mom = [float(getattr(genome.nodes[nid], 'sensitivity_momentum', 0.0)) for nid in comp['order']]
+        init_var = [float(getattr(genome.nodes[nid], 'sensitivity_variance', 0.0)) for nid in comp['order']]
+        profile_out['initial_sensitivity'] = np.asarray(init_sens, dtype=np.float64)
+        profile_out['initial_jitter'] = np.asarray(init_jit, dtype=np.float64)
+        profile_out['initial_momentum'] = np.asarray(init_mom, dtype=np.float64)
+        profile_out['initial_variance'] = np.asarray(init_var, dtype=np.float64)
+    rng_local = rng or np.random.default_rng()
     if w.size == 0:
         return history
     for _ in range(int(steps)):
-        w, L = backprop_step(comp, X, y, w, lr=lr, l2=l2)
+        w, L, profile = backprop_step(comp, X, y, w, lr=lr, l2=l2)
         if not np.isfinite(L):
             L = float(np.nan_to_num(L, nan=1000.0, posinf=1000.0, neginf=1000.0))
         history.append(L)
+        if profile is not None and profile.shape[0] == node_profile_accum.shape[0]:
+            node_profile_accum += profile
+            node_profile_sumsq += profile * profile
+            if profile_out is not None:
+                step_profiles.append(np.asarray(profile, dtype=np.float64))
     for e_idx, inn in enumerate(comp['eid']):
         genome.connections[inn].weight = float(w[e_idx])
+    if node_profile_accum.size:
+        avg_profile = node_profile_accum / max(1, float(steps))
+        mean_sq = node_profile_sumsq / max(1, float(steps))
+        var_profile = np.maximum(0.0, mean_sq - avg_profile ** 2)
+        global_mean = float(np.mean(avg_profile)) if avg_profile.size else 0.0
+        global_rms = float(np.sqrt(np.maximum(1e-09, np.mean(var_profile)))) if var_profile.size else 0.0
+        for idx, nid in enumerate(comp['order']):
+            node = genome.nodes.get(nid)
+            if node is None:
+                continue
+            baseline = float(getattr(node, 'backprop_sensitivity', 1.0))
+            prev_momentum = float(getattr(node, 'sensitivity_momentum', 0.0))
+            prev_variance = float(getattr(node, 'sensitivity_variance', 0.0))
+            local = float(avg_profile[idx])
+            centered = local - global_mean
+            tone = float(np.tanh(centered / (global_rms + 1e-06))) if global_rms > 0 else float(np.tanh(centered))
+            target = 1.0 + 0.24 * float(np.tanh(local)) + 0.08 * tone
+            node.backprop_sensitivity = float(
+                np.clip(
+                    0.78 * baseline + 0.17 * target + 0.05 * (1.0 + np.tanh(prev_momentum)),
+                    0.2,
+                    5.0,
+                )
+            )
+            var_local = float(np.sqrt(float(var_profile[idx]))) if idx < var_profile.size else 0.0
+            node.sensitivity_momentum = float(
+                np.clip(0.62 * prev_momentum + 0.38 * tone, -1.5, 1.5)
+            )
+            node.sensitivity_variance = float(
+                np.clip(0.7 * prev_variance + 0.3 * var_local, 0.0, 3.0)
+            )
+            jitter_base = float(getattr(node, 'sensitivity_jitter', 0.0))
+            jitter_scale = 0.02 + 0.018 * float(np.clip(node.sensitivity_variance, 0.0, 3.0))
+            jitter_drive = 0.15 * node.sensitivity_momentum
+            jitter_target = float(np.clip(jitter_drive + rng_local.normal(0.0, jitter_scale), -0.3, 0.3))
+            node.sensitivity_jitter = float(np.clip(0.74 * jitter_base + 0.26 * jitter_target, -0.25, 0.25))
+        if profile_out is not None:
+            profile_out['avg_profile'] = np.asarray(avg_profile, dtype=np.float64)
+            profile_out['profile_var'] = np.asarray(var_profile, dtype=np.float64)
+            profile_out['final_sensitivity'] = np.asarray(
+                [float(getattr(genome.nodes[nid], 'backprop_sensitivity', 1.0)) for nid in comp['order']],
+                dtype=np.float64,
+            )
+            profile_out['final_jitter'] = np.asarray(
+                [float(getattr(genome.nodes[nid], 'sensitivity_jitter', 0.0)) for nid in comp['order']],
+                dtype=np.float64,
+            )
+            profile_out['final_momentum'] = np.asarray(
+                [float(getattr(genome.nodes[nid], 'sensitivity_momentum', 0.0)) for nid in comp['order']],
+                dtype=np.float64,
+            )
+            profile_out['final_variance'] = np.asarray(
+                [float(getattr(genome.nodes[nid], 'sensitivity_variance', 0.0)) for nid in comp['order']],
+                dtype=np.float64,
+            )
+            if step_profiles:
+                profile_out['step_profiles'] = np.stack(step_profiles, axis=0)
+            else:
+                profile_out['step_profiles'] = np.zeros((0, len(comp['order'])), dtype=np.float64)
+            profile_out['loss_history'] = np.asarray(history, dtype=np.float64)
+    try:
+        genome.invalidate_caches(weights=True)
+    except Exception:
+        pass
     return history
 
 def predict_proba(genome: Genome, X):
@@ -3455,7 +4543,7 @@ def draw_genome_png(genome: Genome, scars: Optional[Dict[int, 'Scar']], path: st
     ax.set_aspect('equal', adjustable='box')
     ax.axis('off')
     fig.tight_layout()
-    fig.savefig(path, dpi=200)
+    _savefig(fig, path, dpi=200)
     plt.close(fig)
 
 def _normalize_scar_snapshot(entry: Optional[Dict[Any, Any]]) -> Tuple[Dict[int, int], Dict[Tuple[int, int], int]]:
@@ -3679,7 +4767,7 @@ def export_double_exposure(genome: Genome, lineage_edges: List[Tuple[Optional[in
     if title:
         ax.set_title(title)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=220)
+    _savefig(fig, out_path, dpi=220)
     plt.close(fig)
 
 def _infer_generations(lineage_edges: Iterable[Tuple[Optional[int], Optional[int], int, int, str]]):
@@ -3726,6 +4814,47 @@ def _fallback_lineage_layout(nodes: List[int], gen_map: Dict[int, int]):
         if n not in pos:
             pos[n] = (0.5, 0.5)
     return pos
+
+def _summarize_lineage_rows(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return ''
+    parts: List[str] = []
+    changed_nodes = rows[0].get('changed_nodes', 0)
+    changed_edges = rows[0].get('changed_edges', 0)
+    if changed_nodes:
+        parts.append(f'ΔN={changed_nodes}')
+    if changed_edges:
+        parts.append(f'ΔE={changed_edges}')
+    delta_paths = sum(int(row.get('delta_paths', 0) or 0) for row in rows)
+    if delta_paths:
+        parts.append(f'ΔP={delta_paths:+d}')
+    detours = [float(row['detour']) for row in rows if isinstance(row.get('detour'), (int, float))]
+    if detours:
+        parts.append(f'↺{float(np.mean(detours)):+.2f}')
+    if any(int(row.get('heal_flag', 0)) for row in rows):
+        parts.append('heal')
+    return ' '.join(parts)
+
+def _merge_meta_summary(genome: Genome, summary: str='') -> str:
+    latest = None
+    meta = getattr(genome, 'meta_reflections', None)
+    if meta:
+        latest = meta[-1]
+    if not latest:
+        return summary
+    event = latest.get('event', '')
+    delta = latest.get('delta_score')
+    if event == 'mutate_weights':
+        mean_delta = latest.get('mean_abs_delta')
+        desc = f'{event}' + (f' μΔw={mean_delta:.3f}' if isinstance(mean_delta, (int, float)) else '')
+    else:
+        if isinstance(delta, (int, float)):
+            desc = f'{event} ΔC={delta:+.2f}'
+        else:
+            desc = event
+    if summary and desc:
+        return f'{summary} || {desc}'
+    return desc or summary
 
 def render_lineage(neat, path='lineage.png', title='Lineage', max_edges: Optional[int]=10000, highlight: Optional[Iterable[int]]=None, dpi=200):
     edges = getattr(neat, 'lineage_edges', None)
@@ -3813,8 +4942,19 @@ def render_lineage(neat, path='lineage.png', title='Lineage', max_edges: Optiona
     if len(nodes) <= 1200:
         for nid, (x, y) in pos.items():
             ax.text(x, y + 0.02, str(nid), fontsize=6, ha='center', va='bottom', alpha=0.9)
+    annotations: Dict[int, List[Tuple[int, str]]] = getattr(neat, 'lineage_annotations', {}) or {}
+    if annotations:
+        for nid, (x, y) in pos.items():
+            notes = annotations.get(nid)
+            if not notes:
+                continue
+            snippet = notes[-3:]
+            text = '\n'.join(f'g{gen}: {msg}' for gen, msg in snippet if msg)
+            if not text:
+                continue
+            ax.text(x + 0.012, y - 0.05, text, fontsize=5.5, ha='left', va='top', alpha=0.85, family='monospace')
     fig.tight_layout()
-    fig.savefig(path, dpi=dpi)
+    _savefig(fig, path, dpi=dpi)
     plt.close(fig)
 
 def _moving_stats(arr: List[float], window: int):
@@ -3855,7 +4995,7 @@ def plot_learning_and_complexity(history: List[Tuple[float, float]], hidden_coun
     if title:
         ax1.set_title(title)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=200)
+    _savefig(fig, out_path, dpi=200)
     plt.close(fig)
 
 def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, contour_cmap: str='coolwarm', point_cmap: Optional[str]=None, point_size: float=12.0, point_alpha: float=0.85, add_colorbar: bool=False):
@@ -3881,8 +5021,112 @@ def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, c
     ax.set_xlabel('x')
     ax.set_ylabel('y')
     fig.tight_layout()
-    fig.savefig(out_path, dpi=220)
+    _savefig(fig, out_path, dpi=220)
     plt.close(fig)
+
+def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    gg = genome.copy()
+    profile: Dict[str, Any] = {}
+    history = train_with_backprop_numpy(gg, X, y, steps=steps, lr=lr, l2=l2, profile_out=profile)
+    loss = np.asarray(history, dtype=np.float64)
+    step_profiles = np.asarray(
+        profile.get('step_profiles', np.zeros((0, len(profile.get('node_order', []))), dtype=np.float64)),
+        dtype=np.float64,
+    )
+    if step_profiles.ndim != 2 or step_profiles.shape[0] == 0:
+        step_profiles = None
+    node_order = profile.get('node_order', [])
+    node_types = profile.get('node_types', [])
+    labels = []
+    for nid, t in zip(node_order, node_types):
+        prefix = (t[0].upper() + ':') if t else 'N:'
+        labels.append(f'{prefix}{nid}')
+    initial_sens = np.asarray(profile.get('initial_sensitivity', []), dtype=np.float64)
+    final_sens = np.asarray(profile.get('final_sensitivity', []), dtype=np.float64)
+    final_momentum = np.asarray(profile.get('final_momentum', []), dtype=np.float64)
+    final_variance = np.asarray(profile.get('final_variance', []), dtype=np.float64)
+    final_jitter = np.asarray(profile.get('final_jitter', []), dtype=np.float64)
+    idx_pool = [i for i, t in enumerate(node_types) if t == 'hidden']
+    if not idx_pool:
+        idx_pool = list(range(len(labels)))
+    delta = final_sens - initial_sens if initial_sens.size and final_sens.size else np.zeros(len(labels), dtype=np.float64)
+    order_idx = sorted(idx_pool, key=lambda i: abs(delta[i]) if i < delta.size else 0.0, reverse=True)
+    if len(order_idx) > 10:
+        order_idx = order_idx[:10]
+    scatter_idx = sorted(idx_pool, key=lambda i: (final_variance[i] if i < final_variance.size else 0.0) + 0.25 * abs(final_momentum[i] if i < final_momentum.size else 0.0), reverse=True)
+    if len(scatter_idx) > 12:
+        scatter_idx = scatter_idx[:12]
+    fig = plt.figure(figsize=(10.5, 6.2))
+    gs = _gridspec.GridSpec(2, 2, height_ratios=[1.7, 1.0], width_ratios=[1.0, 1.0], hspace=0.32, wspace=0.28)
+    ax_top = fig.add_subplot(gs[0, :])
+    steps_axis = np.arange(1, loss.size + 1, dtype=np.float64) if loss.size else np.arange(1, steps + 1, dtype=np.float64)
+    handles = []
+    labels_legend = []
+    if step_profiles is not None:
+        mean_profile = step_profiles.mean(axis=1)
+        std_profile = step_profiles.std(axis=1)
+        mp = mean_profile[:steps_axis.size]
+        sp = std_profile[:steps_axis.size]
+        ax_top.fill_between(steps_axis[:mp.size], mp - sp[:mp.size], mp + sp[:mp.size], color='#8ecae6', alpha=0.35, label='pulse ±σ')
+        line_mp, = ax_top.plot(steps_axis[:mp.size], mp, color='#219ebc', lw=2.0, label='pulse mean')
+        handles.append(line_mp)
+        labels_legend.append('pulse mean')
+    if loss.size:
+        ax_loss = ax_top.twinx()
+        line_loss, = ax_loss.plot(steps_axis[:loss.size], loss, color='#f07167', lw=1.8, label='loss')
+        ax_loss.set_ylabel('loss', color='#f07167')
+        ax_loss.tick_params(axis='y', colors='#f07167')
+        handles.append(line_loss)
+        labels_legend.append('loss')
+    ax_top.set_xlabel('backprop step')
+    ax_top.set_ylabel('pulse magnitude')
+    ax_top.set_title('Backprop pulse landscape')
+    if handles:
+        ax_top.legend(handles, labels_legend, loc='upper right', frameon=False, fontsize=9)
+    ax_left = fig.add_subplot(gs[1, 0])
+    if order_idx and initial_sens.size and final_sens.size:
+        y_pos = np.arange(len(order_idx))
+        init_vals = initial_sens[order_idx]
+        final_vals = final_sens[order_idx]
+        delta_vals = final_vals - init_vals
+        ax_left.barh(y_pos - 0.18, init_vals, height=0.3, color='#c1d3fe', alpha=0.75, label='initial')
+        ax_left.barh(y_pos + 0.18, final_vals, height=0.3, color='#5e60ce', alpha=0.9, label='post-train')
+        ax_left.axvline(1.0, color='#333333', lw=0.8, ls='--', alpha=0.6)
+        for k, idx in enumerate(order_idx):
+            lbl = labels[idx] if idx < len(labels) else f'n{idx}'
+            ax_left.text(final_vals[k] + 0.04, y_pos[k] + 0.2, f'Δ{delta_vals[k]:+.2f}', fontsize=8, color='#333333')
+        ax_left.set_yticks(y_pos)
+        ax_left.set_yticklabels([labels[idx] if idx < len(labels) else f'n{idx}' for idx in order_idx])
+        ax_left.set_xlabel('sensitivity')
+        ax_left.set_title('Hidden node sensitivity drift')
+        ax_left.legend(frameon=False, fontsize=8, loc='lower right')
+    else:
+        ax_left.text(0.5, 0.5, 'No hidden nodes tracked', ha='center', va='center', fontsize=10)
+        ax_left.set_axis_off()
+    ax_right = fig.add_subplot(gs[1, 1])
+    if scatter_idx and final_momentum.size and final_variance.size:
+        mom_vals = final_momentum[scatter_idx]
+        var_vals = final_variance[scatter_idx]
+        jit_vals = final_jitter[scatter_idx] if final_jitter.size else np.zeros_like(mom_vals)
+        sc = ax_right.scatter(mom_vals, var_vals, c=jit_vals, cmap='coolwarm', s=60, edgecolors='k', linewidths=0.35)
+        for k, idx in enumerate(scatter_idx):
+            lbl = labels[idx] if idx < len(labels) else f'n{idx}'
+            ax_right.text(mom_vals[k] + 0.02, var_vals[k] + 0.02, lbl, fontsize=8)
+        ax_right.set_xlabel('momentum (smoothed)')
+        ax_right.set_ylabel('variance trace')
+        ax_right.set_title('Post-train temperament field')
+        if len(scatter_idx) >= 3:
+            cb = fig.colorbar(sc, ax=ax_right, fraction=0.046, pad=0.04)
+            cb.set_label('jitter', fontsize=9)
+    else:
+        ax_right.text(0.5, 0.5, 'No temperament statistics', ha='center', va='center', fontsize=10)
+        ax_right.set_axis_off()
+    fig.suptitle(f'Backprop Variation | steps={steps}', fontsize=12)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    _savefig(fig, out_path, dpi=220)
+    plt.close(fig)
+    return {'figure': out_path, 'history': loss, 'profile': profile}
 
 def export_decision_boundaries_all(genome: Genome, out_dir: str, steps: int=50, seed: int=0):
     os.makedirs(out_dir or '.', exist_ok=True)
@@ -3913,7 +5157,7 @@ def compose_gallery_from_existing(result: Dict[str, str], out_dir: str, task: st
             ax.set_title(title, fontsize=11)
             ax.axis('off')
         fig.tight_layout()
-        fig.savefig(combo, dpi=220)
+        _savefig(fig, combo, dpi=220)
         plt.close(fig)
         outputs[f'{idx:02d} {task.upper()} 学習曲線＋決定境界'] = combo
     else:
@@ -3949,7 +5193,7 @@ def export_task_gallery(tasks: Tuple[str, ...], gens: int, pop: int, steps: int,
                 ax.set_title(f'{task.upper()} | {title}')
                 ax.axis('off')
             fig.tight_layout()
-            fig.savefig(combo, dpi=220)
+            _savefig(fig, combo, dpi=220)
             plt.close(fig)
             outputs[f'{idx:02d} {task.upper()} 学習曲線＋決定境界'] = combo
         else:
@@ -4147,6 +5391,13 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     topo_path = f'{out_prefix}_topology.png'
     scars = diff_scars(None, best, None, birth_gen=gens, regen_mode_for_new='split')
     draw_genome_png(best, scars, topo_path, title=f'Best Topology (Gen {gens})')
+    backprop_variation = None
+    bp_path = f'{out_prefix}_backprop_variation.png'
+    try:
+        backprop_variation = export_backprop_variation(best, Xtr, ytr, bp_path, steps=steps, lr=0.005, l2=0.0001)
+    except Exception as bp_err:
+        print('[WARN] Backprop variation export failed:', bp_err)
+        backprop_variation = None
     regen_gif = None
     morph_gif = None
     if make_gifs and len(neat.snapshots_genomes) >= 2:
@@ -4205,7 +5456,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         except Exception as log_err:
             print('[WARN] Resilience log write failed:', log_err)
             resilience_log = None
-    return {'learning_curve': lc_path, 'decision_boundary': db_path, 'topology': topo_path, 'top3_topologies': top3_paths, 'regen_gif': regen_gif, 'morph_gif': morph_gif, 'lineage': lineage_path, 'scars_spiral': scars_spiral, 'summary_decisions': summary_paths, 'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None, 'lcs_ribbon': lcs_ribbon, 'lcs_timeline': lcs_timeline, 'history': hist, 'genomes_cyto': genomes_cyto, 'resilience_log': resilience_log}
+    return {'learning_curve': lc_path, 'decision_boundary': db_path, 'topology': topo_path, 'top3_topologies': top3_paths, 'regen_gif': regen_gif, 'morph_gif': morph_gif, 'lineage': lineage_path, 'scars_spiral': scars_spiral, 'summary_decisions': summary_paths, 'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None, 'lcs_ribbon': lcs_ribbon, 'lcs_timeline': lcs_timeline, 'history': hist, 'genomes_cyto': genomes_cyto, 'resilience_log': resilience_log, 'backprop_variation': backprop_variation}
 
 def _fig_to_rgb(fig):
     """
@@ -4227,6 +5478,7 @@ def _fig_to_rgb(fig):
         return buf[:, :, 1:4].copy()
     import io
     bio = io.BytesIO()
+    _stamp_figure(fig)
     fig.savefig(bio, format='png', dpi=fig.dpi, bbox_inches='tight', pad_inches=0.0)
     bio.seek(0)
     img = _imread_image(bio)
@@ -4634,7 +5886,7 @@ def export_scars_spiral_map(snapshots_genomes: List[Genome], snapshots_scars: Li
     if any((xs[k] for k in xs)):
         ax.legend(loc='upper left', frameon=False, fontsize=9, handlelength=1.0)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=dpi)
+    _savefig(fig, out_path, dpi=dpi)
     _plt.close(fig)
     return out_path
 
@@ -4649,7 +5901,10 @@ def _import_gym():
     try:
         import gymnasium as gym
     except ImportError:
-        import gym
+        try:
+            import gym
+        except ImportError as exc:
+            raise ImportError('Gym/Gymnasium is not installed. RL機能は無効です。pip install gymnasium[toy_text] 等をお試しください。') from exc
     return gym
 
 def output_dim_from_space(space) -> int:
@@ -4736,9 +5991,192 @@ def build_action_mapper(space, stochastic=False, temp=1.0):
         return f
     raise ValueError(f'Unsupported action space: {type(space)}')
 
-def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]]=None) -> Dict[str, float]:
+def _cyclic_noise_profile(gen: float, ctx: Optional[Dict[str, Any]]=None) -> Tuple[float, str, Dict[str, Any]]:
+    """Compute a cyclical noise profile rotating through spectral archetypes.
+
+    The palette rotates through white noise, black noise, and rhythmic alpha/beta
+    waves. Each mode receives a smooth envelope with a deterministic micro-jitter
+    to keep the signal lively while remaining reproducible.
+    """
+
+    cfg = ctx or {}
+    palette = tuple(cfg.get('palette', ('white', 'alpha', 'beta', 'black')))
+    if not palette:
+        palette = ('white',)
+    stage_len = max(1, int(cfg.get('stage_len', 12)))
+    jitter_amp = float(cfg.get('jitter_amp', 0.0025))
+    base_levels = cfg.get('base_levels')
+    if not base_levels:
+        base_levels = {
+            'white': (0.018, 0.008),
+            'alpha': (0.021, 0.009),
+            'beta': (0.024, 0.011),
+            'black': (0.028, 0.013),
+        }
+    min_std = float(cfg.get('min_std', 0.006))
+    max_std = float(cfg.get('max_std', 0.08))
+    cycle_len = stage_len * len(palette)
+    phase = float(gen) % max(1, cycle_len)
+    stage_idx = int(phase // stage_len) % len(palette)
+    local = (phase % stage_len) / stage_len
+    kind = palette[stage_idx]
+    base, swing = base_levels.get(kind, base_levels.get('white', (0.02, 0.01)))
+    envelope = 0.5 - 0.5 * math.cos(math.tau * local)
+    spectral_bias = 0.0
+    band_label = 'white'
+    wave_freq = None
+    if kind == 'white':
+        spectral_bias = 0.0
+        band_label = 'white'
+    elif kind == 'black':
+        spectral_bias = 2.4
+        band_label = 'black'
+        envelope = envelope ** 1.6
+    elif kind == 'alpha':
+        spectral_bias = 0.7
+        band_label = 'alpha'
+        envelope = 0.5 + 0.5 * math.sin(math.tau * local)
+        wave_freq = 10.0 + 2.5 * math.sin(math.tau * (local + 0.25))
+    elif kind == 'beta':
+        spectral_bias = 0.9
+        band_label = 'beta'
+        envelope = 0.5 + 0.5 * math.cos(math.tau * (local + 0.25))
+        wave_freq = 18.0 + 5.0 * math.sin(math.tau * (local + 0.5))
+    drift = swing * envelope
+    jitter = jitter_amp * (
+        math.sin(0.61 * float(gen)) + 0.5 * math.cos(1.37 * float(gen) + stage_idx)
+    )
+    if kind == 'black':
+        jitter *= 1.3
+    std = float(np.clip(base + drift + jitter, min_std, max_std))
+    profile: Dict[str, Any] = {
+        'cycle_index': float(stage_idx),
+        'cycle_phase': float(local),
+        'envelope': float(envelope),
+        'jitter': float(jitter),
+        'spectral_bias': float(spectral_bias),
+    }
+    if wave_freq is not None:
+        profile['wave_freq_hz'] = float(wave_freq)
+        profile['wave_phase'] = float((phase % stage_len) / stage_len)
+    profile['band_label'] = band_label
+    profile['base_level'] = float(base)
+    profile['swing'] = float(swing)
+    return (std, kind, profile)
+
+
+@dataclass
+class SpectralNoiseWeaver:
+    """Blend spectral noise archetypes into resonant mixtures.
+
+    Keeps a tempered distribution over the palette so the environment cycles
+    through dominant modes without erasing supporting harmonics. By smoothing
+    transitions and preserving cross-mode energy, evaluator populations perceive
+    organic fluctuations rather than abrupt jumps.
+    """
+
+    palette: Tuple[str, ...] = ('white', 'alpha', 'beta', 'black')
+    blend_inertia: float = 0.65
+    std_inertia: float = 0.55
+    focus_base: float = 0.58
+    focus_surge_bonus: float = 0.18
+    jitter_std: float = 0.025
+    entropy_floor: float = 1e-05
+    seed: Optional[int] = None
+    _rng: np.random.Generator = field(init=False, repr=False)
+    _weights: Dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _last_std: float = field(default=0.05, init=False, repr=False)
+    _last_kind: str = field(default='white', init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._rng = np.random.default_rng(self.seed)
+
+    def _palette(self, ctx: Dict[str, Any]) -> Tuple[str, ...]:
+        palette = tuple(ctx.get('palette') or self.palette)
+        if not palette:
+            palette = self.palette or ('white',)
+        if not palette:
+            palette = ('white',)
+        return palette
+
+    def compose(
+        self,
+        counter: float,
+        base_std: float,
+        base_kind: str,
+        base_profile: Dict[str, Any],
+        *,
+        ctx: Dict[str, Any],
+    ) -> Tuple[float, str, Dict[str, Any]]:
+        palette = self._palette(ctx)
+        levels = ctx.get('levels') or {}
+        min_std = float(ctx.get('min_std', 0.0))
+        max_std = float(ctx.get('max_std', 1.0))
+        stage_len = max(1, int(ctx.get('stage_len', max(1, len(palette)))))
+        surge = bool(ctx.get('surge', False))
+        intensity = float(ctx.get('intensity', 0.0))
+        focus_target = self.focus_base + self.focus_surge_bonus * (1.0 if surge else 0.0)
+        focus_target += 0.12 * math.tanh((intensity - 0.2) / 0.18)
+        focus_target = float(np.clip(focus_target, 0.35, 0.96))
+        background = max(1e-06, 1.0 - focus_target)
+        new_weights: Dict[str, float] = {}
+        prev_weights = self._weights or {mode: 1.0 / len(palette) for mode in palette}
+        for idx, mode in enumerate(palette):
+            prev = float(prev_weights.get(mode, 1.0 / len(palette)))
+            if mode == base_kind:
+                target = focus_target
+            else:
+                target = background / max(1, len(palette) - 1)
+            blend = self.blend_inertia * prev + (1.0 - self.blend_inertia) * target
+            jitter = float(self._rng.normal(0.0, self.jitter_std))
+            new_weights[mode] = max(self.entropy_floor, blend + jitter)
+        total = float(sum(new_weights.values()))
+        if not math.isfinite(total) or total <= 0.0:
+            new_weights = {mode: 1.0 / len(palette) for mode in palette}
+            total = 1.0
+        weights = {mode: float(val / total) for mode, val in new_weights.items()}
+        stage_phase = (counter % stage_len) / float(stage_len)
+        mix_std = 0.0
+        harmonics: Dict[str, float] = {}
+        for idx, mode in enumerate(palette):
+            base_level, swing = levels.get(mode, levels.get(base_kind, (base_std, 0.0)))
+            phase = (stage_phase + idx / max(1, len(palette))) % 1.0
+            envelope = 0.5 - 0.5 * math.cos(math.tau * phase)
+            if mode == 'alpha':
+                envelope = 0.5 + 0.5 * math.sin(math.tau * phase)
+            elif mode == 'beta':
+                envelope = 0.5 + 0.5 * math.cos(math.tau * (phase + 0.25))
+            elif mode == 'black':
+                envelope = envelope ** 1.5
+            mode_std = float(np.clip(base_level + swing * envelope, min_std, max_std))
+            weight = weights.get(mode, 0.0)
+            harmonics[mode] = weight
+            mix_std += weight * mode_std
+        mix_std = self.std_inertia * float(self._last_std) + (1.0 - self.std_inertia) * mix_std
+        mix_std = float(np.clip(mix_std, min_std, max_std))
+        arr = np.asarray(list(weights.values()), dtype=np.float64)
+        if arr.size:
+            focus_val = float(np.max(arr))
+            entropy = float(-np.sum(arr * np.log(arr + 1e-09)))
+        else:
+            focus_val = 1.0
+            entropy = 0.0
+        dominant = max(weights.items(), key=lambda kv: kv[1])[0]
+        profile = dict(base_profile)
+        profile['harmonics'] = {k: float(v) for k, v in harmonics.items()}
+        profile['mix_entropy'] = entropy
+        profile['mix_focus'] = focus_val
+        profile['headline_kind'] = dominant
+        profile['previous_kind'] = self._last_kind
+        self._weights = weights
+        self._last_std = mix_std
+        self._last_kind = dominant
+        return (mix_std, dominant, profile)
+
+
+def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
     """Enhanced curriculum with chaotic difficulty fluctuations and environmental monotony.
-    
+
     Creates a challenging environment with:
     - Non-linear difficulty progression with sudden jumps and drops
     - Multiple overlapping oscillations for unpredictability
@@ -4752,6 +6190,34 @@ def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]]=None) 
     - spike_amp: Amplitude of difficulty spikes
     """
     ctx = _ctx or {}
+    noise_ctx = ctx.get('noise_ctx', {})
+    noise_min = float(noise_ctx.get('min_std', 0.006))
+    noise_max = float(noise_ctx.get('max_std', 0.06))
+    noise_std_raw, noise_kind, noise_profile = _cyclic_noise_profile(
+        gen,
+        {
+            'palette': noise_ctx.get('palette', ('white', 'alpha', 'beta', 'black')),
+            'stage_len': noise_ctx.get('stage_len', 16),
+            'jitter_amp': noise_ctx.get('jitter_amp', 0.0025),
+            'base_levels': noise_ctx.get('base_levels'),
+            'min_std': noise_min,
+            'max_std': noise_max,
+        },
+    )
+
+    def _payload(diff_val: float, regen_flag: bool, scale: float) -> Dict[str, Any]:
+        scaled_noise = float(np.clip(noise_std_raw * scale, noise_min, noise_max))
+        profile = dict(noise_profile)
+        profile['stage_scale'] = float(scale)
+        profile['cycle_gen'] = int(gen)
+        return {
+            'difficulty': float(diff_val),
+            'noise_std': scaled_noise,
+            'noise_kind': noise_kind,
+            'noise_profile': profile,
+            'enable_regen': regen_flag,
+        }
+
     chaos_amp1 = ctx.get('chaos_amp1', 0.35)
     chaos_freq1_sin = ctx.get('chaos_freq1_sin', 0.28)
     chaos_freq1_cos = ctx.get('chaos_freq1_cos', 0.11)
@@ -4765,14 +6231,13 @@ def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]]=None) 
     spike_threshold_phase4 = spike_prob * 100
     if gen < 15:
         micro_var = 0.05 * np.sin(gen * 0.8)
-        return {'difficulty': 0.4 + micro_var, 'noise_std': 0.01, 'enable_regen': False}
+        return _payload(0.4 + micro_var, False, 0.6)
     if gen < 30:
         base_diff = 0.5 + (gen - 15) * 0.04
         wave1 = 0.15 * np.sin((gen - 15) * 0.35)
         wave2 = 0.1 * np.cos((gen - 15) * 0.52)
         diff = base_diff + wave1 + wave2
-        noise = 0.02
-        return {'difficulty': max(0.3, diff), 'noise_std': noise, 'enable_regen': False}
+        return _payload(max(0.3, diff), False, 0.85)
     if gen < 60:
         base_diff = 1.0 + (gen - 30) * 0.045
         wave1 = 0.25 * np.sin((gen - 30) * 0.22)
@@ -4781,8 +6246,7 @@ def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]]=None) 
         drop_component = -0.4 if (gen - 30) % 17 < 2 else 0.0
         spike_component = spike_amp if gen * 7 % 100 < spike_threshold_phase3 else 0.0
         diff = base_diff + wave1 + wave2 + wave3 + drop_component + spike_component
-        noise = 0.03
-        return {'difficulty': max(0.5, diff), 'noise_std': noise, 'enable_regen': True}
+        return _payload(max(0.5, diff), True, 1.15)
     base_diff = 2.0 + (gen - 60) * 0.03
     chaos1 = chaos_amp1 * np.sin((gen - 60) * chaos_freq1_sin) * np.cos((gen - 60) * chaos_freq1_cos)
     chaos2 = chaos_amp2 * np.cos((gen - 60) * chaos_freq2)
@@ -4791,8 +6255,7 @@ def _default_difficulty_schedule(gen: int, _ctx: Optional[Dict[str, Any]]=None) 
     drop_component = -0.7 if (gen - 60) % 19 < 2 else 0.0
     spike_component = spike_amp if gen * 13 % 100 < spike_threshold_phase4 else 0.0
     diff = base_diff + chaos1 + chaos2 + chaos3 + jump_component + drop_component + spike_component
-    noise = 0.04
-    return {'difficulty': max(0.3, diff), 'noise_std': noise, 'enable_regen': True}
+    return _payload(max(0.3, diff), True, 1.35)
 
 def _apply_stable_neat_defaults(neat: ReproPlanaNEATPlus):
     """Enhanced defaults for complex topology survival under challenging environments."""
@@ -5099,7 +6562,8 @@ def run_gym_neat_experiment(env_id: str, gens: int=20, pop: int=24, episodes: in
     plt.title(f'{env_id} | Average Episode Reward')
     plt.legend()
     plt.tight_layout()
-    plt.savefig(rc_png, dpi=150)
+    fig = plt.gcf()
+    _savefig(fig, rc_png, dpi=150)
     plt.close()
     lcs_ribbon = None
     lcs_timeline = None
@@ -5125,11 +6589,29 @@ def _genome_to_cyto(genome: Genome) -> dict:
     """
     nodes = []
     for nid, node in genome.nodes.items():
-        node_data = {'id': str(nid), 'label': f'{node.type[0].upper()}{nid}', 'type': node.type, 'bias': getattr(node, 'bias', 0.0), 'activation': node.activation}
+        node_data = {
+            'id': str(nid),
+            'label': f'{node.type[0].upper()}{nid}',
+            'type': node.type,
+            'bias': getattr(node, 'bias', 0.0),
+            'activation': node.activation,
+            'sensitivity': float(getattr(node, 'backprop_sensitivity', 1.0)),
+            'jitter': float(getattr(node, 'sensitivity_jitter', 0.0)),
+            'momentum': float(getattr(node, 'sensitivity_momentum', 0.0)),
+            'variance': float(getattr(node, 'sensitivity_variance', 0.0)),
+        }
         nodes.append({'data': node_data})
     edges = []
     for innov, conn in genome.connections.items():
-        edge_data = {'id': f'e{innov}', 'source': str(conn.in_node), 'target': str(conn.out_node), 'weight': float(conn.weight), 'enabled': bool(conn.enabled)}
+        edge_weight = float(conn.weight)
+        edge_data = {
+            'id': f'e{innov}',
+            'source': str(conn.in_node),
+            'target': str(conn.out_node),
+            'weight': edge_weight,
+            'abs_weight': abs(edge_weight),
+            'enabled': bool(conn.enabled),
+        }
         edges.append({'data': edge_data})
     return {'id': genome.id, 'nodes': nodes, 'edges': edges, 'meta': {'fitness': getattr(genome, 'fitness', None), 'birth_gen': genome.birth_gen}}
 
@@ -5152,9 +6634,255 @@ def export_interactive_html_report(path: str, title: str, history, genomes, *, m
         genomes = [genomes[i] for i in idxs]
     if genomes and 'nodes' not in genomes[0]:
         genomes = [_genome_to_cyto(g) for g in genomes]
-    data = {'title': title, 'lc': {'x': xs, 'best': ys_best, 'avg': ys_avg}, 'genomes': genomes}
-    html = f"""<!doctype html>\n<html lang="ja">\n<head>\n  <meta charset="utf-8"/>\n  <title>{title}</title>\n  <meta name="viewport" content="width=device-width, initial-scale=1"/>\n  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>\n  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>\n  <style>\n    :root {{ --grid:#e5e5e5; --fg:#111; --muted:#666; --ok1:#0072B2; --ok2:#D55E00; --ok3:#009E73; --ok4:#CC79A7; --ok5:#F0E442; --ok6:#56B4E9; --ok7:#E69F00; --ok8:#000; }}\n    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--fg); }}\n    .container {{ max-width:1200px; margin:24px auto; padding:0 16px; }}\n    h1 {{ font-size:22px; margin:0 0 12px; }}\n    .card {{ border:1px solid var(--grid); border-radius:8px; padding:12px; background:#fff; margin-bottom:16px; }}\n    #lc {{ height:360px; }}\n    .panel {{ display:grid; grid-template-columns:1fr 320px; gap:16px; }}\n    #cy {{ width:100%; height:560px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}\n    .detail {{ border:1px dashed var(--grid); border-radius:6px; padding:8px; font-size:13px; height:560px; overflow:auto; background:#fafafa; }}\n    .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }}\n    select,button {{ padding:6px 8px; font-size:14px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}\n    .dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}\n    .legend {{ display:inline-flex; gap:8px; align-items:center; }}\n    /* Tooltip */\n    .tip {{ position:fixed; pointer-events:none; background:rgba(0,0,0,.8); color:#fff; padding:6px 8px; font-size:12px; border-radius:4px; transform:translate(8px,8px); z-index:1000; display:none; max-width:320px; white-space:nowrap; }}\n    /* Context menu */\n    .ctx-menu {{\n      position: fixed; z-index: 2000; display: none; min-width: 220px;\n      background: #fff; color: var(--fg); border: 1px solid var(--grid); border-radius: 8px;\n      box-shadow: 0 8px 20px rgba(0,0,0,.12); padding: 6px;\n    }}\n    .ctx-item {{ font-size: 13px; padding: 8px 10px; cursor: pointer; border-radius:6px; }}\n    .ctx-item:hover {{ background: #f3f3f3; }}\n    .ctx-sep {{ height:1px; background: var(--grid); margin:6px 0; }}\n    .swatches {{ display:flex; flex-wrap:wrap; gap:6px; padding: 4px 2px 2px; }}\n    .swatch {{ width:18px; height:18px; border-radius:50%; cursor:pointer; border:1px solid rgba(0,0,0,.15); }}\n    .ctx-row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}\n  </style>\n</head>\n<body>\n  <div class="container">\n    <h1>{title}</h1>\n    <div class="card">\n      <h2>Learning Curve</h2>\n      <div id="lc"></div>\n    </div>\n    <div class="card">\n      <h2>Genome Viewer</h2>\n      <div class="row">\n        <label for="genomeSelect">Genome:</label>\n        <select id="genomeSelect"></select>\n        <button id="layoutBtn">Re-layout</button>\n        <span class="legend">\n          <span class="dot" style="background:#009E73"></span> input\n          <span class="dot" style="background:#999"></span> hidden\n          <span class="dot" style="background:#0072B2"></span> output\n        </span>\n      </div>\n      <div class="panel">\n        <div id="cy"></div>\n        <div class="detail" id="detail"><div class="fine">ノードやエッジを選択すると詳細が表示されます。</div></div>\n      </div>\n    </div>\n  </div>\n  <div class="tip" id="tip"></div>\n  <div class="ctx-menu" id="ctx"></div>\n\n  <script>\n    const DATA = {json.dumps(data, ensure_ascii=False)};\n    // Learning curve\n    (function(){{\n      const traces = [];\n      if (DATA.lc && DATA.lc.x.length) {{\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.best, mode:'lines', name:'best', line:{{width:2, color:'#0072B2'}},\n          hovertemplate:'gen=%{{x}}<br>best=%{{y:.4f}}<extra></extra>' }});\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.avg,  mode:'lines', name:'avg',  line:{{width:2, color:'#D55E00'}},\n          hovertemplate:'gen=%{{x}}<br>avg=%{{y:.4f}}<extra></extra>' }});\n      }}\n      Plotly.newPlot('lc', traces, {{\n        margin:{{l:40,r:10,t:10,b:40}},\n        xaxis:{{title:'Generation', gridcolor:'#eee'}},\n        yaxis:{{title:'Fitness', gridcolor:'#eee'}},\n        legend:{{orientation:'h'}}\n      }}, {{displayModeBar:true, responsive:true}});\n    }})();\n\n    // Genome viewer\n    const cyContainer = document.getElementById('cy');\n    const detail = document.getElementById('detail');\n    const tip = document.getElementById('tip');\n    const sel = document.getElementById('genomeSelect');\n    const layoutBtn = document.getElementById('layoutBtn');\n    const ctx = document.getElementById('ctx');\n    let cy = null;\n    let currentGenome = null; // store current genome object\n    let ctxNode = null;\n\n    function lsKey(gid) {{ return 'NEAT_REPORT_GENOME_STATE::' + String(gid); }}\n    function saveState() {{\n      if (!cy || !currentGenome) return;\n      const st = {{}};\n      cy.nodes().forEach(n => {{\n        st[n.id()] = {{\n          pos: n.position(),\n          locked: n.locked(),\n          color: n.data('color') || null,\n          note: n.data('note') || null\n        }};\n      }});\n      try {{ localStorage.setItem(lsKey(currentGenome.id || 'genome'), JSON.stringify(st)); }} catch(e){{}}\n    }}\n    function applyState() {{\n      if (!cy || !currentGenome) return;\n      let raw = null;\n      try {{ raw = localStorage.getItem(lsKey(currentGenome.id || 'genome')); }} catch(e){{}}\n      if (!raw) return;\n      let st = null;\n      try {{ st = JSON.parse(raw); }} catch(e) {{ return; }}\n      if (!st) return;\n      cy.batch(() => {{\n        cy.nodes().forEach(n => {{\n          const s = st[n.id()]; if (!s) return;\n          if (s.pos && Number.isFinite(s.pos.x) && Number.isFinite(s.pos.y)) n.position(s.pos);\n          if (s.locked) n.lock(); else n.unlock();\n          if (s.color) {{ n.data('color', s.color); n.style('background-color', s.color); }}\n          if (s.note) {{\n            n.data('note', s.note);\n            const orig = n.data('orig_label') || n.data('label') || n.id();\n            n.data('label', orig + '\\n' + s.note);\n          }}\n        }});\n      }});\n    }}\n\n    function genomeToElements(g) {{\n      // Ensure orig_label availability for annotations\n      const nodes = (g.nodes||[]).map(n => {{\n        const d = n.data || n;\n        return {{ data: Object.assign({{}}, d, {{ orig_label: d.label }}) }};\n      }});\n      const edges = (g.edges||[]).map(e => ({{ data: e.data || e, classes: ((e.data||e).enabled? 'enabled':'disabled') }}));\n      return nodes.concat(edges);\n    }}\n    function populateSelect() {{\n      sel.innerHTML = '';\n      if (!DATA.genomes || DATA.genomes.length===0) {{\n        const opt = document.createElement('option'); opt.text='(no genomes)'; sel.add(opt); sel.disabled=true; return;\n      }}\n      sel.disabled=false;\n      DATA.genomes.forEach((g,i) => {{\n        const meta = g.meta || {{}};\n        const label = (g.id || ('genome_'+i)) + (meta.fitness!==undefined ? (' (fitness='+meta.fitness+')') : '');\n        const opt = document.createElement('option'); opt.value=String(i); opt.text=label; sel.add(opt);\n      }});\n    }}\n    function renderGenome(idx) {{\n      if (!DATA.genomes || !DATA.genomes[idx]) return;\n      const g = DATA.genomes[idx];\n      currentGenome = g;\n      const elements = genomeToElements(g);\n      const styles = [\n        {{ selector:'node', style:{{ 'label':'data(label)', 'font-size':11, 'text-valign':'center', 'text-halign':'center',\n           'text-wrap':'wrap', 'text-max-width': 90, 'background-color':'#999','width':22,'height':22, 'color':'#111','border-color':'#333','border-width':0.5 }} }},\n        {{ selector:'node[type = "input"]',  style:{{ 'background-color':'#009E73' }} }},\n        {{ selector:'node[type = "output"]', style:{{ 'background-color':'#0072B2' }} }},\n        {{ selector:'edge', style:{{ 'line-color':'#888', 'width':'mapData(weight, -2, 2, 0.6, 4)', 'opacity':0.95,\n           'curve-style':'bezier','target-arrow-shape':'triangle','target-arrow-color':'#888' }} }},\n        {{ selector:'edge[weight < 0]',  style:{{ 'line-color':'#D55E00', 'target-arrow-color':'#D55E00' }} }},\n        {{ selector:'edge[weight >= 0]', style:{{ 'line-color':'#56B4E9', 'target-arrow-color':'#56B4E9' }} }},\n        {{ selector:'edge.disabled', style:{{ 'line-style':'dotted','opacity':0.3 }} }},\n        {{ selector:':selected', style:{{ 'border-width':2, 'border-color':'#F0E442' }} }},\n      ];\n      if (cy) cy.destroy();\n      cy = cytoscape({{ container: cyContainer, elements: elements, style: styles, layout: {{ name:'cose', animate:false }},\n        wheelSensitivity:0.2, minZoom:0.2, maxZoom:5 }});\n\n      function showDetail(html) {{ detail.innerHTML = html; }}\n      function nodeHtml(d) {{\n        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');\n        return `<div><b>Node</b></div>\n          <div>ID: ${{a('id')}}</div>\n          <div>Label: ${{a('label')}}</div>\n          <div>Type: ${{a('type')}}</div>\n          <div>Bias: ${{a('bias')}}</div>\n          <div>Activation: ${{a('activation')}}</div>\n          <div>Note: ${{a('note')}}</div>`;\n      }}\n      function edgeHtml(d) {{\n        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');\n        return `<div><b>Edge</b></div>\n          <div>Source: ${{a('source')}}</div>\n          <div>Target: ${{a('target')}}</div>\n          <div>Weight: ${{a('weight')}}</div>\n          <div>Enabled: ${{a('enabled')}}</div>`;\n      }}\n\n      // Click selects → details\n      cy.on('tap','node',(evt)=> showDetail(nodeHtml(evt.target.data())));\n      cy.on('tap','edge',(evt)=> showDetail(edgeHtml(evt.target.data())));\n      cy.on('tap',(evt)=> {{ if (evt.target===cy) showDetail('<div class="fine">ノードやエッジを選択すると詳細が表示されます。</div>'); }});\n\n      // Hover tooltip\n      const moveTip = (e) => {{ tip.style.left=(e.renderedPosition.x + cyContainer.getBoundingClientRect().left)+'px';\n                                tip.style.top=(e.renderedPosition.y + cyContainer.getBoundingClientRect().top)+'px'; }};\n      cy.on('mouseover','node',(evt)=>{{ tip.innerHTML = evt.target.data('label') || evt.target.data('id'); tip.style.display='block'; moveTip(evt); }});\n      cy.on('mousemove','node',(evt)=> moveTip(evt));\n      cy.on('mouseout','node',()=> {{ tip.style.display='none'; }});\n\n      // Persist position/color/note\n      cy.on('free', 'node', saveState);\n      cy.on('lock unlock', 'node', saveState);\n\n      // Apply saved state for this genome\n      applyState();\n\n      // Context menu handlers\n      cy.on('cxttapstart', 'node', (evt) => {{\n        ctxNode = evt.target;\n        openCtxAt(evt.renderedPosition);\n      }});\n      cy.on('cxttapstart', (evt) => {{\n        if (evt.target === cy) closeCtx();\n      }});\n      document.addEventListener('click', (e) => {{\n        if (!ctx.contains(e.target)) closeCtx();\n      }});\n      window.addEventListener('resize', closeCtx);\n      document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeCtx(); }});\n    }}\n\n    // UI wiring\n    populateSelect();\n    if (DATA.genomes && DATA.genomes.length>0) renderGenome(0);\n    sel.addEventListener('change', ()=> {{ const idx=parseInt(sel.value,10); if(!Number.isNaN(idx)) renderGenome(idx); }});\n    layoutBtn.addEventListener('click', ()=> {{ if (cy) cy.layout({{name:'cose', animate:true}}).run(); }});\n\n    // Context menu building\n    const PALETTE = ['#0072B2','#D55E00','#009E73','#CC79A7','#F0E442','#56B4E9','#E69F00','#000000','#777777','#999999'];\n    const hiddenColorPicker = document.createElement('input'); hiddenColorPicker.type='color'; hiddenColorPicker.style.display='none'; document.body.appendChild(hiddenColorPicker);\n\n    function openCtxAt(renderedPos) {{\n      if (!ctxNode) return;\n      const rect = cyContainer.getBoundingClientRect();\n      const x = rect.left + renderedPos.x;\n      const y = rect.top + renderedPos.y;\n      ctx.innerHTML = '';\n      const menu = document.createElement('div');\n\n      // Title\n      const title = document.createElement('div');\n      title.className='ctx-item';\n      title.style.cursor='default';\n      title.innerHTML = '<b>Node:</b> ' + (ctxNode.data('label') || ctxNode.id());\n      ctx.appendChild(title);\n\n      // Fix/Unfix\n      const fix = document.createElement('div');\n      fix.className='ctx-item';\n      const locked = ctxNode.locked();\n      fix.textContent = locked ? '位置の固定を解除' : '位置を固定';\n      fix.onclick = () => {{\n        if (ctxNode.locked()) ctxNode.unlock(); else ctxNode.lock();\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(fix);\n\n      // Color row\n      const colorRow = document.createElement('div');\n      colorRow.className='ctx-item';\n      colorRow.innerHTML = '<div class="ctx-row"><span>色を変更</span><span style="font-size:12px;color:var(--muted)">クリックで適用</span></div>';\n      const sw = document.createElement('div'); sw.className='swatches';\n      PALETTE.forEach(c => {{\n        const d = document.createElement('div'); d.className='swatch'; d.style.background=c;\n        d.title = c;\n        d.onclick = () => {{ ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx(); }};\n        sw.appendChild(d);\n      }});\n      // Custom picker\n      const custom = document.createElement('div');\n      custom.className='ctx-item';\n      custom.textContent='カスタムカラー…';\n      custom.onclick = () => {{\n        hiddenColorPicker.value = ctxNode.data('color') || '#999999';\n        hiddenColorPicker.onchange = () => {{\n          const c = hiddenColorPicker.value;\n          ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx();\n        }};\n        hiddenColorPicker.click();\n      }};\n      colorRow.appendChild(sw);\n      ctx.appendChild(colorRow);\n      ctx.appendChild(custom);\n\n      // Note editor\n      const noteBtn = document.createElement('div');\n      noteBtn.className='ctx-item';\n      noteBtn.textContent='注釈を追加/編集…';\n      noteBtn.onclick = () => {{\n        const cur = ctxNode.data('note') || '';\n        const txt = window.prompt('ノードの注釈（空で削除）', cur);\n        if (txt === null) return;\n        const orig = ctxNode.data('orig_label') || ctxNode.data('label') || ctxNode.id();\n        if (txt.trim() === '') {{\n          ctxNode.data('note', null);\n          ctxNode.data('label', orig);\n        }} else {{\n          ctxNode.data('note', txt);\n          ctxNode.data('label', orig + '\\n' + txt);\n        }}\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(noteBtn);\n\n      // Reset color\n      const resetColor = document.createElement('div');\n      resetColor.className='ctx-item';\n      resetColor.textContent='色をリセット';\n      resetColor.onclick = () => {{\n        ctxNode.data('color', null);\n        // Revert to type-based color by removing inline style\n        ctxNode.removeStyle('background-color');\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(resetColor);\n\n      // Separator\n      const sep = document.createElement('div'); sep.className='ctx-sep'; ctx.appendChild(sep);\n\n      // Save layout now\n      const saveBtn = document.createElement('div');\n      saveBtn.className='ctx-item';\n      saveBtn.textContent='レイアウトを保存';\n      saveBtn.onclick = () => {{ saveState(); closeCtx(); }};\n      ctx.appendChild(saveBtn);\n\n      // Open\n      ctx.style.left = Math.round(x) + 'px';\n      ctx.style.top  = Math.round(y) + 'px';\n      ctx.style.display = 'block';\n    }}\n\n    function closeCtx() {{ ctx.style.display='none'; ctxNode = null; }}\n\n  </script>\n</body>\n</html>"""
+    build_id = _build_stamp_short()
+    data = {'title': title, 'lc': {'x': xs, 'best': ys_best, 'avg': ys_avg}, 'genomes': genomes, 'build': build_id}
+    html = f"""<!doctype html>\n<html lang="ja">\n<head>\n  <meta charset="utf-8"/>\n  <title>{title}</title>\n  <meta name="viewport" content="width=device-width, initial-scale=1"/>\n  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>\n  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>\n  <style>\n    :root {{ --grid:#e5e5e5; --fg:#111; --muted:#666; --ok1:#0072B2; --ok2:#D55E00; --ok3:#009E73; --ok4:#CC79A7; --ok5:#F0E442; --ok6:#56B4E9; --ok7:#E69F00; --ok8:#000; }}\n    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--fg); }}\n    .container {{ max-width:1200px; margin:24px auto; padding:0 16px; }}\n    h1 {{ font-size:22px; margin:0 0 12px; }}\n    .card {{ border:1px solid var(--grid); border-radius:8px; padding:12px; background:#fff; margin-bottom:16px; }}\n    #lc {{ height:360px; }}\n    .panel {{ display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:16px; align-items:start; overflow:hidden; }}\n    .panel > * {{ min-width:0; }}\n    #cy {{ width:100%; height:560px; border:1px solid var(--grid); border-radius:6px; background:#fff; box-sizing:border-box; }}\n    .detail {{ border:1px dashed var(--grid); border-radius:6px; padding:8px; font-size:13px; height:560px; overflow:auto; background:#fafafa; box-sizing:border-box; }}\n    .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }}\n    .row.controls {{ margin-top:4px; font-size:13px; color:var(--muted); }}\n    .row.controls label {{ font-size:13px; color:var(--fg); display:flex; align-items:center; gap:4px; }}\n    select,button,input[type=range] {{ padding:6px 8px; font-size:14px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}\n    input[type=range] {{ padding:0; width:160px; accent-color:#0072B2; }}\n    .dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}\n    .legend {{ display:inline-flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:13px; }}\n    .legend-title {{ font-weight:600; color:var(--muted); margin-right:2px; }}\n    .legend-gradient {{ width:120px; height:10px; border-radius:4px; border:1px solid var(--grid); background:linear-gradient(90deg,#2c7bb6,#abd9e9,#ffffbf,#fdae61,#d7191c); }}\n    .legend-text {{ color:var(--muted); font-size:12px; }}\n    .checkbox {{ display:inline-flex; align-items:center; gap:6px; padding:4px 6px; border:1px solid var(--grid); border-radius:6px; background:#fff; color:var(--fg); }}\n    .checkbox input {{ margin:0; }}\n    #genomeStats {{ font-size:13px; color:var(--muted); margin-top:8px; display:grid; gap:4px; line-height:1.4; }}\n    @media (max-width: 900px) {{\n      .panel {{ grid-template-columns:1fr; }}\n      .detail {{ height:auto; min-height:220px; }}\n      #cy {{ height:420px; }}\n    }}\n    /* Tooltip */\n    .tip {{ position:fixed; pointer-events:none; background:rgba(0,0,0,.8); color:#fff; padding:6px 8px; font-size:12px; border-radius:4px; transform:translate(8px,8px); z-index:1000; display:none; max-width:320px; white-space:nowrap; }}\n    /* Context menu */\n    .ctx-menu {{\n      position: fixed; z-index: 2000; display: none; min-width: 220px;\n      background: #fff; color: var(--fg); border: 1px solid var(--grid); border-radius: 8px;\n      box-shadow: 0 8px 20px rgba(0,0,0,.12); padding: 6px;\n    }}\n    .ctx-item {{ font-size: 13px; padding: 8px 10px; cursor: pointer; border-radius:6px; }}\n    .ctx-item:hover {{ background: #f3f3f3; }}\n    .ctx-sep {{ height:1px; background: var(--grid); margin:6px 0; }}\n    .swatches {{ display:flex; flex-wrap:wrap; gap:6px; padding: 4px 2px 2px; }}\n    .swatch {{ width:18px; height:18px; border-radius:50%; cursor:pointer; border:1px solid rgba(0,0,0,.15); }}\n    .ctx-row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}\n  </style>\n</head>\n<body>\n  <div class="container">\n    <h1>{title}</h1>\n    <div class="card">\n      <h2>Learning Curve</h2>\n      <div id="lc"></div>\n    </div>\n    <div class="card">\n      <h2>Genome Viewer</h2>\n      <div class="row">\n        <label for="genomeSelect">Genome:</label>\n        <select id="genomeSelect"></select>\n        <button id="layoutBtn">Re-layout</button>\n        <span class="legend" id="legendBox"></span>\n      </div>\n      <div class="row controls">\n        <label for="nodeColorMode">ノード色:</label>\n        <select id="nodeColorMode">\n          <option value="type">種類</option>\n          <option value="sensitivity">感受性</option>\n          <option value="momentum">モメンタム</option>\n          <option value="variance">分散</option>\n        </select>\n        <label for="weightFilter">|weight| ≥ <span id="weightFilterValue">0</span></label>\n        <input type="range" id="weightFilter" min="0" max="100" step="1" value="0"/>\n        <label class="checkbox"><input type="checkbox" id="enabledOnly"/> 有効エッジのみ</label>\n      </div>\n      <div class="panel">\n        <div id="cy"></div>\n        <div class="detail" id="detail"><div class="fine">ノードやエッジを選択すると詳細が表示されます。</div></div>\n      </div>\n      <div id="genomeStats"></div>\n    </div>\n  </div>\n  <div class="tip" id="tip"></div>\n  <div class="ctx-menu" id="ctx"></div>\n\n  <script>\n    const DATA = {json.dumps(data, ensure_ascii=False)};\n    // Learning curve\n    (function(){{\n      const traces = [];\n      if (DATA.lc && DATA.lc.x.length) {{\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.best, mode:'lines', name:'best', line:{{width:2, color:'#0072B2'}},\n          hovertemplate:'gen=%{{x}}<br>best=%{{y:.4f}}<extra></extra>' }});\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.avg,  mode:'lines', name:'avg',  line:{{width:2, color:'#D55E00'}},\n          hovertemplate:'gen=%{{x}}<br>avg=%{{y:.4f}}<extra></extra>' }});\n      }}\n      Plotly.newPlot('lc', traces, {{\n        margin:{{l:40,r:10,t:10,b:40}},\n        xaxis:{{title:'Generation', gridcolor:'#eee'}},\n        yaxis:{{title:'Fitness', gridcolor:'#eee'}},\n        legend:{{orientation:'h'}}\n      }}, {{displayModeBar:true, responsive:true}});\n    }})();\n\n    // Genome viewer\n    const cyContainer = document.getElementById('cy');\n    const detail = document.getElementById('detail');\n    const tip = document.getElementById('tip');\n    const sel = document.getElementById('genomeSelect');\n    const layoutBtn = document.getElementById('layoutBtn');\n    const ctx = document.getElementById('ctx');\n    const colorModeSelect = document.getElementById('nodeColorMode');\n    const weightSlider = document.getElementById('weightFilter');\n    const weightLabel = document.getElementById('weightFilterValue');\n    const enabledOnly = document.getElementById('enabledOnly');\n    const legendBox = document.getElementById('legendBox');\n    const statsBox = document.getElementById('genomeStats');\n    let cy = null;\n    let currentGenome = null; // store current genome object\n    let ctxNode = null;\n    const globalStats = computeGlobalStats();\n    let currentEdgeMax = globalStats.maxAbsWeight || 0;\n    let activeColorMode = (colorModeSelect && colorModeSelect.value) || 'type';\n    updateLegend(activeColorMode);\n    applyEdgeFilters();\n\n    function lsKey(gid) {{ return 'NEAT_REPORT_GENOME_STATE::' + String(gid); }}\n    function saveState() {{\n      if (!cy || !currentGenome) return;\n      const st = {{}};\n      cy.nodes().forEach(n => {{\n        st[n.id()] = {{\n          pos: n.position(),\n          locked: n.locked(),\n          color: n.data('color') || null,\n          note: n.data('note') || null\n        }};\n      }});\n      try {{ localStorage.setItem(lsKey(currentGenome.id || 'genome'), JSON.stringify(st)); }} catch(e){{}}\n    }}\n    function applyState() {{\n      if (!cy || !currentGenome) return;\n      let raw = null;\n      try {{ raw = localStorage.getItem(lsKey(currentGenome.id || 'genome')); }} catch(e){{}}\n      if (!raw) return;\n      let st = null;\n      try {{ st = JSON.parse(raw); }} catch(e) {{ return; }}\n      if (!st) return;\n      cy.batch(() => {{\n        cy.nodes().forEach(n => {{\n          const s = st[n.id()]; if (!s) return;\n          if (s.pos && Number.isFinite(s.pos.x) && Number.isFinite(s.pos.y)) n.position(s.pos);\n          if (s.locked) n.lock(); else n.unlock();\n          if (s.color) {{ n.data('color', s.color); n.style('background-color', s.color); }}\n          if (s.note) {{\n            n.data('note', s.note);\n            const orig = n.data('orig_label') || n.data('label') || n.id();\n            n.data('label', orig + '\\n' + s.note);\n          }}\n        }});\n      }});\n    }}\n\n    
+function updateRange(range, value) {{
+  if (!Number.isFinite(value)) return;
+  if (value < range[0]) range[0] = value;
+  if (value > range[1]) range[1] = value;
+}}
+function normalizeRange(range, fallback) {{
+  if (!Number.isFinite(range[0]) || !Number.isFinite(range[1]) || range[0] === Infinity || range[1] === -Infinity) {{
+    range[0] = fallback;
+    range[1] = fallback;
+  }}
+}}
+function computeGlobalStats() {{
+  const ranges = {{
+    sensitivity: [Infinity, -Infinity],
+    momentum: [Infinity, -Infinity],
+    variance: [Infinity, -Infinity],
+  }};
+  let maxAbsWeight = 0;
+  (DATA.genomes || []).forEach(g => {{
+    (g.nodes || []).forEach(n => {{
+      const d = n.data || n;
+      updateRange(ranges.sensitivity, Number(d.sensitivity));
+      updateRange(ranges.momentum, Number(d.momentum));
+      updateRange(ranges.variance, Number(d.variance));
+    }});
+    (g.edges || []).forEach(e => {{
+      const d = e.data || e;
+      const absW = Math.abs(Number(d.abs_weight !== undefined ? d.abs_weight : d.weight));
+      if (Number.isFinite(absW) && absW > maxAbsWeight) maxAbsWeight = absW;
+    }});
+  }});
+  normalizeRange(ranges.sensitivity, 1);
+  normalizeRange(ranges.momentum, 0);
+  normalizeRange(ranges.variance, 0);
+  return {{ ranges, maxAbsWeight }};
+}}
+function formatNumber(value, digits) {{
+  if (!Number.isFinite(value)) return '–';
+  const places = Number.isFinite(digits) ? digits : 2;
+  return Number(value).toFixed(places);
+}}
+function gradientColor(t) {{
+  const stops = [
+    [44, 123, 182],
+    [171, 217, 233],
+    [253, 174, 97],
+    [215, 25, 28],
+  ];
+  const clamped = Math.min(1, Math.max(0, t));
+  const scaled = clamped * (stops.length - 1);
+  const idx = Math.min(stops.length - 2, Math.floor(scaled));
+  const frac = scaled - idx;
+  const start = stops[idx];
+  const end = stops[idx + 1];
+  const comp = start.map((s, i) => Math.round(s + (end[i] - s) * frac));
+  return '#' + comp.map(c => c.toString(16).padStart(2, '0')).join('');
+}}
+function calcStats(values) {{
+  const arr = values.filter(v => Number.isFinite(v));
+  if (!arr.length) return {{ mean: NaN, std: NaN }};
+  const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+  const variance = arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / arr.length;
+  return {{ mean, std: Math.sqrt(variance) }};
+}}
+function computeEdgeMax(g) {{
+  let max = 0;
+  (g.edges || []).forEach(e => {{
+    const d = e.data || e;
+    const absW = Math.abs(Number(d.abs_weight !== undefined ? d.abs_weight : d.weight));
+    if (Number.isFinite(absW) && absW > max) max = absW;
+  }});
+  return max;
+}}
+function applyNodeColorMode(mode) {{
+  activeColorMode = mode || 'type';
+  updateLegend(activeColorMode);
+  if (!cy) return;
+  const keyMap = {{ sensitivity: 'sensitivity', momentum: 'momentum', variance: 'variance' }};
+  const range = globalStats.ranges[activeColorMode] || [0, 1];
+  cy.batch(() => {{
+    cy.nodes().forEach(n => {{
+      const data = n.data();
+      const manual = data.color;
+      if (manual) {{
+        n.data('vizColor', manual);
+        n.style('background-color', manual);
+        return;
+      }}
+      let color = '#999999';
+      if (activeColorMode === 'type') {{
+        if (data.type === 'input') color = '#009E73';
+        else if (data.type === 'output') color = '#0072B2';
+        else color = '#999999';
+      }} else {{
+        const key = keyMap[activeColorMode];
+        const value = Number(data[key]);
+        let t = 0.5;
+        if (Number.isFinite(value)) {{
+          const [min, max] = range;
+          t = (max > min) ? (value - min) / (max - min) : 0.5;
+        }}
+        color = gradientColor(t);
+      }}
+      n.data('vizColor', color);
+      n.style('background-color', color);
+    }});
+  }});
+}}
+function applyEdgeVisuals() {{
+  if (!cy) return;
+  const denom = currentEdgeMax > 0 ? currentEdgeMax : 1;
+  cy.batch(() => {{
+    cy.edges().forEach(e => {{
+      const data = e.data();
+      const w = Number(data.weight) || 0;
+      const absW = Math.abs(w);
+      const baseColor = w >= 0 ? '#56B4E9' : '#D55E00';
+      const width = 0.6 + 3.8 * (absW / denom);
+      const clampedWidth = Math.max(0.6, Math.min(width, 6));
+      e.data('vizColor', baseColor);
+      e.data('vizWidth', clampedWidth);
+      e.style('line-color', baseColor);
+      e.style('target-arrow-color', baseColor);
+      e.style('width', clampedWidth);
+    }});
+  }});
+}}
+function applyEdgeFilters() {{
+  const sliderVal = weightSlider ? Number(weightSlider.value) : 0;
+  const threshold = (currentEdgeMax || 0) * (sliderVal / 100);
+  if (weightLabel) weightLabel.textContent = formatNumber(threshold, 3);
+  if (!cy) return;
+  cy.batch(() => {{
+    cy.edges().forEach(edge => {{
+      const data = edge.data();
+      const absW = Math.abs(Number(data.weight) || 0);
+      let hide = false;
+      if (threshold > 0 && absW < threshold - 1e-9) hide = true;
+      if (enabledOnly && enabledOnly.checked && !data.enabled) hide = true;
+      if (hide) edge.addClass('hidden'); else edge.removeClass('hidden');
+    }});
+  }});
+}}
+function updateLegend(mode) {{
+  if (!legendBox) return;
+  if (mode === 'type') {{
+    legendBox.innerHTML = '<span class="legend-title">Node:</span>' +
+      '<span class="dot" style="background:#009E73"></span> input ' +
+      '<span class="dot" style="background:#999999"></span> hidden ' +
+      '<span class="dot" style="background:#0072B2"></span> output';
+  }} else {{
+    const range = globalStats.ranges[mode] || [0, 0];
+    legendBox.innerHTML = '<span class="legend-title">Node:</span>' +
+      '<span class="legend-gradient"></span>' +
+      `<span class="legend-text">low ${{formatNumber(range[0], 2)}}</span>` +
+      `<span class="legend-text">high ${{formatNumber(range[1], 2)}}</span>`;
+  }}
+}}
+function updateGenomeStats(g) {{
+  if (!statsBox) return;
+  const nodes = g.nodes || [];
+  const edges = g.edges || [];
+  const enabledCount = edges.filter(e => ((e.data||e).enabled)).length;
+  const values = key => nodes.map(n => Number((n.data || n)[key])).filter(v => Number.isFinite(v));
+  const sens = calcStats(values('sensitivity'));
+  const momentum = calcStats(values('momentum'));
+  const jitter = calcStats(values('jitter'));
+  const variance = calcStats(values('variance'));
+  const parts = [
+    `<div>Nodes: ${{nodes.length}} / Edges: ${{edges.length}} (enabled ${{enabledCount}})</div>`,
+    `<div>感受性 μ=${{formatNumber(sens.mean, 3)}} σ=${{formatNumber(sens.std, 3)}}</div>`,
+    `<div>モメンタム μ=${{formatNumber(momentum.mean, 3)}} σ=${{formatNumber(momentum.std, 3)}} ・ ジッター μ=${{formatNumber(jitter.mean, 3)}} σ=${{formatNumber(jitter.std, 3)}} ・ 分散 μ=${{formatNumber(variance.mean, 3)}}</div>`
+  ];
+  statsBox.innerHTML = parts.join('');
+}}
+function genomeToElements(g) {{
+      const nodes = (g.nodes||[]).map(n => {{
+        const d = Object.assign({{}}, n.data || n);
+        if (d.orig_label === undefined) d.orig_label = d.label;
+        if (d.vizColor === undefined) d.vizColor = '#999999';
+        if (d.vizWidth === undefined) d.vizWidth = 2;
+        return {{ data: d }};
+      }});
+      const edges = (g.edges||[]).map(e => {{
+        const d = Object.assign({{}}, e.data || e);
+        if (d.vizColor === undefined) {{
+          const w = Number(d.weight) || 0;
+          d.vizColor = w >= 0 ? '#56B4E9' : '#D55E00';
+        }}
+        const absW = Math.abs(Number(d.abs_weight !== undefined ? d.abs_weight : d.weight)) || 0;
+        if (d.vizWidth === undefined) d.vizWidth = 0.6 + Math.min(3.4, absW);
+        return {{ data: d, classes: (d.enabled ? 'enabled' : 'disabled') }};
+      }});
+      return nodes.concat(edges);
+    }}
+function populateSelect() {{\n      sel.innerHTML = '';\n      if (!DATA.genomes || DATA.genomes.length===0) {{\n        const opt = document.createElement('option'); opt.text='(no genomes)'; sel.add(opt); sel.disabled=true; return;\n      }}\n      sel.disabled=false;\n      DATA.genomes.forEach((g,i) => {{\n        const meta = g.meta || {{}};\n        const label = (g.id || ('genome_'+i)) + (meta.fitness!==undefined ? (' (fitness='+meta.fitness+')') : '');\n        const opt = document.createElement('option'); opt.value=String(i); opt.text=label; sel.add(opt);\n      }});\n    }}\n    function renderGenome(idx) {{\n      if (!DATA.genomes || !DATA.genomes[idx]) return;\n      const g = DATA.genomes[idx];\n      currentGenome = g;\n      const elements = genomeToElements(g);\n      const styles = [
+        {{ selector:'node', style:{{ 'label':'data(label)', 'font-size':11, 'text-valign':'center', 'text-halign':'center',
+           'text-wrap':'wrap', 'text-max-width': 90, 'background-color':'data(vizColor)','width':22,'height':22, 'color':'#111','border-color':'#333','border-width':0.5 }} }},
+        {{ selector:'edge', style:{{ 'line-color':'data(vizColor)', 'target-arrow-color':'data(vizColor)', 'width':'data(vizWidth)', 'opacity':0.95,
+           'curve-style':'bezier','target-arrow-shape':'triangle' }} }},
+        {{ selector:'edge.disabled', style:{{ 'line-style':'dotted','opacity':0.35 }} }},
+        {{ selector:'edge.hidden', style:{{ 'display':'none' }} }},
+        {{ selector:':selected', style:{{ 'border-width':2, 'border-color':'#F0E442' }} }},
+      ];\n      if (cy) cy.destroy();
+      cy = cytoscape({{ container: cyContainer, elements: elements, style: styles, layout: {{ name:'cose', animate:false }},
+        wheelSensitivity:0.2, minZoom:0.2, maxZoom:5 }});
+      currentEdgeMax = Math.max(computeEdgeMax(g), globalStats.maxAbsWeight || 0);
+      applyEdgeVisuals();
+      if (weightSlider) {{
+        if (!cy || cy.edges().length === 0) {{
+          weightSlider.value = '0';
+          weightSlider.disabled = true;
+        }} else {{
+          weightSlider.disabled = false;
+        }}
+      }}
+
+      function showDetail(html) {{ detail.innerHTML = html; }}\n      function nodeHtml(d) {{\n        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');\n        return `<div><b>Node</b></div>\n          <div>ID: ${{a('id')}}</div>\n          <div>Label: ${{a('label')}}</div>\n          <div>Type: ${{a('type')}}</div>\n          <div>Bias: ${{a('bias')}}</div>\n          <div>Activation: ${{a('activation')}}</div>\n          <div>Sensitivity: ${{a('sensitivity')}}</div>\n          <div>Jitter: ${{a('jitter')}}</div>\n          <div>Momentum: ${{a('momentum')}}</div>\n          <div>Variance: ${{a('variance')}}</div>\n          <div>Note: ${{a('note')}}</div>`;\n      }}\n      function edgeHtml(d) {{
+        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');
+        return `<div><b>Edge</b></div>
+          <div>Source: ${{a('source')}}</div>
+          <div>Target: ${{a('target')}}</div>
+          <div>Weight: ${{a('weight')}}</div>
+          <div>|Weight|: ${{a('abs_weight')}}</div>
+          <div>Enabled: ${{a('enabled')}}</div>`;
+      }}
+
+      // Click selects → details\n      cy.on('tap','node',(evt)=> showDetail(nodeHtml(evt.target.data())));\n      cy.on('tap','edge',(evt)=> showDetail(edgeHtml(evt.target.data())));\n      cy.on('tap',(evt)=> {{ if (evt.target===cy) showDetail('<div class="fine">ノードやエッジを選択すると詳細が表示されます。</div>'); }});\n\n      // Hover tooltip\n      const moveTip = (e) => {{ tip.style.left=(e.renderedPosition.x + cyContainer.getBoundingClientRect().left)+'px';\n                                tip.style.top=(e.renderedPosition.y + cyContainer.getBoundingClientRect().top)+'px'; }};\n      const metricKeyMap = {{ sensitivity:'sensitivity', momentum:'momentum', variance:'variance' }};\n      const metricLabelMap = {{ sensitivity:'S', momentum:'M', variance:'V' }};\n      cy.on('mouseover','node',(evt)=>{{
+        const data = evt.target.data();
+        let text = data.label || data.id || '';
+        if (activeColorMode !== 'type') {{
+          const key = metricKeyMap[activeColorMode];
+          const label = metricLabelMap[activeColorMode] || activeColorMode;
+          const val = Number(data[key]);
+          if (Number.isFinite(val)) text += ' · ' + label + '=' + formatNumber(val, 3);
+        }}
+        tip.innerHTML = text;
+        tip.style.display='block';
+        moveTip(evt);
+      }});\n      cy.on('mousemove','node',(evt)=> moveTip(evt));\n      cy.on('mouseout','node',()=> {{ tip.style.display='none'; }});\n\n      // Persist position/color/note\n      cy.on('free', 'node', saveState);\n      cy.on('lock unlock', 'node', saveState);\n\n      // Apply saved state for this genome\n      applyState();\n\n      applyNodeColorMode(activeColorMode);\n      applyEdgeFilters();\n      updateGenomeStats(g);\n      // Context menu handlers\n      cy.on('cxttapstart', 'node', (evt) => {{\n        ctxNode = evt.target;\n        openCtxAt(evt.renderedPosition);\n      }});\n      cy.on('cxttapstart', (evt) => {{\n        if (evt.target === cy) closeCtx();\n      }});\n      document.addEventListener('click', (e) => {{\n        if (!ctx.contains(e.target)) closeCtx();\n      }});\n      window.addEventListener('resize', closeCtx);\n      document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeCtx(); }});\n    }}\n\n    // UI wiring\n    populateSelect();\n    if (DATA.genomes && DATA.genomes.length>0) renderGenome(0);\n    sel.addEventListener('change', ()=> {{ const idx=parseInt(sel.value,10); if(!Number.isNaN(idx)) renderGenome(idx); }});\n    layoutBtn.addEventListener('click', ()=> {{ if (cy) cy.layout({{name:'cose', animate:true}}).run(); }});\n    if (colorModeSelect) colorModeSelect.addEventListener('change', ()=> {{
+      activeColorMode = colorModeSelect.value || 'type';
+      applyNodeColorMode(activeColorMode);
+    }});\n    if (weightSlider) weightSlider.addEventListener('input', ()=> {{ applyEdgeFilters(); }});\n    if (enabledOnly) enabledOnly.addEventListener('change', ()=> {{ applyEdgeFilters(); }});\n\n    // Context menu building\n    const PALETTE = ['#0072B2','#D55E00','#009E73','#CC79A7','#F0E442','#56B4E9','#E69F00','#000000','#777777','#999999'];\n    const hiddenColorPicker = document.createElement('input'); hiddenColorPicker.type='color'; hiddenColorPicker.style.display='none'; document.body.appendChild(hiddenColorPicker);\n\n    function openCtxAt(renderedPos) {{\n      if (!ctxNode) return;\n      const rect = cyContainer.getBoundingClientRect();\n      const x = rect.left + renderedPos.x;\n      const y = rect.top + renderedPos.y;\n      ctx.innerHTML = '';\n      const menu = document.createElement('div');\n\n      // Title\n      const title = document.createElement('div');\n      title.className='ctx-item';\n      title.style.cursor='default';\n      title.innerHTML = '<b>Node:</b> ' + (ctxNode.data('label') || ctxNode.id());\n      ctx.appendChild(title);\n\n      // Fix/Unfix\n      const fix = document.createElement('div');\n      fix.className='ctx-item';\n      const locked = ctxNode.locked();\n      fix.textContent = locked ? '位置の固定を解除' : '位置を固定';\n      fix.onclick = () => {{\n        if (ctxNode.locked()) ctxNode.unlock(); else ctxNode.lock();\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(fix);\n\n      // Color row\n      const colorRow = document.createElement('div');\n      colorRow.className='ctx-item';\n      colorRow.innerHTML = '<div class="ctx-row"><span>色を変更</span><span style="font-size:12px;color:var(--muted)">クリックで適用</span></div>';\n      const sw = document.createElement('div'); sw.className='swatches';\n      PALETTE.forEach(c => {{\n        const d = document.createElement('div'); d.className='swatch'; d.style.background=c;\n        d.title = c;\n        d.onclick = () => {{ ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx(); }};\n        sw.appendChild(d);\n      }});\n      // Custom picker\n      const custom = document.createElement('div');\n      custom.className='ctx-item';\n      custom.textContent='カスタムカラー…';\n      custom.onclick = () => {{\n        hiddenColorPicker.value = ctxNode.data('color') || '#999999';\n        hiddenColorPicker.onchange = () => {{\n          const c = hiddenColorPicker.value;\n          ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx();\n        }};\n        hiddenColorPicker.click();\n      }};\n      colorRow.appendChild(sw);\n      ctx.appendChild(colorRow);\n      ctx.appendChild(custom);\n\n      // Note editor\n      const noteBtn = document.createElement('div');\n      noteBtn.className='ctx-item';\n      noteBtn.textContent='注釈を追加/編集…';\n      noteBtn.onclick = () => {{\n        const cur = ctxNode.data('note') || '';\n        const txt = window.prompt('ノードの注釈（空で削除）', cur);\n        if (txt === null) return;\n        const orig = ctxNode.data('orig_label') || ctxNode.data('label') || ctxNode.id();\n        if (txt.trim() === '') {{\n          ctxNode.data('note', null);\n          ctxNode.data('label', orig);\n        }} else {{\n          ctxNode.data('note', txt);\n          ctxNode.data('label', orig + '\\n' + txt);\n        }}\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(noteBtn);\n\n      // Reset color\n      const resetColor = document.createElement('div');\n      resetColor.className='ctx-item';\n      resetColor.textContent='色をリセット';\n      resetColor.onclick = () => {{\n        ctxNode.data('color', null);\n        // Revert to type-based color by removing inline style\n        ctxNode.removeStyle('background-color');\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(resetColor);\n\n      // Separator\n      const sep = document.createElement('div'); sep.className='ctx-sep'; ctx.appendChild(sep);\n\n      // Save layout now\n      const saveBtn = document.createElement('div');\n      saveBtn.className='ctx-item';\n      saveBtn.textContent='レイアウトを保存';\n      saveBtn.onclick = () => {{ saveState(); closeCtx(); }};\n      ctx.appendChild(saveBtn);\n\n      // Open\n      ctx.style.left = Math.round(x) + 'px';\n      ctx.style.top  = Math.round(y) + 'px';\n      ctx.style.display = 'block';\n    }}\n\n    function closeCtx() {{ ctx.style.display='none'; ctxNode = null; }}\n\n  </script>\n</body>\n</html>"""
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    html = html.replace('</style>', ".build-id{margin:0.4rem 0 0;color:#444;font-size:0.9rem;}</style>", 1)
+    html = html.replace('<h1>{title}</h1>', f"<h1>{title}</h1><p class='build-id'>Build: {build_id}</p>", 1)
     with open(path, 'w', encoding='utf-8') as f:
         f.write(html)
     print('[REPORT]', path)
@@ -5199,7 +6927,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
         return _run_default_fractal_demo()
     _ensure_matplotlib_agg(force=True)
     ap = argparse.ArgumentParser(description='Spiral-NEAT NumPy | built-in CLI')
-    ap.add_argument('--task', choices=['xor', 'circles', 'spiral'])
+    ap.add_argument('--task', dest='tasks_single', action='append', nargs='+', choices=['xor', 'circles', 'spiral'], help='one or more supervised tasks to evolve (repeatable)')
+    ap.add_argument('--tasks', dest='tasks_single', action='append', nargs='+', choices=['xor', 'circles', 'spiral'], help=argparse.SUPPRESS)
     ap.add_argument('--gens', type=int, default=60)
     ap.add_argument('--pop', type=int, default=64)
     ap.add_argument('--steps', type=int, default=80)
@@ -5213,83 +6942,107 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--rl-temp', type=float, default=1.0)
     ap.add_argument('--rl-gameplay-gif', action='store_true')
     ap.add_argument('--out', default='out_monolith_cli')
-    ap.add_argument('--make-gifs', action='store_true')
-    ap.add_argument('--make-lineage', action='store_true')
-    ap.add_argument('--gallery', nargs='*', default=[])
-    ap.add_argument('--gallery-analysis-only', action='store_true', help='compose gallery from current run without rerun')
     ap.add_argument('--report', action='store_true')
+    ap.add_argument('--version', action='store_true', help='print build information and exit')
+    ap.add_argument('--sync-spinor-seeds', action='store_true', help='bind spinor evaluator and weaver RNGs to --seed')
     args = ap.parse_args(argv_list)
+    requested_tasks: List[str] = []
+    if getattr(args, 'tasks_single', None):
+        for chunk in args.tasks_single:
+            requested_tasks.extend(chunk)
+    requested_tasks = list(dict.fromkeys(requested_tasks))
+    if args.version:
+        info = _resolve_build_info()
+        print(_build_stamp_text())
+        print(f"git hash : {info['hash']}")
+        print(f"timestamp: {info['timestamp']}")
+        return 0
+    print(f"[INFO] {_build_stamp_text()}")
+    global _SPINOR_BOUND_SEED
+    _SPINOR_BOUND_SEED = args.seed if args.sync_spinor_seeds else None
     script_name = os.path.basename(__file__) if '__file__' in globals() else 'spiral_monolith_neat_numpy.py'
     os.makedirs(args.out, exist_ok=True)
-    figs: Dict[str, Optional[str]] = {}
-    report_meta: Dict[str, Optional[Dict[str, Any]]] = {'supervised': None, 'rl': None}
-    if args.task:
-        np.random.seed(args.seed)
-        res = run_backprop_neat_experiment(args.task, gens=args.gens, pop=args.pop, steps=args.steps, out_prefix=os.path.join(args.out, args.task), make_gifs=args.make_gifs, make_lineage=args.make_lineage, rng_seed=args.seed)
-        figs['図1 学習曲線＋複雑度'] = res.get('learning_curve')
-        figs['図2 最良トポロジ'] = res.get('topology')
-        db_path = res.get('decision_boundary')
-        if db_path and os.path.exists(db_path):
-            figs['図3 決定境界'] = db_path
-        regen_gif = res.get('regen_gif')
-        if regen_gif and os.path.exists(regen_gif) and (imageio is not None):
-            with imageio.get_reader(regen_gif) as r:
-                idx = max(0, r.get_length() // 2 - 1)
-                frame = r.get_data(idx)
-                fig3 = os.path.join(args.out, f'{args.task}_fig3_regen_frame.png')
-                _imwrite_image(fig3, frame)
-                figs['図3A 再生ダイジェスト代表フレーム'] = fig3
-        scars_spiral_path = res.get('scars_spiral')
-        has_scars_spiral = bool(scars_spiral_path and os.path.exists(scars_spiral_path))
-        if has_scars_spiral:
-            figs['図4 螺旋再生ヒートマップ'] = scars_spiral_path
-        else:
-            figs['図4 螺旋再生ヒートマップ'] = res.get('scars_spiral')
-        lineage_path = res.get('lineage')
-        has_lineage = bool(lineage_path and os.path.exists(lineage_path))
-        if has_lineage:
-            figs['図5 系統ラインエイジ'] = lineage_path
-        regen_log = res.get('lcs_log')
-        has_regen_log = bool(regen_log and os.path.exists(regen_log))
-        if has_regen_log:
-            figs['LCS Healing Log'] = regen_log
-        ribbon = res.get('lcs_ribbon')
-        has_ribbon = bool(ribbon and os.path.exists(ribbon))
-        if has_ribbon:
-            figs['LCS Ribbon'] = ribbon
-        timeline = res.get('lcs_timeline')
-        has_timeline = bool(timeline and os.path.exists(timeline))
-        if has_timeline:
-            figs['LCS Timeline'] = timeline
-        resilience_log = res.get('resilience_log')
-        has_resilience_log = bool(resilience_log and os.path.exists(resilience_log))
-        if has_resilience_log:
-            figs['Resilience Tracebacks'] = resilience_log
-        history = res.get('history') or []
-        best_fit = max((b for b, _a in history), default=None)
-        final_best = history[-1][0] if history else None
-        final_avg = history[-1][1] if history else None
-        initial_best = history[0][0] if history else None
-        report_meta['supervised'] = {'task': args.task, 'gens': args.gens, 'pop': args.pop, 'steps': args.steps, 'best_fit': best_fit, 'final_best': final_best, 'final_avg': final_avg, 'initial_best': initial_best, 'has_lineage': has_lineage, 'has_regen_log': has_regen_log, 'has_lcs_viz': bool(has_ribbon or has_timeline), 'has_spiral': has_scars_spiral, 'has_resilience': has_resilience_log}
+    figs: Dict[str, Optional[str]] = OrderedDict()
+    report_meta: Dict[str, Any] = {'supervised': [], 'rl': None}
+    supervised_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 
-        # If analysis-only gallery is requested, compose from current run and skip rerun
-    if args.gallery and args.gallery_analysis_only and args.task:
-        gal_dir = os.path.join(args.out, 'gallery')
-        os.makedirs(gal_dir, exist_ok=True)
-        gal = compose_gallery_from_existing(res, out_dir=gal_dir, task=args.task, idx=1)
-        for k, v in gal.items():
-            figs[f'ギャラリー {k}'] = v
-        args.gallery = []
-    if args.gallery:
-        gal = export_task_gallery(
-            tasks=tuple(args.gallery),
-            gens=max(6, args.gens),
-            pop=max(12, args.pop),
-            steps=max(10, args.steps),
-            out_dir=os.path.join(args.out, 'gallery'),
-        )
-        for k, v in gal.items():
-            figs[f'ギャラリー {k}'] = v
+    def _add_artifact(label: str, path: Optional[str]):
+        if not path:
+            return
+        try:
+            resolved = os.path.abspath(path)
+        except Exception:
+            resolved = path
+        if os.path.exists(resolved):
+            figs[label] = resolved
+
+    if requested_tasks:
+        np.random.seed(args.seed)
+        for task in requested_tasks:
+            out_prefix = os.path.join(args.out, task)
+            res = run_backprop_neat_experiment(task, gens=args.gens, pop=args.pop, steps=args.steps, out_prefix=out_prefix, make_gifs=True, make_lineage=True, rng_seed=args.seed)
+            supervised_results[task] = res
+            label_base = task.upper()
+            _add_artifact(f'{label_base} | Learning Curve + Complexity', res.get('learning_curve'))
+            _add_artifact(f'{label_base} | Decision Boundary', res.get('decision_boundary'))
+            _add_artifact(f'{label_base} | Best Topology', res.get('topology'))
+            for idx, path in enumerate(res.get('top3_topologies') or [], 1):
+                _add_artifact(f'{label_base} | Topology Rank {idx}', path)
+            regen_gif = res.get('regen_gif')
+            _add_artifact(f'{label_base} | Regeneration GIF', regen_gif)
+            if regen_gif and os.path.exists(regen_gif) and imageio is not None:
+                try:
+                    with imageio.get_reader(regen_gif) as reader:
+                        idx = max(0, reader.get_length() // 2 - 1)
+                        frame = reader.get_data(idx)
+                    frame_path = os.path.join(args.out, f'{task}_regen_frame.png')
+                    _imwrite_image(frame_path, frame)
+                    _add_artifact(f'{label_base} | Regeneration Snapshot', frame_path)
+                except Exception:
+                    pass
+            morph_gif = res.get('morph_gif')
+            _add_artifact(f'{label_base} | Morph GIF', morph_gif)
+            lineage_path = res.get('lineage')
+            _add_artifact(f'{label_base} | Lineage', lineage_path)
+            scars_spiral_path = res.get('scars_spiral')
+            _add_artifact(f'{label_base} | Spiral Scar Map', scars_spiral_path)
+            regen_log = res.get('lcs_log')
+            _add_artifact(f'{label_base} | LCS Healing Log', regen_log)
+            ribbon = res.get('lcs_ribbon')
+            _add_artifact(f'{label_base} | LCS Ribbon', ribbon)
+            timeline = res.get('lcs_timeline')
+            _add_artifact(f'{label_base} | LCS Timeline', timeline)
+            resilience_log = res.get('resilience_log')
+            _add_artifact(f'{label_base} | Resilience Tracebacks', resilience_log)
+            bp_variant = res.get('backprop_variation')
+            if isinstance(bp_variant, dict):
+                _add_artifact(f'{label_base} | Backprop Variation', bp_variant.get('figure'))
+            summary_decisions = res.get('summary_decisions') or {}
+            if isinstance(summary_decisions, dict):
+                for variant_name, variant_path in summary_decisions.items():
+                    _add_artifact(f'{label_base} | Decision {variant_name}', variant_path)
+            history = res.get('history') or []
+            best_fit = max((b for b, _a in history), default=None)
+            final_best = history[-1][0] if history else None
+            final_avg = history[-1][1] if history else None
+            initial_best = history[0][0] if history else None
+            sup_summary = {
+                'task': task,
+                'gens': args.gens,
+                'pop': args.pop,
+                'steps': args.steps,
+                'best_fit': best_fit,
+                'final_best': final_best,
+                'final_avg': final_avg,
+                'initial_best': initial_best,
+                'has_lineage': bool(lineage_path and os.path.exists(lineage_path)),
+                'has_regen_log': bool(regen_log and os.path.exists(regen_log)),
+                'has_lcs_viz': bool((ribbon and os.path.exists(ribbon)) or (timeline and os.path.exists(timeline))),
+                'has_spiral': bool(scars_spiral_path and os.path.exists(scars_spiral_path)),
+                'has_resilience': bool(resilience_log and os.path.exists(resilience_log)),
+            }
+            report_meta['supervised'].append(sup_summary)
+    rl_history: List[Tuple[float, float]] = []
     if args.rl_env:
         try:
             gym = _import_gym()
@@ -5312,6 +7065,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                     os.remove(regen_log_path)
             fit = gym_fitness_factory(args.rl_env, stochastic=args.rl_stochastic, temp=args.rl_temp, max_steps=args.rl_max_steps, episodes=args.rl_episodes)
             best, hist = neat.evolve(fit, n_generations=args.rl_gens, verbose=True, env_schedule=_default_difficulty_schedule)
+            rl_history = list(hist)
             rl_resilience_log = None
             rl_failures = list(getattr(neat, '_resilience_failures', [])) if hasattr(neat, '_resilience_failures') else []
             if rl_failures:
@@ -5337,7 +7091,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             plt.title(f'{args.rl_env} | Average Episode Reward')
             plt.legend()
             plt.tight_layout()
-            plt.savefig(rc_png, dpi=150)
+            fig = plt.gcf()
+            _savefig(fig, rc_png, dpi=150)
             plt.close()
             figs['RL 平均エピソード報酬'] = rc_png
             if rl_resilience_log and os.path.exists(rl_resilience_log):
@@ -5375,17 +7130,20 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
         except Exception as e:
             print('[WARN] RL branch skipped:', e)
     if args.report:
-        if args.task:
-            title = f'{args.task.upper()} | Interactive NEAT Report'
-            html_path = os.path.join(args.out, f'{args.task}_interactive.html')
-            export_interactive_html_report(html_path, title=title, history=res.get('history', []), genomes=res.get('genomes_cyto', []), max_genomes=60)
-        if args.rl_env:
+        for task, res in supervised_results.items():
+            title = f'{task.upper()} | Interactive NEAT Report'
+            html_path = os.path.join(args.out, f'{task}_interactive.html')
+            try:
+                export_interactive_html_report(html_path, title=title, history=res.get('history', []), genomes=res.get('genomes_cyto', []), max_genomes=60)
+            except Exception as report_err:
+                print(f'[WARN] Interactive report failed for {task}:', report_err)
+        if args.rl_env and rl_history:
             title = f'{args.rl_env} | Interactive NEAT Report'
             html_path = os.path.join(args.out, f"{args.rl_env.replace(':', '_')}_interactive.html")
             try:
-                export_interactive_html_report(html_path, title=title, history=hist, genomes=[], max_genomes=1)
-            except Exception:
-                pass
+                export_interactive_html_report(html_path, title=title, history=rl_history, genomes=[], max_genomes=1)
+            except Exception as rl_report_err:
+                print('[WARN] RL interactive report failed:', rl_report_err)
         if figs:
 
             def _data_uri(p: str) -> Tuple[str, str]:
@@ -5410,9 +7168,9 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                 f.write("<style>body{font-family:'Hiragino Sans','Noto Sans JP',sans-serif;background:#fafafa;color:#222;line-height:1.6;padding:2rem;}header.cover{background:#fff;border:1px solid #ddd;border-radius:12px;padding:1.5rem;margin-bottom:2rem;box-shadow:0 8px 20px rgba(0,0,0,0.05);}header.cover h1{margin-top:0;font-size:1.9rem;}header.cover p.meta{margin:0.35rem 0 0.6rem 0;}header.cover ul{margin:0;padding-left:1.2rem;}section.summary,section.legend,section.narrative,section.examples{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:1.25rem;margin-bottom:2rem;box-shadow:0 10px 24px rgba(0,0,0,0.035);}section.summary h2,section.legend h2,section.narrative h2,section.examples h2{margin-top:0;font-size:1.35rem;}section.summary ul{margin:0;padding-left:1.4rem;}section.legend ol{margin:0;padding-left:1.4rem;}section.narrative p{margin:0 0 0.8rem 0;}section.examples ul{margin:0;padding-left:1.4rem;}section.examples li{margin:0 0 0.65rem 0;}section.examples code{background:#f4f4f4;border-radius:6px;display:block;padding:0.35rem 0.55rem;font-size:0.92rem;}figure{background:#fff;border:1px solid #e8e8e8;border-radius:12px;padding:1rem;margin:0 0 2rem 0;box-shadow:0 12px 24px rgba(0,0,0,0.04);}figure img,figure video{width:100%;height:auto;border-radius:8px;}figcaption{margin-top:0.75rem;font-weight:600;}</style></head><body>")
                 f.write("<header class='cover'>")
                 f.write('<h1>Spiral Monolith NEAT Report / スパイラル・モノリスNEATレポート</h1>')
-                f.write(f"<p class='meta'>Generated at / 生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Primary Task / 主タスク: {(args.task.upper() if args.task else 'N/A')}</p>")
-                if args.gallery:
-                    f.write("<p class='meta'>Gallery Tasks / ギャラリー対象: " + ', '.join((htmllib.escape(t.upper()) for t in args.gallery)) + '</p>')
+                primary_label = ', '.join(t.upper() for t in requested_tasks) if requested_tasks else 'N/A'
+                f.write(f"<p class='meta'>Generated at / 生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Supervised Tasks / 教師ありタスク: {primary_label}</p>")
+                f.write(f"<p class='meta'>Build / ビルド: {_build_stamp_short()}</p>")
                 f.write('<ul>')
                 f.write(f'<li>Generations / 世代数: {args.gens}</li>')
                 f.write(f'<li>Population / 個体数: {args.pop}</li>')
@@ -5425,8 +7183,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
 
                 def _fmt_float(val: Optional[float]) -> str:
                     return '–' if val is None else f'{val:.4f}'
-                sup_meta = report_meta.get('supervised')
-                if sup_meta:
+                for sup_meta in report_meta.get('supervised') or []:
                     extras = []
                     if sup_meta.get('has_regen_log'):
                         extras.append('LCS log')
@@ -5466,7 +7223,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                 f.write("<section class='narrative'><h2>Evolution Digest / 進化ダイジェスト</h2>")
                 f.write('<p>Early generations showed smooth structural adaptation and convergence under low-difficulty conditions.</p>')
                 f.write('<p>However, as environmental difficulty and noise increased, regeneration-driven mutations began to trigger bursts of morphological diversification, resembling biological punctuated equilibria.</p>')
-                if sup_meta and sup_meta.get('has_regen_log'):
+                any_sup = next((m for m in report_meta.get('supervised') or [] if m.get('has_regen_log')), None)
+                if any_sup:
                     f.write('<p>LCS metrics highlighted how severed pathways recovered within the allowed healing window, aligning regenerative bursts with topology repairs.</p>')
                 f.write('</section>')
                 if entries:
@@ -5474,11 +7232,14 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                     for label, path in entries:
                         f.write(f'<li><strong>{htmllib.escape(label)}</strong><br><small>{htmllib.escape(os.path.basename(path))}</small></li>')
                     f.write('</ol></section>')
-                cli_examples = [f"python {script_name} --task {htmllib.escape(args.task or 'spiral')} --gens {max(args.gens, 60)} --pop {max(args.pop, 64)} --steps {max(args.steps, 80)} --make-gifs --make-lineage --report --out demo_{htmllib.escape(args.task or 'spiral')}", f'python {script_name} --task xor --gallery spiral circles --gens 40 --pop 48 --steps 60 --report --out gallery_pack']
+                cli_examples = [
+                    f"python {script_name} --task spiral xor --gens {max(args.gens, 60)} --pop {max(args.pop, 64)} --steps {max(args.steps, 80)} --report --out demo_multitask",
+                    f"python {script_name} --task circles --gens {max(40, args.gens)} --pop {max(48, args.pop)} --steps {max(60, args.steps)} --report --out circles_run",
+                ]
                 rl_example_env = args.rl_env or 'CartPole-v1'
                 cli_examples.append(f"python {script_name} --rl-env {htmllib.escape(rl_example_env)} --rl-gens {max(args.rl_gens, 30)} --rl-pop {max(args.rl_pop, 32)} --rl-episodes {max(args.rl_episodes, 2)} --rl-max-steps {args.rl_max_steps} --report --out rl_{htmllib.escape(rl_example_env.replace(':', '_'))}")
                 f.write("<section class='examples'><h2>CLI Quickstart / CLIクイックスタート</h2>")
-                f.write('<p>Use the following commands as templates for supervised runs, gallery batches, and Gym integrations.</p>')
+                f.write('<p>Use the following commands as templates for supervised batches and Gym integrations.</p>')
                 f.write('<ul>')
                 for cmd in cli_examples:
                     f.write(f'<li><code>{cmd}</code></li>')
@@ -5496,6 +7257,19 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                         f.write(f"<figure><a href='{uri}'>download {htmllib.escape(os.path.basename(p))}</a><figcaption><strong>{escaped_label}</strong></figcaption></figure>")
                 f.write('</body></html>')
             print('[REPORT]', html)
+        manifest_path = os.path.join(args.out, 'artifact_manifest.json')
+        manifest_payload = {
+            'build_id': _build_stamp_short(),
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+            'figures': {k: v for k, v in figs.items()},
+            'report_meta': report_meta,
+        }
+        try:
+            with open(manifest_path, 'w', encoding='utf-8') as mf:
+                json.dump(manifest_payload, mf, indent=2, ensure_ascii=False)
+            print(f'[REPORT] manifest → {manifest_path}')
+        except Exception as manifest_err:
+            print('[WARN] Failed to write artifact manifest:', manifest_err)
     print('[OK] outputs in:', args.out)
     return 0
 try:
@@ -5526,7 +7300,7 @@ _SHM_META = {}
 _SHM_CACHE = {}
 _SHM_HANDLES = {}
 STRUCTURAL_EPS = 1e-09
-__all__ = ['NodeGene', 'ConnectionGene', 'InnovationTracker', 'Genome', 'compatibility_distance', 'EvalMode', 'ReproPlanaNEATPlus', 'compile_genome', 'forward_batch', 'train_with_backprop_numpy', 'predict', 'predict_proba', 'fitness_backprop_classifier', 'make_circles', 'make_xor', 'make_spirals', 'draw_genome_png', 'export_regen_gif', 'export_morph_gif', 'export_double_exposure', 'plot_learning_and_complexity', 'plot_decision_boundary', 'export_decision_boundaries_all', 'render_lineage', 'export_scars_spiral_map', 'output_dim_from_space', 'build_action_mapper', 'eval_with_node_activations', 'run_policy_in_env', 'run_gym_neat_experiment', 'LCSMonitor', 'summarize_graph_changes', 'load_lcs_log', 'export_lcs_ribbon_png', 'export_lcs_timeline_gif', 'PerSampleSequenceStopperPro']
+__all__ = ['NodeGene', 'ConnectionGene', 'InnovationTracker', 'Genome', 'compatibility_distance', 'HouseholdManager', 'EvalMode', 'ReproPlanaNEATPlus', 'SpinorGroupInteraction', 'SpinorScheduler', 'NomologyEnv', 'SelfReproducingEvaluator', 'SpinorNomologyDatasetController', 'SpinorNomologyFitness', 'compile_genome', 'forward_batch', 'train_with_backprop_numpy', 'predict', 'predict_proba', 'fitness_backprop_classifier', 'make_circles', 'make_xor', 'make_spirals', 'draw_genome_png', 'export_regen_gif', 'export_morph_gif', 'export_double_exposure', 'plot_learning_and_complexity', 'plot_decision_boundary', 'export_backprop_variation', 'export_decision_boundaries_all', 'render_lineage', 'export_scars_spiral_map', 'output_dim_from_space', 'build_action_mapper', 'eval_with_node_activations', 'run_policy_in_env', 'run_gym_neat_experiment', 'LCSMonitor', 'summarize_graph_changes', 'load_lcs_log', 'export_lcs_ribbon_png', 'export_lcs_timeline_gif', 'PerSampleSequenceStopperPro']
 INF = 10 ** 12
 PATCHED_PATH = __file__
 spec = None
@@ -5538,27 +7312,85 @@ def rotate_2d(x: np.ndarray, theta: float) -> np.ndarray:
     R = np.array([[c, -s], [s, c]], dtype=np.float32)
     return (R @ x.T).T
 
-def augment_with_spinor(X: np.ndarray, theta: float) -> Tuple[np.ndarray, int]:
+
+def _hex_to_rgba(hex_color: Optional[str], alpha: float=0.15) -> Tuple[float, float, float, float]:
+    color = str(hex_color or '').strip()
+    if color.startswith('#'):
+        color = color[1:]
+    if len(color) == 3:
+        color = ''.join((ch * 2 for ch in color))
+    try:
+        r = int(color[0:2], 16) / 255.0
+        g = int(color[2:4], 16) / 255.0
+        b = int(color[4:6], 16) / 255.0
+    except Exception:
+        r = g = b = 0.62
+    return (
+        float(np.clip(r, 0.0, 1.0)),
+        float(np.clip(g, 0.0, 1.0)),
+        float(np.clip(b, 0.0, 1.0)),
+        float(np.clip(alpha, 0.0, 1.0)),
+    )
+
+
+def augment_with_spinor(
+    X: np.ndarray,
+    theta: float,
+    parity: Optional[int]=None,
+    group_embed: Optional[np.ndarray]=None,
+) -> Tuple[np.ndarray, int]:
     s = SpinorScheduler.spinor_vec(theta)
-    p = SpinorScheduler.parity(theta)
+    p = SpinorScheduler.parity(theta) if parity is None else int(parity)
     s_tiled = np.tile(s.reshape(1, 2), (X.shape[0], 1))
     p_col = np.full((X.shape[0], 1), float(p), dtype=np.float32)
-    return (np.concatenate([X, s_tiled, p_col], axis=1).astype(np.float32), p)
+    parts = [X, s_tiled, p_col]
+    if group_embed is not None:
+        ge = np.asarray(group_embed, dtype=np.float32).reshape(1, -1)
+        ge_tiled = np.tile(ge, (X.shape[0], 1))
+        parts.append(ge_tiled)
+    return (np.concatenate(parts, axis=1).astype(np.float32), p)
 
-def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_std: float=0.07, nomology_intensity: float=0.25, drift_scale: float=0.006, seed: int=0, out_prefix: str='/mnt/data/spinor_neat') -> Dict[str, str]:
+def run_spinor_monolith(
+    gens: int=40,
+    pop: int=80,
+    period_gens: int=36,
+    jitter_std: float=0.07,
+    nomology_intensity: float=0.25,
+    drift_scale: float=0.006,
+    seed: int=0,
+    out_prefix: str='/mnt/data/spinor_neat',
+    spinor_bind_seed: Optional[int]=None,
+) -> Dict[str, str]:
     os.environ['NEAT_EVAL_BACKEND'] = 'thread'
+    global _SPINOR_BOUND_SEED
+    if spinor_bind_seed is None:
+        spinor_bind_seed = _SPINOR_BOUND_SEED
     rng = np.random.default_rng(seed)
-    spin = SpinorScheduler(period_gens=period_gens, jitter_std=jitter_std, seed=seed)
-    env = NomologyEnv(intensity=nomology_intensity, drift_scale=drift_scale, seed=seed)
+    group = SpinorGroupInteraction.dihedral(order=6, seed=seed)
+    spin = SpinorScheduler(period_gens=period_gens, jitter_std=jitter_std, seed=seed, group=group)
+    env = NomologyEnv(
+        intensity=nomology_intensity,
+        drift_scale=drift_scale,
+        seed=seed,
+        noise_weaver_seed=spinor_bind_seed if spinor_bind_seed is not None else None,
+    )
     tel = Telemetry(f'{out_prefix}_telemetry.csv', f'{out_prefix}_regimes.csv')
-    out_dim = 2
-    neat_inst = neat.ReproPlanaNEATPlus(num_inputs=5, num_outputs=out_dim, population_size=pop, output_activation='identity', rng=rng)
-    neat._apply_stable_neat_defaults(neat_inst)
-    neat_inst.max_hidden_nodes = max(getattr(neat_inst, 'max_hidden_nodes', 128), 192)
-    neat_inst.max_edges = max(getattr(neat_inst, 'max_edges', 1024), 2048)
-    controller = SpinorNomologyDatasetController(spin, env, rng, n_tr=512, n_va=256)
+    controller = SpinorNomologyDatasetController(
+        spin,
+        env,
+        rng,
+        n_tr=512,
+        n_va=256,
+        evaluator_seed=spinor_bind_seed,
+    )
     controller.telemetry = tel
     controller.update_for_generation(0, shmem=False)
+    out_dim = 2
+    neat_inst = neat.ReproPlanaNEATPlus(num_inputs=controller.feature_dim, num_outputs=out_dim, population_size=pop, output_activation='identity', rng=rng)
+    neat._apply_stable_neat_defaults(neat_inst)
+    neat_inst.spinor_controller = controller
+    neat_inst.max_hidden_nodes = max(getattr(neat_inst, 'max_hidden_nodes', 128), 192)
+    neat_inst.max_edges = max(getattr(neat_inst, 'max_edges', 1024), 2048)
     fit = SpinorNomologyFitness(controller=controller, get_generation=lambda: neat_inst.generation, steps=40, lr=0.005, l2=0.0001, alpha_nodes=0.001, alpha_edges=0.0005)
     hist = neat_inst.evolve(fit, n_generations=gens, target_fitness=None, verbose=True, env_schedule=None)
     resilience_log = None
@@ -5594,14 +7426,22 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
                 out.append(0)
         return np.array(out, dtype=np.int32)
 
+    def _str_col(rows: List[Dict[str, str]], key: str) -> List[str]:
+        return [str(row.get(key, '')) for row in rows]
+
     g = _int_col(tele_rows, 'gen') if tele_rows else np.array([], dtype=np.int32)
     theta4 = _float_col(tele_rows, 'theta_mod_4pi') if tele_rows else np.array([], dtype=np.float64)
     parity = _int_col(tele_rows, 'parity') if tele_rows else np.array([], dtype=np.int32)
     theta_raw = _float_col(tele_rows, 'theta') if tele_rows else np.array([], dtype=np.float64)
     noise_seq = _float_col(tele_rows, 'noise') if tele_rows else np.array([], dtype=np.float64)
+    noise_kind_seq = np.array(_str_col(tele_rows, 'noise_kind')) if tele_rows else np.array([], dtype=object)
     turns_seq = _float_col(tele_rows, 'turns') if tele_rows else np.array([], dtype=np.float64)
     rot_bias_seq = _float_col(tele_rows, 'rot_bias') if tele_rows else np.array([], dtype=np.float64)
     regime_ids = _int_col(tele_rows, 'regime_id') if tele_rows else np.array([], dtype=np.int32)
+    group_idx_seq = _int_col(tele_rows, 'group_idx') if tele_rows else np.array([], dtype=np.int32)
+    group_energy_seq = _float_col(tele_rows, 'group_energy') if tele_rows else np.array([], dtype=np.float64)
+    group_label_seq = np.array(_str_col(tele_rows, 'group_label')) if tele_rows else np.array([], dtype=object)
+    evaluator_notes = _str_col(tele_rows, 'evaluator_note') if tele_rows else []
 
     plt.figure()
     if g.size:
@@ -5610,7 +7450,8 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     plt.ylabel('theta mod 4π')
     fig1 = f'{out_prefix}_phase.png'
     plt.tight_layout()
-    plt.savefig(fig1, dpi=160)
+    fig = plt.gcf()
+    _savefig(fig, fig1, dpi=160)
     plt.close()
     plt.figure()
     if g.size:
@@ -5619,7 +7460,8 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     plt.ylabel('parity (2π branch)')
     fig2 = f'{out_prefix}_parity.png'
     plt.tight_layout()
-    plt.savefig(fig2, dpi=160)
+    fig = plt.gcf()
+    _savefig(fig, fig2, dpi=160)
     plt.close()
     plt.figure()
     if g.size:
@@ -5635,8 +7477,63 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     plt.ylabel('theta mod 4π (regimes)')
     fig3 = f'{out_prefix}_regimes.png'
     plt.tight_layout()
-    plt.savefig(fig3, dpi=160)
+    fig = plt.gcf()
+    _savefig(fig, fig3, dpi=160)
     plt.close()
+
+    fig_noise: Optional[str] = None
+    if g.size:
+        fig_noise = f'{out_prefix}_noise_timeline.png'
+        fig, ax = plt.subplots(figsize=(8.2, 3.8))
+        colors = []
+        for idx in range(len(g)):
+            kind = noise_kind_seq[idx] if noise_kind_seq.size else ''
+            style = _resolve_noise_style(kind, None) if kind else None
+            col = style.get('color', '#6c757d') if style else '#6c757d'
+            colors.append(col)
+        ax.plot(g, noise_seq, color='#495057', lw=1.0, alpha=0.4)
+        if colors:
+            ax.scatter(g, noise_seq, c=colors, s=28, alpha=0.9, edgecolors='none')
+        if noise_kind_seq.size:
+            span_start = 0
+            current_kind = noise_kind_seq[0]
+            for idx in range(1, len(g) + 1):
+                if idx == len(g) or noise_kind_seq[idx] != current_kind:
+                    start_gen = float(g[span_start])
+                    end_gen = float(g[idx - 1]) + 1.0
+                    style = _resolve_noise_style(current_kind, None)
+                    ax.axvspan(start_gen, end_gen, color=_hex_to_rgba(style.get('color'), 0.12), lw=0)
+                    span_start = idx
+                    if idx < len(g):
+                        current_kind = noise_kind_seq[idx]
+        ax.set_xlabel('generation')
+        ax.set_ylabel('noise σ')
+        ax.set_title('Noise schedule & spectral mode')
+        legend_handles: List[Line2D] = []
+        seen_kinds: Set[str] = set()
+        for kind in noise_kind_seq:
+            key = str(kind)
+            if not key or key in seen_kinds:
+                continue
+            style = _resolve_noise_style(key, None)
+            handle = Line2D(
+                [0],
+                [0],
+                marker='o',
+                linestyle='None',
+                markersize=8,
+                markerfacecolor=style.get('color', '#6c757d'),
+                markeredgecolor='none',
+                label=f"{style.get('symbol', '?')} {style.get('label', key)}",
+            )
+            legend_handles.append(handle)
+            seen_kinds.add(key)
+        if legend_handles:
+            ax.legend(handles=legend_handles, loc='upper right', frameon=False, fontsize=9, title='noise kind')
+        ax.grid(True, alpha=0.18, linestyle='--', linewidth=0.6)
+        fig.tight_layout()
+        _savefig(fig, fig_noise, dpi=170)
+        plt.close(fig)
 
     spinor_grid_png: Optional[str] = None
     spinor_transition_gif: Optional[str] = None
@@ -5685,7 +7582,21 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
             for ax, idx in zip(axes_arr, snapshots):
                 X_vis, y_vis = _synth_snapshot(idx)
                 ax.scatter(X_vis[:, 0], X_vis[:, 1], c=y_vis, cmap='coolwarm', s=12, alpha=0.7, edgecolors='none')
-                ax.set_title(f'gen {int(g[idx])} | regime {int(regime_ids[idx])} | parity {int(parity[idx])}')
+                grp_label = group_label_seq[idx] if group_label_seq.size else ''
+                note = evaluator_notes[idx] if idx < len(evaluator_notes) else ''
+                title = f'gen {int(g[idx])} | regime {int(regime_ids[idx])} | parity {int(parity[idx])}'
+                kind = noise_kind_seq[idx] if noise_kind_seq.size else ''
+                if kind:
+                    style = _resolve_noise_style(kind, None)
+                    title += f" | {style.get('symbol', '?')} {style.get('label', kind)}"
+                    ax.set_facecolor(_hex_to_rgba(style.get('color'), 0.1))
+                else:
+                    ax.set_facecolor('#f8f9fa')
+                if grp_label:
+                    title += f' | {grp_label}'
+                if note:
+                    title += f' | {note}'
+                ax.set_title(title)
                 ax.add_patch(FancyArrowPatch((0.0, 0.0), (math.cos(theta_raw[idx] + rot_bias_seq[idx]), math.sin(theta_raw[idx] + rot_bias_seq[idx])), arrowstyle='->', mutation_scale=12, lw=1.5, color='#444444'))
                 ax.set_xlim(-1.6, 1.6)
                 ax.set_ylim(-1.6, 1.6)
@@ -5695,9 +7606,9 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
                 ax.grid(False)
             for ax in axes_arr[len(snapshots):]:
                 ax.axis('off')
-            plt.tight_layout()
+            fig.tight_layout()
             spinor_grid_png = f'{out_prefix}_spinor_transition_grid.png'
-            plt.savefig(spinor_grid_png, dpi=170)
+            _savefig(fig, spinor_grid_png, dpi=170)
             plt.close(fig)
 
         step = max(1, len(g) // 60)
@@ -5707,12 +7618,23 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
             fig, axs = plt.subplots(1, 2, figsize=(7.0, 3.6))
             ax_data, ax_spin = axs
             ax_data.scatter(X_vis[:, 0], X_vis[:, 1], c=y_vis, cmap='coolwarm', s=14, alpha=0.75, edgecolors='none')
+            kind = noise_kind_seq[idx] if noise_kind_seq.size else ''
+            style = _resolve_noise_style(kind, None) if kind else None
+            if style:
+                ax_data.set_facecolor(_hex_to_rgba(style.get('color'), 0.1))
+                ax_spin.set_facecolor(_hex_to_rgba(style.get('color'), 0.12))
+            else:
+                ax_data.set_facecolor('#f8f9fa')
+                ax_spin.set_facecolor('#f8f9fa')
             ax_data.set_xlim(-1.6, 1.6)
             ax_data.set_ylim(-1.6, 1.6)
             ax_data.set_aspect('equal', 'box')
             ax_data.set_xticks([])
             ax_data.set_yticks([])
-            ax_data.set_title(f'gen {int(g[idx])} | regime {int(regime_ids[idx])}')
+            title_data = f'gen {int(g[idx])} | regime {int(regime_ids[idx])}'
+            if style:
+                title_data += f" | {style.get('symbol', '?')} {style.get('label', kind)}"
+            ax_data.set_title(title_data)
             arrow_dataset = FancyArrowPatch((0.0, 0.0), (math.cos(theta_raw[idx] + rot_bias_seq[idx]), math.sin(theta_raw[idx] + rot_bias_seq[idx])), arrowstyle='->', mutation_scale=12, lw=1.8, color='#2ca02c')
             ax_data.add_patch(arrow_dataset)
 
@@ -5727,8 +7649,20 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
             ax_spin.axis('off')
             theta_deg = (float(theta_raw[idx]) % (2.0 * math.pi)) * 180.0 / math.pi
             ax_spin.set_title('spinor orientation')
-            ax_spin.text(0.0, -1.15, f'θ={theta_deg:5.1f}° | parity {int(parity[idx])}', ha='center', va='top', fontsize=10)
-            fig.suptitle('Spinor-fractal transition overview', fontsize=12)
+            grp_label = group_label_seq[idx] if group_label_seq.size else ''
+            energy = group_energy_seq[idx] if group_energy_seq.size else 0.0
+            summary_line = f'θ={theta_deg:5.1f}° | parity {int(parity[idx])}'
+            if grp_label:
+                summary_line += f' | {grp_label}'
+            summary_line += f' | energy {energy:0.2f}'
+            if style:
+                summary_line += f" | {style.get('symbol', '?')} {style.get('label', kind)}"
+            ax_spin.text(0.0, -1.15, summary_line, ha='center', va='top', fontsize=10)
+            note = evaluator_notes[idx] if idx < len(evaluator_notes) else ''
+            title = 'Spinor-fractal transition overview'
+            if note:
+                title += f' ← {note}'
+            fig.suptitle(title, fontsize=12)
             fig.tight_layout()
             fig.canvas.draw()
             w, h = fig.canvas.get_width_height()
@@ -5745,6 +7679,8 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
                 spinor_transition_gif = None
 
     artifacts: Dict[str, Optional[str]] = {'telemetry_csv': tel.tel_csv, 'regimes_csv': tel.reg_csv, 'phase_png': fig1, 'parity_png': fig2, 'regimes_png': fig3}
+    if fig_noise:
+        artifacts['noise_timeline_png'] = fig_noise
     if resilience_log:
         artifacts['resilience_log'] = resilience_log
     if spinor_grid_png:
@@ -5754,20 +7690,190 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     return artifacts
 
 @dataclass
+class SpinorGroupInteraction:
+    name: str
+    elements: np.ndarray
+    cayley: np.ndarray
+    generator_weights: Optional[np.ndarray] = None
+    jitter: float = 0.0
+    seed: Optional[int] = None
+    _rng: np.random.Generator = field(init=False, repr=False)
+    _transposes: np.ndarray = field(init=False, repr=False)
+    _identity: np.ndarray = field(init=False, repr=False)
+    _element_norms: np.ndarray = field(init=False, repr=False)
+    _embeddings: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        elems = np.asarray(self.elements, dtype=np.float32)
+        if elems.ndim != 3 or elems.shape[1:] != (2, 2):
+            raise ValueError('SpinorGroupInteraction.elements must be (k, 2, 2).')
+        cayley = np.asarray(self.cayley, dtype=np.int64)
+        if cayley.shape != (elems.shape[0], elems.shape[0]):
+            raise ValueError('SpinorGroupInteraction.cayley must be square with size equal to number of elements.')
+        self.elements = np.ascontiguousarray(elems)
+        self._transposes = np.ascontiguousarray(np.transpose(self.elements, (0, 2, 1)))
+        self._identity = np.eye(2, dtype=np.float32)
+        self.cayley = cayley
+        n = elems.shape[0]
+        if self.generator_weights is not None:
+            weights = np.asarray(self.generator_weights, dtype=np.float64)
+            if weights.ndim != 1 or weights.size != n:
+                raise ValueError('generator_weights must be 1D with same length as elements.')
+            weights = np.maximum(1e-09, weights)
+            self.generator_weights = weights / weights.sum()
+        else:
+            self.generator_weights = np.full(n, 1.0 / n, dtype=np.float64)
+        self._rng = np.random.default_rng(self.seed)
+        flat = self.elements.reshape(n, -1)
+        self._element_norms = np.linalg.norm(flat, axis=1).astype(np.float32)
+        self._embeddings = flat.astype(np.float32, copy=False)
+
+    @property
+    def size(self) -> int:
+        return int(self.elements.shape[0])
+
+    @property
+    def embed_dim(self) -> int:
+        return 4
+
+    def matrix(self, idx: int) -> np.ndarray:
+        return self.matrix_safe(idx)
+
+    def matrix_safe(self, idx: Optional[int]) -> np.ndarray:
+        if idx is None:
+            return self._identity
+        try:
+            return self.elements[int(idx) % self.size]
+        except Exception:
+            return self._identity
+
+    def embed(self, idx: int) -> np.ndarray:
+        return self.embed_safe(idx)
+
+    def embed_safe(self, idx: Optional[int]) -> np.ndarray:
+        if idx is None:
+            return self._embeddings[0]
+        try:
+            return self._embeddings[int(idx) % self.size]
+        except Exception:
+            return self._embeddings[0]
+
+    def describe(self, idx: Optional[int]) -> str:
+        if idx is None:
+            return 'identity'
+        return f'{self.name}[{int(idx)}]'
+
+    def step(self, state: int) -> int:
+        gen_idx = int(self._rng.choice(self.size, p=self.generator_weights))
+        next_state = int(self.cayley[state, gen_idx])
+        if self.jitter > 0.0:
+            noise = float(self._rng.normal(0.0, self.jitter))
+            if abs(noise) > 0.5:
+                next_state = int(self.cayley[next_state, gen_idx])
+        return int(next_state % self.size)
+
+    def energy(self, idx: Optional[int]) -> float:
+        if idx is None:
+            return 0.0
+        try:
+            return float(self._element_norms[int(idx) % self.size])
+        except Exception:
+            return float(self._element_norms[0])
+
+    def apply_to_points(self, idx: Optional[int], points: np.ndarray) -> np.ndarray:
+        if idx is None or points.size == 0:
+            return points
+        try:
+            mat_t = self._transposes[int(idx) % self.size]
+            return np.asarray(points @ mat_t, dtype=np.float32)
+        except Exception:
+            return np.asarray(points, dtype=np.float32)
+
+    @classmethod
+    def dihedral(cls, order: int=4, twist: float=0.0, seed: Optional[int]=None) -> 'SpinorGroupInteraction':
+        if order <= 0:
+            raise ValueError('order must be positive for dihedral group.')
+        rotations = []
+        for k in range(order):
+            ang = 2.0 * math.pi * k / order
+            c = math.cos(ang)
+            s = math.sin(ang)
+            rotations.append(np.array([[c, -s], [s, c]], dtype=np.float32))
+        reflections = []
+        for k in range(order):
+            ang = math.pi * k / order + twist
+            c = math.cos(ang)
+            s = math.sin(ang)
+            reflections.append(np.array([[c, s], [s, -c]], dtype=np.float32))
+        elems = np.stack(rotations + reflections, axis=0)
+        n = elems.shape[0]
+        cayley = np.zeros((n, n), dtype=np.int64)
+        for i in range(n):
+            for j in range(n):
+                mat = elems[i] @ elems[j]
+                diff = np.linalg.norm(elems - mat, axis=(1, 2))
+                idx = int(np.argmin(diff))
+                cayley[i, j] = idx
+        weights = np.ones(n, dtype=np.float64)
+        weights[:order] = 2.0
+        weights[order:] = 1.0
+        return cls(name=f'D_{order}', elements=elems, cayley=cayley, generator_weights=weights, seed=seed)
+
+@dataclass
 class SpinorScheduler:
-    period_gens: int = 40
+    period_gens: int = 48
     jitter_std: float = 0.06
     seed: Optional[int] = None
     base_phase: float = 0.0
+    group: Optional[SpinorGroupInteraction] = None
+    max_cached_states: int = 1024
     _rng: np.random.Generator = field(init=False, repr=False)
+    _group_states: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _state_order: deque = field(default_factory=deque, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._rng = np.random.default_rng(self.seed)
+        if self.group is not None and not isinstance(self.group, SpinorGroupInteraction):
+            raise TypeError('SpinorScheduler.group must be SpinorGroupInteraction or None.')
 
     def phase(self, gen: int) -> float:
         omega = 4.0 * math.pi / float(max(1, self.period_gens))
         jitter = float(self._rng.normal(0.0, self.jitter_std))
         return self.base_phase + omega * float(gen) + jitter
+
+    def _group_state_for(self, gen: int) -> Tuple[Optional[int], Optional[np.ndarray], Optional[np.ndarray]]:
+        if self.group is None:
+            return (None, None, None)
+        if gen in self._group_states:
+            idx = self._group_states[gen]
+        else:
+            if gen == 0:
+                idx = 0
+            else:
+                prev_idx = self._group_state_for(gen - 1)[0] or 0
+                idx = self.group.step(prev_idx)
+            self._group_states[gen] = idx
+            self._state_order.append(gen)
+            while len(self._group_states) > max(1, int(self.max_cached_states)):
+                old_gen = self._state_order.popleft()
+                if old_gen == gen:
+                    break
+                self._group_states.pop(old_gen, None)
+        mat = self.group.matrix_safe(idx)
+        embed = self.group.embed_safe(idx)
+        return (idx, mat, embed)
+
+    def phase_bundle(self, gen: int) -> Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]:
+        theta = self.phase(gen)
+        parity = SpinorScheduler.parity(theta)
+        idx, mat, embed = self._group_state_for(gen)
+        energy = self.group.energy(idx) if self.group is not None else 0.0
+        return (theta, parity, idx, mat, embed, energy)
+
+    def describe_group(self, idx: Optional[int]) -> str:
+        if self.group is None:
+            return 'singlet'
+        return self.group.describe(idx)
 
     @staticmethod
     def spinor_vec(theta: float) -> np.ndarray:
@@ -5783,86 +7889,761 @@ class NomologyEnv:
     intensity: float = 0.2
     drift_scale: float = 0.004
     seed: Optional[int] = None
+    noise_weaver_seed: Optional[int] = None
     _rng: np.random.Generator = field(init=False, repr=False)
     noise: float = 0.06
     turns: float = 1.6
     rot_bias: float = 0.0
+    lazy_share: float = 0.0
+    lazy_anchor: float = 0.0
+    lazy_gap: float = 0.0
+    lazy_stasis: float = 0.0
     regime_id: int = 0
+    noise_kind: str = 'white'
+    noise_profile: Dict[str, Any] = field(
+        default_factory=lambda: {
+            'cycle_phase': 0.0,
+            'envelope': 0.0,
+            'jitter': 0.0,
+            'spectral_bias': 0.0,
+            'band_label': 'white',
+        }
+    )
+    noise_kind_label: str = 'White'
+    noise_kind_symbol: str = 'W'
+    noise_kind_color: str = '#f6f7fb'
+    noise_kind_code: int = 0
+    noise_palette: Tuple[str, ...] = ('white', 'alpha', 'beta', 'black')
+    noise_stage_len: int = 6
+    noise_jitter: float = 0.006
+    noise_levels: Dict[str, Tuple[float, float]] = field(
+        default_factory=lambda: {
+            'white': (0.045, 0.012),
+            'alpha': (0.052, 0.014),
+            'beta': (0.058, 0.018),
+            'black': (0.068, 0.022),
+        }
+    )
+    noise_min: float = 0.02
+    noise_max: float = 0.14
+    noise_weaver: Optional[SpectralNoiseWeaver] = None
+    noise_focus: float = 0.0
+    noise_entropy: float = 0.0
+    noise_harmonics: Dict[str, float] = field(default_factory=dict)
+    noise_style_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    _noise_counter: float = field(default=0.0, init=False, repr=False)
+    _last_weaver_error: Optional[str] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._rng = np.random.default_rng(self.seed)
+        if self.noise_weaver is None:
+            try:
+                weaver_seed = self.noise_weaver_seed if self.noise_weaver_seed is not None else self.seed
+                self.noise_weaver = SpectralNoiseWeaver(palette=self.noise_palette, seed=weaver_seed)
+            except Exception as weaver_err:
+                self._last_weaver_error = f'{type(weaver_err).__name__}: {weaver_err}'
+                self.noise_weaver = None
+        else:
+            try:
+                self.noise_weaver.palette = tuple(self.noise_palette)
+            except Exception:
+                pass
+            if self.noise_weaver_seed is not None:
+                try:
+                    self.noise_weaver.seed = self.noise_weaver_seed
+                    self.noise_weaver._rng = np.random.default_rng(self.noise_weaver_seed)
+                except Exception:
+                    pass
+        self._noise_counter = 0.0
+        self._refresh_noise(surge=True)
+
+    def noise_style(self, kind: Optional[str]=None) -> Dict[str, Any]:
+        target = kind or self.noise_kind
+        return _resolve_noise_style(target, self.noise_style_overrides)
+
+    def _noise_ctx(self, surge: bool=False) -> Dict[str, Any]:
+        return {
+            'palette': self.noise_palette,
+            'stage_len': max(1, int(self.noise_stage_len)),
+            'jitter_amp': float(self.noise_jitter * (1.5 if surge else 1.0)),
+            'base_levels': dict(self.noise_levels),
+            'min_std': float(self.noise_min),
+            'max_std': float(self.noise_max),
+            'levels': dict(self.noise_levels),
+            'surge': bool(surge),
+            'intensity': float(self.intensity),
+            'regime_id': int(self.regime_id),
+            'drift_scale': float(self.drift_scale),
+        }
+
+    def _refresh_noise(self, advance: bool=False, surge: bool=False) -> None:
+        if advance:
+            self._noise_counter += 1.0
+        std, kind, profile = _cyclic_noise_profile(self._noise_counter, self._noise_ctx(surge))
+        jitter_extra = float(self._rng.normal(0.0, self.noise_jitter * (0.35 if surge else 0.25)))
+        std = float(np.clip(std + jitter_extra, self.noise_min, self.noise_max))
+        profile = dict(profile)
+        profile.setdefault('spectral_bias', 0.0)
+        profile.setdefault('band_label', kind)
+        profile.setdefault('cycle_phase', 0.0)
+        profile['jitter'] = float(profile.get('jitter', 0.0) + jitter_extra)
+        weaver = getattr(self, 'noise_weaver', None)
+        if weaver is not None:
+            weaver_ctx = self._noise_ctx(surge)
+            try:
+                std, kind, profile = weaver.compose(
+                    self._noise_counter,
+                    std,
+                    kind,
+                    profile,
+                    ctx=weaver_ctx,
+                )
+                self._last_weaver_error = None
+            except Exception as weaver_err:
+                self._last_weaver_error = f'{type(weaver_err).__name__}: {weaver_err}'
+        profile['regime'] = int(self.regime_id)
+        profile['counter'] = float(self._noise_counter)
+        profile['surge'] = bool(surge)
+        profile['noise_jitter_extra'] = jitter_extra
+        self.noise = std
+        self.noise_kind = kind
+        self.noise_profile = profile
+        style = self.noise_style(kind)
+        self.noise_kind_label = style.get('label', kind)
+        self.noise_kind_symbol = style.get('symbol', kind[:1].upper() if kind else '?')
+        self.noise_kind_color = style.get('color', '#9e9e9e')
+        self.noise_kind_code = int(style.get('index', -1))
+        profile['kind_label'] = self.noise_kind_label
+        profile['kind_symbol'] = self.noise_kind_symbol
+        profile['kind_color'] = self.noise_kind_color
+        profile['kind_code'] = self.noise_kind_code
+        profile['kind_bias'] = float(style.get('bias', 0.0))
+        profile['style'] = {
+            'label': self.noise_kind_label,
+            'symbol': self.noise_kind_symbol,
+            'color': self.noise_kind_color,
+            'index': self.noise_kind_code,
+            'bias': float(style.get('bias', 0.0)),
+        }
+        harmonics = profile.get('harmonics') if isinstance(profile, dict) else None
+        if isinstance(harmonics, dict) and harmonics:
+            clean = {str(k): float(v) for k, v in harmonics.items()}
+            total = sum(max(0.0, float(v)) for v in clean.values())
+            if total > 0.0 and math.isfinite(total):
+                clean = {k: float(max(0.0, float(v)) / total) for k, v in clean.items()}
+            arr = np.asarray(list(clean.values()), dtype=np.float64)
+            if arr.size:
+                focus_val = float(np.max(arr))
+                entropy_val = float(-np.sum(arr * np.log(arr + 1e-09)))
+            else:
+                focus_val = 1.0
+                entropy_val = 0.0
+            self.noise_harmonics = clean
+        else:
+            focus_val = 1.0
+            entropy_val = 0.0
+            self.noise_harmonics = {}
+        self.noise_focus = float(profile.get('mix_focus', focus_val))
+        self.noise_entropy = float(profile.get('mix_entropy', entropy_val))
 
     def maybe_switch(self) -> bool:
-        if self._rng.random() < self.intensity:
+        triggered = bool(self._rng.random() < self.intensity)
+        if triggered:
             self.regime_id += 1
-            self.noise = float(np.clip(self._rng.normal(0.05, 0.02), 0.0, 0.15))
-            self.turns = float(np.clip(self._rng.normal(1.6, 0.4), 0.6, 3.0))
+        self._refresh_noise(advance=True, surge=triggered)
+        if triggered:
+            if self.noise_kind == 'alpha':
+                target_turns = 1.85
+            elif self.noise_kind == 'beta':
+                target_turns = 1.35
+            elif self.noise_kind == 'black':
+                target_turns = 2.15
+            else:
+                target_turns = 1.6
+            self.turns = float(np.clip(target_turns + self._rng.normal(0.0, 0.35), 0.6, 3.0))
             self.rot_bias = float(self._rng.uniform(-math.pi, math.pi))
-            return True
-        return False
+        return triggered
 
     def drift(self) -> None:
         self.rot_bias += float(self._rng.normal(0.0, self.drift_scale))
         self.turns = float(np.clip(self.turns + self._rng.normal(0.0, self.drift_scale), 0.6, 3.2))
+        self._refresh_noise(advance=False, surge=False)
+
+@dataclass
+class SelfReproducingEvaluator:
+    feature_dim: int
+    spin: SpinorScheduler
+    base_env: NomologyEnv
+    population_size: int = 4
+    rng: Optional[np.random.Generator] = None
+    seed: Optional[int] = None
+    mutate_weights_prob: float = 0.65
+    mutate_connection_prob: float = 0.35
+    mutate_node_prob: float = 0.2
+    output_scale: Tuple[float, float, float] = (0.08, 1.0, math.pi / 4.0)
+    _population: List[Genome] = field(default_factory=list, init=False, repr=False)
+    _rng: np.random.Generator = field(init=False, repr=False)
+    _innov: InnovationTracker = field(init=False, repr=False)
+    _next_gid: int = field(init=False, repr=False)
+    last_event: Optional[str] = field(default=None, init=False)
+    last_resilience: Optional[str] = field(default=None, init=False)
+    _leader_cache_id: Optional[int] = field(default=None, init=False, repr=False)
+    _leader_cache_rev: Tuple[int, int] = field(default=(-1, -1), init=False, repr=False)
+    _leader_compiled: Optional[Dict[str, Any]] = field(default=None, init=False, repr=False)
+    _resilience_notes: deque = field(default_factory=lambda: deque(maxlen=16), init=False, repr=False)
+    lazy_feedback_smoothing: float = 0.35
+    lazy_feedback_decay: float = 0.25
+    _lazy_feedback: Dict[str, Any] = field(
+        default_factory=lambda: {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0},
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.rng is not None:
+            self._rng = self.rng
+        else:
+            self._rng = np.random.default_rng(self.seed)
+        bias = self.feature_dim + 1
+        outputs = 3
+        self._innov = InnovationTracker(next_node_id=bias + outputs)
+        self._next_gid = int(self._rng.integers(1 << 30))
+        if not self._population:
+            for _ in range(self.population_size):
+                self._population.append(self._seed_genome())
+
+    def _seed_genome(self) -> Genome:
+        nodes: Dict[int, NodeGene] = {}
+        for i in range(self.feature_dim):
+            nodes[i] = NodeGene(i, 'input', 'identity')
+        bias_id = self.feature_dim
+        nodes[bias_id] = NodeGene(bias_id, 'bias', 'identity')
+        out_ids = []
+        for j in range(3):
+            nid = self.feature_dim + 1 + j
+            nodes[nid] = NodeGene(nid, 'output', 'tanh')
+            out_ids.append(nid)
+        conns: Dict[int, ConnectionGene] = {}
+        for src in range(self.feature_dim + 1):
+            for dst in out_ids:
+                inn = self._innov.get_conn_innovation(src, dst)
+                weight = float(self._rng.normal(0.0, 0.5))
+                conns[inn] = ConnectionGene(src, dst, weight, True, inn)
+        gid = self._next_gid
+        self._next_gid += 1
+        g = Genome(nodes, conns, gid=gid, birth_gen=0, parents=(None, None), cooperative=True)
+        g.meta_reflect('init_env_genome', {'role': 'environment'})
+        return g
+
+    def _feature_vector(
+        self,
+        bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
+        env: NomologyEnv,
+        generation: int,
+    ) -> np.ndarray:
+        theta, parity, _, _, embed, energy = bundle
+        gen_norm = float((generation % max(1, self.spin.period_gens)) / max(1, self.spin.period_gens))
+        noise_norm = float(np.clip(env.noise / 0.2, 0.0, 1.0))
+        turns_norm = float(np.clip((env.turns - 0.6) / (3.2 - 0.6 + 1e-09), 0.0, 1.0))
+        rot_norm = float((env.rot_bias + math.pi) / (2.0 * math.pi))
+        style = env.noise_style() if hasattr(env, 'noise_style') else _resolve_noise_style(getattr(env, 'noise_kind', ''), None)
+        palette = getattr(env, 'noise_palette', ('white', 'alpha', 'beta', 'black'))
+        palette_span = max(1.0, float(len(palette) - 1))
+        code_idx = float(style.get('index', -1))
+        if code_idx < 0:
+            code_norm = -1.0
+        else:
+            code_norm = float(np.clip((code_idx / palette_span) * 2.0 - 1.0, -1.0, 1.0))
+        focus_norm = float(np.clip(getattr(env, 'noise_focus', 0.0), 0.0, 1.5) / 1.5)
+        entropy_norm = float(np.clip(getattr(env, 'noise_entropy', 0.0), 0.0, 4.0) / 4.0)
+        bias_norm = float(style.get('bias', 0.0))
+        base = [
+            math.cos(theta),
+            math.sin(theta),
+            float(parity),
+            gen_norm,
+            noise_norm,
+            turns_norm,
+            rot_norm,
+            float(energy / 4.0),
+            focus_norm,
+            entropy_norm,
+            code_norm,
+            bias_norm,
+        ]
+        if embed is not None:
+            base.extend(embed.tolist())
+        vec = np.asarray(base, dtype=np.float32)
+        if vec.size < self.feature_dim:
+            vec = np.pad(vec, (0, self.feature_dim - vec.size))
+        elif vec.size > self.feature_dim:
+            vec = vec[:self.feature_dim]
+        return vec.astype(np.float32)
+
+    def _mutate_child(self, parent: Genome, bundle, features: np.ndarray, outputs: np.ndarray, generation: int) -> str:
+        child = parent.copy()
+        changed = False
+        if self._rng.random() < self.mutate_weights_prob:
+            child.mutate_weights(self._rng)
+            changed = True
+        if self._rng.random() < self.mutate_connection_prob:
+            changed = child.mutate_add_connection(self._rng, self._innov) or changed
+        if self._rng.random() < self.mutate_node_prob:
+            changed = child.mutate_add_node(self._rng, self._innov) or changed
+        if not changed:
+            return 'steady-state'
+        child.parents = (parent.id, None)
+        child.id = self._next_gid
+        self._next_gid += 1
+        child.birth_gen = generation + 1
+        child.meta_reflect(
+            'env_self_reproduce',
+            {
+                'features': features.tolist(),
+                'outputs': outputs.tolist(),
+                'generation': generation,
+                'parent': parent.id,
+            },
+        )
+        self._population.insert(0, child)
+        if len(self._population) > self.population_size:
+            self._population.pop()
+        return f'spawned {child.id} ← {parent.id}'
+
+    def _compiled_leader(self, leader: Genome):
+        rev = (getattr(leader, '_structure_rev', -1), getattr(leader, '_weights_rev', -1))
+        if (
+            self._leader_compiled is not None
+            and self._leader_cache_id == leader.id
+            and self._leader_cache_rev == rev
+        ):
+            return self._leader_compiled
+        compiled = compile_genome(leader)
+        self._leader_compiled = compiled
+        self._leader_cache_id = leader.id
+        self._leader_cache_rev = rev
+        return compiled
+
+    def update_lazy_feedback(self, feedback: Dict[str, Any]) -> None:
+        if not isinstance(feedback, dict):
+            return
+        payload = dict(feedback)
+        prev = getattr(self, '_lazy_feedback', {})
+        if not isinstance(prev, dict):
+            prev = {}
+        alpha = float(np.clip(self.lazy_feedback_smoothing, 0.0, 0.95))
+        if prev:
+            blended: Dict[str, Any] = {}
+            for key, val in payload.items():
+                if isinstance(val, (int, float)):
+                    old = prev.get(key, val)
+                    if isinstance(old, (int, float)):
+                        blended[key] = float(old) * alpha + float(val) * (1.0 - alpha)
+                    else:
+                        blended[key] = float(val)
+                else:
+                    blended[key] = val
+            payload.update(blended)
+        payload.setdefault('generation', prev.get('generation', payload.get('generation', -1)))
+        self._lazy_feedback = payload
+
+    def _record_resilience(self, err: BaseException, generation: int) -> str:
+        label = f'{type(err).__name__}@{generation}'
+        self.last_resilience = label
+        try:
+            self._resilience_notes.append(label)
+        except Exception:
+            pass
+        return label
+
+    def resilience_history(self) -> List[str]:
+        return list(self._resilience_notes)
+
+    def step(
+        self,
+        bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
+        env: NomologyEnv,
+        generation: int,
+    ) -> Dict[str, Any]:
+        if not self._population:
+            self._population.append(self._seed_genome())
+        leader = self._population[0]
+        feats = self._feature_vector(bundle, env, generation)
+        resilience_flag = ''
+        start = time.perf_counter()
+        try:
+            compiled = self._compiled_leader(leader)
+            out = forward_batch(compiled, feats.reshape(1, -1))[0]
+            out = np.asarray(out, dtype=np.float32)
+        except Exception as err:
+            resilience_flag = self._record_resilience(err, generation)
+            out = np.zeros(3, dtype=np.float32)
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        lazy = getattr(self, '_lazy_feedback', {}) or {}
+        share = float(np.clip(lazy.get('share', 0.0), 0.0, 1.0))
+        stasis = float(np.clip(lazy.get('stasis', 0.0), 0.0, 1.0))
+        anchor = float(np.clip(lazy.get('anchor', 0.0), -1.0, 1.0))
+        gap = float(np.clip(lazy.get('gap', 0.0), -1.0, 1.0))
+        lazy_gen = int(lazy.get('generation', generation)) if isinstance(lazy, dict) else generation
+        age = max(0, int(generation) - lazy_gen)
+        decay = math.exp(-float(np.clip(self.lazy_feedback_decay, 0.05, 1.0)) * age)
+        share *= decay
+        stasis *= decay
+        anchor *= decay
+        gap *= decay
+        prev_noise = float(getattr(env, 'noise', 0.05))
+        prev_turns = float(getattr(env, 'turns', 1.6))
+        prev_rot = float(getattr(env, 'rot_bias', 0.0))
+        scale_noise, scale_turns, scale_rot = self.output_scale
+        mod_out0 = float(out[0] * (1.0 - 0.35 * share) + anchor * 0.35)
+        mod_out1 = float(out[1] * (1.0 - 0.3 * share) + (anchor + gap * 0.5) * 0.3)
+        mod_out2 = float(out[2] * (1.0 - 0.3 * share) + gap * 0.6)
+        target_noise = float(np.clip(0.05 + scale_noise * mod_out0, 0.0, 0.25))
+        target_turns = float(np.clip(1.6 + scale_turns * mod_out1, 0.6, 3.2))
+        rot_target = prev_rot + scale_rot * mod_out2
+        anchor_noise = float(np.clip(0.05 + scale_noise * anchor, 0.0, 0.25))
+        anchor_turns = float(np.clip(1.6 + scale_turns * (anchor + gap * 0.25), 0.6, 3.2))
+        rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6)
+        inertia = float(np.clip(0.25 + 0.5 * share + 0.25 * stasis, 0.0, 0.9))
+        slip = max(0.0, 1.0 - inertia)
+        anchor_mix = slip * 0.5 * stasis
+        leader_mix = slip - anchor_mix
+        env.noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
+        env.turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
+        rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
+        env.rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+        env.lazy_share = float(share)
+        env.lazy_anchor = float(anchor)
+        env.lazy_gap = float(gap)
+        env.lazy_stasis = float(stasis)
+        try:
+            summary = self._mutate_child(leader, bundle, feats, out, generation)
+        except Exception as mutate_err:
+            resilience_flag = resilience_flag or self._record_resilience(mutate_err, generation)
+            summary = f'mutate-failed {type(mutate_err).__name__}'
+        noise_kind = getattr(env, 'noise_kind', None)
+        if noise_kind:
+            label = getattr(env, 'noise_kind_label', noise_kind)
+            symbol = getattr(env, 'noise_kind_symbol', noise_kind[:1].upper())
+            summary = f"{summary} | noise {symbol}({label})"
+        focus = getattr(env, 'noise_focus', None)
+        if isinstance(focus, (int, float)) and focus > 0:
+            summary = f'{summary} | focus {float(focus):.2f}'
+        entropy = getattr(env, 'noise_entropy', None)
+        if isinstance(entropy, (int, float)) and entropy > 0:
+            summary = f'{summary} | entropy {float(entropy):.2f}'
+        weave_err = getattr(env, '_last_weaver_error', None)
+        if weave_err:
+            summary = f'{summary} | weave {str(weave_err).split(':', 1)[0]}'
+        if resilience_flag:
+            summary = f'{summary} | resilience {resilience_flag}'
+        if share > 0.0:
+            summary = f'{summary} | lazy {share:.2f}'
+        if stasis > 0.0:
+            summary = f'{summary} | stasis {stasis:.2f}'
+        if abs(gap) > 0.01:
+            summary = f'{summary} | gap {gap:+.2f}'
+        self.last_event = summary
+        return {
+            'genome_id': leader.id,
+            'note': summary,
+            'resilience': resilience_flag,
+            'latency_ms': latency_ms,
+        }
+
+    @property
+    def leader(self) -> Genome:
+        if not self._population:
+            self._population.append(self._seed_genome())
+        return self._population[0]
 
 class Telemetry:
 
     def __init__(self, tel_csv: str, regime_csv: str) -> None:
         self.tel_csv = tel_csv
         self.reg_csv = regime_csv
+        expected_cols = 31
+        if os.path.exists(self.tel_csv):
+            try:
+                with open(self.tel_csv, 'r', newline='') as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+            except Exception:
+                header = None
+            if not header or len(header) < expected_cols:
+                legacy_path = self.tel_csv + '.legacy'
+                try:
+                    os.replace(self.tel_csv, legacy_path)
+                except OSError:
+                    pass
         if not os.path.exists(self.tel_csv):
             with open(self.tel_csv, 'w', newline='') as f:
-                csv.writer(f).writerow(['gen', 'theta', 'theta_mod_2pi', 'theta_mod_4pi', 'parity', 'regime_id', 'noise', 'turns', 'rot_bias'])
+                csv.writer(f).writerow([
+                    'gen',
+                    'theta',
+                    'theta_mod_2pi',
+                    'theta_mod_4pi',
+                    'parity',
+                    'regime_id',
+                    'noise',
+                    'noise_kind',
+                    'noise_kind_label',
+                    'noise_kind_symbol',
+                    'noise_kind_code',
+                    'noise_kind_color',
+                    'noise_cycle',
+                    'noise_wave_hz',
+                    'noise_spectral_bias',
+                    'noise_jitter',
+                    'noise_focus',
+                    'noise_entropy',
+                    'noise_harmonics',
+                    'turns',
+                    'rot_bias',
+                    'group_idx',
+                    'group_label',
+                    'group_energy',
+                    'lazy_share',
+                    'lazy_anchor',
+                    'lazy_gap',
+                    'lazy_stasis',
+                    'evaluator_id',
+                    'evaluator_note',
+                    'build_id',
+                ])
         if not os.path.exists(self.reg_csv):
             with open(self.reg_csv, 'w', newline='') as f:
-                csv.writer(f).writerow(['gen', 'event', 'regime_id'])
+                csv.writer(f).writerow(['gen', 'event', 'regime_id', 'build_id'])
 
-    def log_step(self, gen: int, theta: float, parity: int, env: NomologyEnv) -> None:
+    def log_step(
+        self,
+        gen: int,
+        theta: float,
+        parity: int,
+        env: NomologyEnv,
+        group_idx: Optional[int]=None,
+        group_label: Optional[str]=None,
+        group_energy: float=0.0,
+        evaluator_meta: Optional[Dict[str, Any]]=None,
+    ) -> None:
         t2 = theta % (2.0 * math.pi)
         t4 = theta % (4.0 * math.pi)
+        eval_id = ''
+        eval_note = ''
+        if isinstance(evaluator_meta, dict):
+            eval_id = evaluator_meta.get('genome_id', '')
+            eval_note = evaluator_meta.get('note', '')
+        profile = getattr(env, 'noise_profile', {}) or {}
+        noise_kind = getattr(env, 'noise_kind', '')
+        if hasattr(env, 'noise_style'):
+            style = env.noise_style(noise_kind)
+        else:
+            style = _resolve_noise_style(noise_kind, None)
+        noise_label = style.get('label', noise_kind)
+        noise_symbol = style.get('symbol', noise_kind[:1].upper() if noise_kind else '')
+        noise_code = int(style.get('index', -1))
+        noise_color = style.get('color', '#9e9e9e')
+        noise_cycle = float(profile.get('cycle_phase', 0.0))
+        noise_wave = profile.get('wave_freq_hz')
+        noise_wave = '' if noise_wave is None else float(noise_wave)
+        noise_spectral = float(profile.get('spectral_bias', 0.0))
+        noise_jitter = float(profile.get('jitter', 0.0))
+        noise_focus = float(getattr(env, 'noise_focus', 0.0))
+        noise_entropy = float(getattr(env, 'noise_entropy', 0.0))
+        harmonics = getattr(env, 'noise_harmonics', {})
+        if isinstance(harmonics, dict) and harmonics:
+            harm_payload = _json.dumps({k: float(v) for k, v in harmonics.items()})
+        else:
+            harm_payload = '{}'
+        lazy_share = float(getattr(env, 'lazy_share', 0.0))
+        lazy_anchor = float(getattr(env, 'lazy_anchor', 0.0))
+        lazy_gap = float(getattr(env, 'lazy_gap', 0.0))
+        lazy_stasis = float(getattr(env, 'lazy_stasis', 0.0))
         with open(self.tel_csv, 'a', newline='') as f:
-            csv.writer(f).writerow([gen, theta, t2, t4, parity, env.regime_id, env.noise, env.turns, env.rot_bias])
+            csv.writer(f).writerow([
+                gen,
+                theta,
+                t2,
+                t4,
+                parity,
+                env.regime_id,
+                env.noise,
+                noise_kind,
+                noise_label,
+                noise_symbol,
+                noise_code,
+                noise_color,
+                noise_cycle,
+                noise_wave,
+                noise_spectral,
+                noise_jitter,
+                noise_focus,
+                noise_entropy,
+                harm_payload,
+                env.turns,
+                env.rot_bias,
+                '' if group_idx is None else int(group_idx),
+                group_label or '',
+                float(group_energy),
+                lazy_share,
+                lazy_anchor,
+                lazy_gap,
+                lazy_stasis,
+                eval_id,
+                eval_note,
+                _build_stamp_short(),
+            ])
 
     def log_regime(self, gen: int, env: NomologyEnv) -> None:
         with open(self.reg_csv, 'a', newline='') as f:
-            csv.writer(f).writerow([gen, 'switch', env.regime_id])
+            csv.writer(f).writerow([gen, 'switch', env.regime_id, _build_stamp_short()])
 
 class SpinorNomologyDatasetController:
     """Updates shared datasets each generation. Why: make fitness see non-stationary regime."""
 
-    def __init__(self, spin: SpinorScheduler, env: NomologyEnv, rng: np.random.Generator, n_tr: int=512, n_va: int=256) -> None:
+    def __init__(
+        self,
+        spin: SpinorScheduler,
+        env: NomologyEnv,
+        rng: np.random.Generator,
+        n_tr: int=512,
+        n_va: int=256,
+        evaluator: Optional[SelfReproducingEvaluator]=None,
+        evaluator_seed: Optional[int]=None,
+    ) -> None:
         self.spin = spin
         self.env = env
         self.rng = rng
         self.n_tr = n_tr
         self.n_va = n_va
         self.last_gen = None
+        self.telemetry: Optional[Telemetry] = None
+        self.evaluator = evaluator
+        self.evaluator_seed = evaluator_seed
+        embed_dim = self.spin.group.embed_dim if self.spin.group else 0
+        self.feature_dim = 12 + embed_dim
+        self.evaluator_feature_dim = 12 + embed_dim
+        self.last_bundle: Optional[Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]] = None
+        self.lazy_feedback_smoothing = 0.4
+        self._lazy_feedback: Dict[str, Any] = {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0}
+        try:
+            self.env.lazy_share = 0.0
+            self.env.lazy_anchor = 0.0
+            self.env.lazy_gap = 0.0
+            self.env.lazy_stasis = 0.0
+        except Exception:
+            pass
+        if self.evaluator is None and self.evaluator_feature_dim > 0:
+            if evaluator_seed is None:
+                evaluator_seed = int(self.rng.integers(1 << 30))
+            eval_rng = np.random.default_rng(int(evaluator_seed))
+            self.evaluator = SelfReproducingEvaluator(
+                self.evaluator_feature_dim,
+                self.spin,
+                self.env,
+                rng=eval_rng,
+                seed=int(evaluator_seed),
+            )
+        elif self.evaluator is not None and evaluator_seed is not None:
+            try:
+                self.evaluator.seed = int(evaluator_seed)
+            except Exception:
+                pass
 
-    def _dataset_core(self, n: int, theta: float) -> Tuple[np.ndarray, np.ndarray]:
-        X, y = neat.make_spirals(n=n, noise=self.env.noise, turns=self.env.turns, seed=int(self.rng.integers(1 << 31)))
+    def _dataset_core(
+        self,
+        n: int,
+        theta: float,
+        parity: int,
+        group_idx: Optional[int],
+        group_embed: Optional[np.ndarray],
+        group_matrix: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        try:
+            X, y = neat.make_spirals(n=n, noise=self.env.noise, turns=self.env.turns, seed=int(self.rng.integers(1 << 31)))
+        except Exception as err:
+            warnings.warn(f'Spinor dataset generation failed: {err}', RuntimeWarning)
+            X = np.zeros((n, 2), dtype=np.float32)
+            y = np.zeros(n, dtype=np.int64)
         X = rotate_2d(X, theta + self.env.rot_bias)
-        X_aug, _ = augment_with_spinor(X, theta)
-        return (X_aug, y.astype(np.int64))
+        if self.spin.group is not None and group_idx is not None:
+            X = self.spin.group.apply_to_points(group_idx, X)
+        elif group_matrix is not None:
+            try:
+                X = (group_matrix @ X.T).T
+            except Exception:
+                pass
+        X_aug, _ = augment_with_spinor(X, theta, parity=parity, group_embed=group_embed)
+        return (X_aug.astype(np.float32), y.astype(np.int64))
+
+    def set_lazy_feedback(self, generation: int, feedback: Dict[str, Any]) -> None:
+        if feedback is None:
+            return
+        payload = dict(feedback)
+        payload['generation'] = int(generation)
+        prev = getattr(self, '_lazy_feedback', None)
+        if isinstance(prev, dict) and prev:
+            mix = {}
+            alpha = float(np.clip(self.lazy_feedback_smoothing, 0.0, 0.95))
+            for key, val in payload.items():
+                if isinstance(val, (int, float)):
+                    old = prev.get(key, val)
+                    if isinstance(old, (int, float)):
+                        mix[key] = float(old) * alpha + float(val) * (1.0 - alpha)
+                    else:
+                        mix[key] = float(val)
+                else:
+                    mix[key] = val
+            payload.update(mix)
+        self._lazy_feedback = payload
+        try:
+            self.env.lazy_share = float(payload.get('share', 0.0))
+            self.env.lazy_anchor = float(payload.get('anchor', 0.0))
+            self.env.lazy_gap = float(payload.get('gap', 0.0))
+            self.env.lazy_stasis = float(payload.get('stasis', 0.0))
+        except Exception:
+            pass
+        if self.evaluator is not None:
+            try:
+                self.evaluator.update_lazy_feedback(payload)
+            except Exception:
+                pass
 
     def update_for_generation(self, gen: int, shmem=False) -> None:
         if self.last_gen == gen:
             return
-        theta = self.spin.phase(gen)
+        bundle = self.spin.phase_bundle(gen)
+        theta, parity, group_idx, group_matrix, group_embed, group_energy = bundle
+        self.last_bundle = bundle
         switched = self.env.maybe_switch()
         if switched:
             self.on_regime_switch(gen)
+        evaluator_meta = None
+        if self.evaluator is not None:
+            try:
+                self.evaluator.update_lazy_feedback(getattr(self, '_lazy_feedback', {}))
+            except Exception:
+                pass
+            evaluator_meta = self.evaluator.step(bundle, self.env, generation=gen)
         self.env.drift()
-        Xtr, ytr = self._dataset_core(self.n_tr, theta)
-        Xva, yva = self._dataset_core(self.n_va, theta)
+        Xtr, ytr = self._dataset_core(self.n_tr, theta, parity, group_idx, group_embed, group_matrix)
+        Xva, yva = self._dataset_core(self.n_va, theta, parity, group_idx, group_embed, group_matrix)
         neat._SHM_CACHE['Xtr'] = Xtr
         neat._SHM_CACHE['ytr'] = ytr
         neat._SHM_CACHE['Xva'] = Xva
         neat._SHM_CACHE['yva'] = yva
         self.last_gen = gen
         if self.telemetry is not None:
-            parity = SpinorScheduler.parity(theta)
-            self.telemetry.log_step(gen, theta, parity, self.env)
-    telemetry: Optional[Telemetry] = None
+            self.telemetry.log_step(
+                gen,
+                theta,
+                parity,
+                self.env,
+                group_idx=group_idx,
+                group_label=self.spin.describe_group(group_idx),
+                group_energy=group_energy,
+                evaluator_meta=evaluator_meta,
+            )
     on_regime_switch = lambda self, gen: self.telemetry and self.telemetry.log_regime(gen, self.env)
 
 class SpinorNomologyFitness(neat.FitnessBackpropShared):
