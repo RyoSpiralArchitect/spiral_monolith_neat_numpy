@@ -15,7 +15,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, List, Callable, Optional, Set, Iterable, Any, Sequence
-from collections import deque, defaultdict, OrderedDict
+from collections import deque, defaultdict, OrderedDict, Counter
 import math, argparse, os, mimetypes, csv
 import sys
 import time
@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
 from matplotlib import font_manager as _font_manager
 from matplotlib import gridspec as _gridspec
+from matplotlib.lines import Line2D
 import csv
 import json
 import math
@@ -40,6 +41,34 @@ from datetime import datetime, timezone
 
 _BUILD_INFO_CACHE: Optional[Dict[str, Any]] = None
 _SPINOR_BOUND_SEED: Optional[int] = None
+
+
+_NOISE_STYLE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    'white': {'label': 'White', 'symbol': 'W', 'color': '#f6f7fb', 'index': 0, 'bias': 0.0},
+    'alpha': {'label': 'Alpha', 'symbol': 'α', 'color': '#8ecae6', 'index': 1, 'bias': -0.06},
+    'beta': {'label': 'Beta', 'symbol': 'β', 'color': '#ffb703', 'index': 2, 'bias': 0.04},
+    'black': {'label': 'Black', 'symbol': '♭', 'color': '#1f1f1f', 'index': 3, 'bias': -0.12},
+}
+_NOISE_STYLE_FALLBACK: Dict[str, Any] = {'label': 'Unknown', 'symbol': '?', 'color': '#9e9e9e', 'index': -1, 'bias': 0.0}
+
+
+def _resolve_noise_style(kind: Optional[str], overrides: Optional[Dict[str, Dict[str, Any]]]=None) -> Dict[str, Any]:
+    key = (kind or '').strip().lower()
+    base = dict(_NOISE_STYLE_DEFAULTS.get(key, _NOISE_STYLE_FALLBACK))
+    if overrides:
+        override = overrides.get(key) or overrides.get(kind or '')
+        if override:
+            base.update({k: v for k, v in override.items() if v is not None})
+    label_source = kind or base.get('label') or 'Unknown'
+    if not base.get('label'):
+        base['label'] = str(label_source).title()
+    if not base.get('symbol'):
+        base['symbol'] = (label_source[:1].upper() if label_source else '?')
+    base['index'] = int(base.get('index', _NOISE_STYLE_FALLBACK['index']))
+    base['color'] = str(base.get('color', _NOISE_STYLE_FALLBACK['color']))
+    base['bias'] = float(base.get('bias', _NOISE_STYLE_FALLBACK['bias']))
+    base['kind'] = kind or ''
+    return base
 
 
 def _resolve_build_info() -> Dict[str, Any]:
@@ -2499,8 +2528,35 @@ class ReproPlanaNEATPlus:
         self.monodromy_smoothing = 0.4
         self.monodromy_decay = 0.55
         self.monodromy_release = 0.35
+        self.monodromy_momentum_decay = 0.65
+        self.monodromy_growth_weight = 0.85
+        self.monodromy_slump_gain = 0.6
+        self.monodromy_fast_release = 0.25
+        self.monodromy_diversity_weight = 0.45
+        self.monodromy_diversity_floor = 0.22
+        self.monodromy_diversity_grace = 2.5
+        self.monodromy_diversity_grace_decay = 0.6
+        self.monodromy_diversity_grace_strength = 0.3
+        self.monodromy_noise_weight = 0.25
+        self.monodromy_noise_style_overrides: Dict[str, Dict[str, Any]] = {}
         self._monodromy_registry: Dict[int, Dict[str, float]] = {}
-        self._monodromy_snapshot: Dict[str, float] = {'pressure_mean': 0.0, 'pressure_max': 0.0, 'active': 0, 'release': 0}
+        self._monodromy_snapshot: Dict[str, float] = {
+            'pressure_mean': 0.0,
+            'pressure_max': 0.0,
+            'active': 0,
+            'release': 0,
+            'relief_mean': 0.0,
+            'momentum_mean': 0.0,
+            'momentum_max': 0.0,
+            'diversity_mean': 0.0,
+            'diversity_max': 0.0,
+            'grace_mean': 0.0,
+            'noise_factor': 1.0,
+            'noise_kind': '',
+            'noise_focus': 0.0,
+            'noise_entropy': 0.0,
+        }
+        self._monodromy_noise_tag = ''
         self._auto_complexity_bonus_state = {
             'baseline': 0.0,
             'bonus_scale': float(self.complexity_survivor_bonus),
@@ -3439,37 +3495,100 @@ class ReproPlanaNEATPlus:
         baseline: Sequence[float],
         signature_map: Dict[int, Tuple[Tuple[Tuple[str, str], ...], Tuple[Tuple[int, int, int], ...]]],
         generation: int,
+        signature_counts: Optional[Dict[Any, int]]=None,
     ) -> List[float]:
+        def _reset_snapshot() -> None:
+            self._monodromy_snapshot = {
+                'pressure_mean': 0.0,
+                'pressure_max': 0.0,
+                'active': 0,
+                'release': 0,
+                'relief_mean': 0.0,
+                'momentum_mean': 0.0,
+                'momentum_max': 0.0,
+                'diversity_mean': 0.0,
+                'diversity_max': 0.0,
+                'grace_mean': 0.0,
+                'noise_factor': 1.0,
+                'noise_kind': '',
+                'noise_focus': 0.0,
+                'noise_entropy': 0.0,
+            }
+
         n = len(fitnesses)
         if n == 0:
-            self._monodromy_snapshot = {'pressure_mean': 0.0, 'pressure_max': 0.0, 'active': 0, 'release': 0}
+            _reset_snapshot()
             return list(fitnesses)
         base = float(getattr(self, 'monodromy_pressure_base', 0.0))
         rng = float(getattr(self, 'monodromy_pressure_range', 0.0))
         if base <= 0.0 and rng <= 0.0:
-            self._monodromy_snapshot = {'pressure_mean': 0.0, 'pressure_max': 0.0, 'active': 0, 'release': 0}
+            _reset_snapshot()
             return list(fitnesses)
+        try:
+            baseline_arr = np.asarray(baseline, dtype=float)
+        except Exception:
+            baseline_arr = np.array(list(map(float, baseline)), dtype=float)
+        if baseline_arr.size == 0:
+            _reset_snapshot()
+            return list(fitnesses)
+        overrides = getattr(self, 'monodromy_noise_style_overrides', None)
+        controller = getattr(self, 'spinor_controller', None)
+        env_obj = getattr(controller, 'env', None) if controller is not None else None
+        noise_kind = ''
+        noise_focus = 0.0
+        noise_entropy = 0.0
+        if env_obj is not None:
+            noise_kind = getattr(env_obj, 'noise_kind', '') or ''
+            noise_focus = float(getattr(env_obj, 'noise_focus', 0.0) or 0.0)
+            noise_entropy = float(getattr(env_obj, 'noise_entropy', 0.0) or 0.0)
+        else:
+            noise_kind = str(self.env.get('noise_kind', ''))
+            noise_focus = float(self.env.get('noise_focus', 0.0) or 0.0)
+            noise_entropy = float(self.env.get('noise_entropy', 0.0) or 0.0)
+        style = _resolve_noise_style(noise_kind, overrides)
+        noise_bias = float(style.get('bias', 0.0))
+        noise_weight = float(np.clip(getattr(self, 'monodromy_noise_weight', 0.0), 0.0, 2.0))
+        entropy_excess = max(0.0, float(noise_entropy) - float(noise_focus))
+        noise_factor = float(np.clip(1.0 + noise_weight * (noise_bias - 0.3 * entropy_excess), 0.2, 1.6))
+        self._monodromy_noise_tag = style.get('symbol', noise_kind or '')
+        if signature_counts is None:
+            signature_counts = Counter(signature_map.values()) if signature_map else Counter()
+        else:
+            signature_counts = Counter(signature_counts)
+        div_weight = float(np.clip(getattr(self, 'monodromy_diversity_weight', 0.0), 0.0, 2.0))
+        unique_relief = float(np.clip(getattr(self, 'monodromy_diversity_floor', 0.0), 0.0, 0.9))
+        grace_init = float(max(0.0, getattr(self, 'monodromy_diversity_grace', 0.0)))
+        grace_decay = float(np.clip(getattr(self, 'monodromy_diversity_grace_decay', 0.0), 0.05, 0.99))
+        grace_strength = float(np.clip(getattr(self, 'monodromy_diversity_grace_strength', 0.0), 0.0, 1.0))
         try:
             top_ratio = float(getattr(self, 'monodromy_top_ratio', 0.1))
         except Exception:
             top_ratio = 0.1
         top_k = max(1, min(n, int(round(top_ratio * n))))
-        order = list(np.argsort(baseline)[::-1])
-        top_indices = order[:top_k]
+        if top_k >= n:
+            order = np.argsort(baseline_arr)[::-1]
+        else:
+            partition = np.argpartition(baseline_arr, -top_k)[-top_k:]
+            order = partition[np.argsort(baseline_arr[partition])[::-1]]
+        top_indices = [int(i) for i in order[:top_k]]
         if not top_indices:
-            self._monodromy_snapshot = {'pressure_mean': 0.0, 'pressure_max': 0.0, 'active': 0, 'release': 0}
+            _reset_snapshot()
             return list(fitnesses)
-        median = float(np.median(baseline)) if baseline else 0.0
-        best_val = float(baseline[order[0]]) if order else median
+        median = float(np.median(baseline_arr))
+        best_val = float(baseline_arr[order[0]]) if order.size else median
         span_scale = abs(best_val - median)
         if not math.isfinite(span_scale) or span_scale < 1e-6:
-            span_scale = max(1e-6, abs(best_val))
+            span_scale = max(1e-6, abs(best_val) if math.isfinite(best_val) else 1.0)
         phase_step = float(getattr(self, 'monodromy_phase_step', 0.38196601125))
         smoothing = float(np.clip(getattr(self, 'monodromy_smoothing', 0.4), 0.0, 1.0))
         span = float(max(1.0, getattr(self, 'monodromy_span', 4.0)))
         decay = float(np.clip(getattr(self, 'monodromy_decay', 0.5), 0.0, 1.0))
         release = float(np.clip(getattr(self, 'monodromy_release', 0.35), 0.0, 1.0))
         cap = float(max(0.0, getattr(self, 'monodromy_penalty_cap', 1.0)))
+        momentum_decay = float(np.clip(getattr(self, 'monodromy_momentum_decay', 0.65), 0.0, 1.0))
+        growth_weight = float(np.clip(getattr(self, 'monodromy_growth_weight', 0.0), 0.0, 1.5))
+        slump_gain = float(np.clip(getattr(self, 'monodromy_slump_gain', 0.0), 0.0, 1.5))
+        fast_release = float(np.clip(getattr(self, 'monodromy_fast_release', 0.0), 0.0, 1.0))
         registry = getattr(self, '_monodromy_registry', None)
         if registry is None:
             registry = {}
@@ -3479,6 +3598,13 @@ class ReproPlanaNEATPlus:
         total_penalty = 0.0
         max_penalty = 0.0
         release_count = 0
+        relief_total = 0.0
+        momentum_total = 0.0
+        momentum_max = 0.0
+        diversity_total = 0.0
+        diversity_max = 0.0
+        grace_total = 0.0
+        span_scale_safe = max(span_scale, 1e-6)
         for idx in top_indices:
             if idx < 0 or idx >= n:
                 continue
@@ -3488,22 +3614,67 @@ class ReproPlanaNEATPlus:
             sig = signature_map.get(gid)
             if state is None:
                 phase = float(self.rng.random())
-                state = {'phase': phase, 'stasis': 0.0, 'signature': sig, 'pressure': 0.0}
+                state = {'phase': phase, 'stasis': 0.0, 'signature': sig, 'pressure': 0.0, 'momentum': 0.0, 'diversity_grace': grace_init}
             phase = (float(state.get('phase', 0.0)) + phase_step) % 1.0
             state['phase'] = phase
             prev_sig = state.get('signature')
+            stasis = float(state.get('stasis', 0.0))
             if sig is not None and prev_sig is not None and sig != prev_sig:
-                state['stasis'] = float(state.get('stasis', 0.0)) * release
+                stasis = stasis * release
                 state['signature'] = sig
+                state['diversity_grace'] = grace_init
                 release_count += 1
             elif sig is not None and prev_sig is None:
                 state['signature'] = sig
-                state['stasis'] = float(state.get('stasis', 0.0)) + 1.0
+                stasis += 1.0
+                state['diversity_grace'] = grace_init
             else:
-                state['stasis'] = float(state.get('stasis', 0.0)) + 1.0
-            envelope = min(1.0, float(state['stasis']) / span)
+                stasis += 1.0
+            current_fit = float(baseline_arr[idx])
+            prev_baseline = float(state.get('last_baseline', current_fit))
+            delta = current_fit - prev_baseline
+            state['last_baseline'] = current_fit
+            momentum = float(state.get('momentum', 0.0))
+            momentum = momentum * momentum_decay + delta * (1.0 - momentum_decay)
+            state['momentum'] = momentum
+            relief_gain = 0.0
+            if delta > 0.0 and fast_release > 0.0:
+                relief_gain = fast_release * math.tanh(delta / span_scale_safe)
+                stasis *= max(0.0, 1.0 - relief_gain)
+            elif delta < 0.0 and slump_gain > 0.0:
+                stasis += slump_gain * math.tanh(-delta / span_scale_safe)
+            state['stasis'] = stasis
+            crowd = 1
+            if sig is not None:
+                try:
+                    crowd = int(signature_counts.get(sig, 1))
+                except Exception:
+                    crowd = 1
+            crowd = max(1, crowd)
+            div_log = math.log1p(max(0.0, crowd - 1.0))
+            div_factor = (1.0 + div_weight * div_log) * max(0.1, 1.0 - unique_relief / max(1.0, float(crowd)))
+            state['diversity_factor'] = div_factor
+            state['diversity_crowd'] = float(crowd)
+            grace_val = float(state.get('diversity_grace', 0.0))
+            grace_factor = 1.0
+            if grace_val > 0.0:
+                grace_factor = max(0.2, 1.0 - grace_strength * min(1.0, grace_val))
+                grace_val *= grace_decay
+            state['diversity_grace'] = grace_val
+            envelope = min(1.0, stasis / span)
             osc = 0.5 - 0.5 * math.cos(2.0 * math.pi * phase)
             target = (base + rng * osc) * envelope
+            if growth_weight > 0.0:
+                grow = math.tanh(max(0.0, momentum) / span_scale_safe)
+                target *= max(0.0, 1.0 - growth_weight * grow)
+            if slump_gain > 0.0:
+                slump = math.tanh(max(0.0, -momentum) / span_scale_safe)
+                target *= 1.0 + slump_gain * slump
+            if relief_gain > 0.0:
+                target *= max(0.0, 1.0 - relief_gain)
+            target *= div_factor
+            target *= grace_factor
+            target *= noise_factor
             pressure_prev = float(state.get('pressure', 0.0))
             pressure = pressure_prev * (1.0 - smoothing) + target * smoothing
             state['pressure'] = pressure
@@ -3517,6 +3688,14 @@ class ReproPlanaNEATPlus:
             state['last_seen'] = int(generation)
             registry[gid] = state
             seen.add(gid)
+            relief_total += relief_gain
+            momentum_total += momentum
+            if abs(momentum) > momentum_max:
+                momentum_max = abs(momentum)
+            diversity_total += float(div_factor)
+            if div_factor > diversity_max:
+                diversity_max = float(div_factor)
+            grace_total += float(grace_factor)
         if registry:
             to_remove = []
             for gid, state in list(registry.items()):
@@ -3524,6 +3703,8 @@ class ReproPlanaNEATPlus:
                     continue
                 state['stasis'] = float(state.get('stasis', 0.0)) * decay
                 state['pressure'] = float(state.get('pressure', 0.0)) * decay
+                state['momentum'] = float(state.get('momentum', 0.0)) * decay
+                state['diversity_grace'] = float(state.get('diversity_grace', 0.0)) * grace_decay
                 if state.get('stasis', 0.0) < 0.05:
                     to_remove.append(gid)
                 else:
@@ -3532,11 +3713,23 @@ class ReproPlanaNEATPlus:
                 registry.pop(gid, None)
         active = len(seen)
         mean_penalty = float(total_penalty / max(1, active)) if active else 0.0
+        relief_mean = float(relief_total / max(1, active)) if active else 0.0
+        momentum_mean = float(momentum_total / max(1, active)) if active else 0.0
         self._monodromy_snapshot = {
             'pressure_mean': mean_penalty,
             'pressure_max': float(max_penalty),
             'active': int(active),
             'release': int(release_count),
+            'relief_mean': relief_mean,
+            'momentum_mean': momentum_mean,
+            'momentum_max': float(momentum_max),
+            'diversity_mean': float(diversity_total / max(1, active)) if active else 0.0,
+            'diversity_max': float(diversity_max),
+            'grace_mean': float(grace_total / max(1, active)) if active else 0.0,
+            'noise_factor': float(noise_factor),
+            'noise_kind': style.get('symbol', noise_kind or ''),
+            'noise_focus': float(noise_focus),
+            'noise_entropy': float(noise_entropy),
         }
         return adjusted
 
@@ -3674,7 +3867,7 @@ class ReproPlanaNEATPlus:
                 except Exception:
                     pass
                 try:
-                    fitnesses = self._apply_monodromy_pressure(fitnesses, baseline_fitnesses, signature_map, gen)
+                    fitnesses = self._apply_monodromy_pressure(fitnesses, baseline_fitnesses, signature_map, gen, signature_counts=signature_counts)
                 except Exception as _mono_err:
                     if getattr(self, 'debug_monodromy', False):
                         print('[WARN] monodromy pressure skipped:', _mono_err)
@@ -3749,7 +3942,15 @@ class ReproPlanaNEATPlus:
                     mono = getattr(self, '_monodromy_snapshot', None)
                     mono_str = ''
                     if mono and mono.get('active'):
-                        mono_str = f" | mono {mono.get('pressure_mean', 0.0):.3f}/{mono.get('pressure_max', 0.0):.3f}~{int(mono.get('release', 0))}"
+                        mono_str = (
+                            f" | mono {mono.get('pressure_mean', 0.0):.3f}/{mono.get('pressure_max', 0.0):.3f}"
+                            f"~{int(mono.get('release', 0))}"
+                            f" Δ{mono.get('relief_mean', 0.0):.3f} μ{mono.get('momentum_mean', 0.0):.3f}"
+                            f" div{mono.get('diversity_mean', 0.0):.2f} gr{mono.get('grace_mean', 0.0):.2f} nf{mono.get('noise_factor', 1.0):.2f}"
+                        )
+                        nk = mono.get('noise_kind')
+                        if nk:
+                            mono_str = f"{mono_str} {nk}"
                     print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}")
                 if context_best > best_ever_fit:
                     best_ever_fit = context_best
@@ -6388,11 +6589,29 @@ def _genome_to_cyto(genome: Genome) -> dict:
     """
     nodes = []
     for nid, node in genome.nodes.items():
-        node_data = {'id': str(nid), 'label': f'{node.type[0].upper()}{nid}', 'type': node.type, 'bias': getattr(node, 'bias', 0.0), 'activation': node.activation}
+        node_data = {
+            'id': str(nid),
+            'label': f'{node.type[0].upper()}{nid}',
+            'type': node.type,
+            'bias': getattr(node, 'bias', 0.0),
+            'activation': node.activation,
+            'sensitivity': float(getattr(node, 'backprop_sensitivity', 1.0)),
+            'jitter': float(getattr(node, 'sensitivity_jitter', 0.0)),
+            'momentum': float(getattr(node, 'sensitivity_momentum', 0.0)),
+            'variance': float(getattr(node, 'sensitivity_variance', 0.0)),
+        }
         nodes.append({'data': node_data})
     edges = []
     for innov, conn in genome.connections.items():
-        edge_data = {'id': f'e{innov}', 'source': str(conn.in_node), 'target': str(conn.out_node), 'weight': float(conn.weight), 'enabled': bool(conn.enabled)}
+        edge_weight = float(conn.weight)
+        edge_data = {
+            'id': f'e{innov}',
+            'source': str(conn.in_node),
+            'target': str(conn.out_node),
+            'weight': edge_weight,
+            'abs_weight': abs(edge_weight),
+            'enabled': bool(conn.enabled),
+        }
         edges.append({'data': edge_data})
     return {'id': genome.id, 'nodes': nodes, 'edges': edges, 'meta': {'fitness': getattr(genome, 'fitness', None), 'birth_gen': genome.birth_gen}}
 
@@ -6417,7 +6636,250 @@ def export_interactive_html_report(path: str, title: str, history, genomes, *, m
         genomes = [_genome_to_cyto(g) for g in genomes]
     build_id = _build_stamp_short()
     data = {'title': title, 'lc': {'x': xs, 'best': ys_best, 'avg': ys_avg}, 'genomes': genomes, 'build': build_id}
-    html = f"""<!doctype html>\n<html lang="ja">\n<head>\n  <meta charset="utf-8"/>\n  <title>{title}</title>\n  <meta name="viewport" content="width=device-width, initial-scale=1"/>\n  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>\n  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>\n  <style>\n    :root {{ --grid:#e5e5e5; --fg:#111; --muted:#666; --ok1:#0072B2; --ok2:#D55E00; --ok3:#009E73; --ok4:#CC79A7; --ok5:#F0E442; --ok6:#56B4E9; --ok7:#E69F00; --ok8:#000; }}\n    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--fg); }}\n    .container {{ max-width:1200px; margin:24px auto; padding:0 16px; }}\n    h1 {{ font-size:22px; margin:0 0 12px; }}\n    .card {{ border:1px solid var(--grid); border-radius:8px; padding:12px; background:#fff; margin-bottom:16px; }}\n    #lc {{ height:360px; }}\n    .panel {{ display:grid; grid-template-columns:1fr 320px; gap:16px; }}\n    #cy {{ width:100%; height:560px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}\n    .detail {{ border:1px dashed var(--grid); border-radius:6px; padding:8px; font-size:13px; height:560px; overflow:auto; background:#fafafa; }}\n    .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }}\n    select,button {{ padding:6px 8px; font-size:14px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}\n    .dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}\n    .legend {{ display:inline-flex; gap:8px; align-items:center; }}\n    /* Tooltip */\n    .tip {{ position:fixed; pointer-events:none; background:rgba(0,0,0,.8); color:#fff; padding:6px 8px; font-size:12px; border-radius:4px; transform:translate(8px,8px); z-index:1000; display:none; max-width:320px; white-space:nowrap; }}\n    /* Context menu */\n    .ctx-menu {{\n      position: fixed; z-index: 2000; display: none; min-width: 220px;\n      background: #fff; color: var(--fg); border: 1px solid var(--grid); border-radius: 8px;\n      box-shadow: 0 8px 20px rgba(0,0,0,.12); padding: 6px;\n    }}\n    .ctx-item {{ font-size: 13px; padding: 8px 10px; cursor: pointer; border-radius:6px; }}\n    .ctx-item:hover {{ background: #f3f3f3; }}\n    .ctx-sep {{ height:1px; background: var(--grid); margin:6px 0; }}\n    .swatches {{ display:flex; flex-wrap:wrap; gap:6px; padding: 4px 2px 2px; }}\n    .swatch {{ width:18px; height:18px; border-radius:50%; cursor:pointer; border:1px solid rgba(0,0,0,.15); }}\n    .ctx-row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}\n  </style>\n</head>\n<body>\n  <div class="container">\n    <h1>{title}</h1>\n    <div class="card">\n      <h2>Learning Curve</h2>\n      <div id="lc"></div>\n    </div>\n    <div class="card">\n      <h2>Genome Viewer</h2>\n      <div class="row">\n        <label for="genomeSelect">Genome:</label>\n        <select id="genomeSelect"></select>\n        <button id="layoutBtn">Re-layout</button>\n        <span class="legend">\n          <span class="dot" style="background:#009E73"></span> input\n          <span class="dot" style="background:#999"></span> hidden\n          <span class="dot" style="background:#0072B2"></span> output\n        </span>\n      </div>\n      <div class="panel">\n        <div id="cy"></div>\n        <div class="detail" id="detail"><div class="fine">ノードやエッジを選択すると詳細が表示されます。</div></div>\n      </div>\n    </div>\n  </div>\n  <div class="tip" id="tip"></div>\n  <div class="ctx-menu" id="ctx"></div>\n\n  <script>\n    const DATA = {json.dumps(data, ensure_ascii=False)};\n    // Learning curve\n    (function(){{\n      const traces = [];\n      if (DATA.lc && DATA.lc.x.length) {{\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.best, mode:'lines', name:'best', line:{{width:2, color:'#0072B2'}},\n          hovertemplate:'gen=%{{x}}<br>best=%{{y:.4f}}<extra></extra>' }});\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.avg,  mode:'lines', name:'avg',  line:{{width:2, color:'#D55E00'}},\n          hovertemplate:'gen=%{{x}}<br>avg=%{{y:.4f}}<extra></extra>' }});\n      }}\n      Plotly.newPlot('lc', traces, {{\n        margin:{{l:40,r:10,t:10,b:40}},\n        xaxis:{{title:'Generation', gridcolor:'#eee'}},\n        yaxis:{{title:'Fitness', gridcolor:'#eee'}},\n        legend:{{orientation:'h'}}\n      }}, {{displayModeBar:true, responsive:true}});\n    }})();\n\n    // Genome viewer\n    const cyContainer = document.getElementById('cy');\n    const detail = document.getElementById('detail');\n    const tip = document.getElementById('tip');\n    const sel = document.getElementById('genomeSelect');\n    const layoutBtn = document.getElementById('layoutBtn');\n    const ctx = document.getElementById('ctx');\n    let cy = null;\n    let currentGenome = null; // store current genome object\n    let ctxNode = null;\n\n    function lsKey(gid) {{ return 'NEAT_REPORT_GENOME_STATE::' + String(gid); }}\n    function saveState() {{\n      if (!cy || !currentGenome) return;\n      const st = {{}};\n      cy.nodes().forEach(n => {{\n        st[n.id()] = {{\n          pos: n.position(),\n          locked: n.locked(),\n          color: n.data('color') || null,\n          note: n.data('note') || null\n        }};\n      }});\n      try {{ localStorage.setItem(lsKey(currentGenome.id || 'genome'), JSON.stringify(st)); }} catch(e){{}}\n    }}\n    function applyState() {{\n      if (!cy || !currentGenome) return;\n      let raw = null;\n      try {{ raw = localStorage.getItem(lsKey(currentGenome.id || 'genome')); }} catch(e){{}}\n      if (!raw) return;\n      let st = null;\n      try {{ st = JSON.parse(raw); }} catch(e) {{ return; }}\n      if (!st) return;\n      cy.batch(() => {{\n        cy.nodes().forEach(n => {{\n          const s = st[n.id()]; if (!s) return;\n          if (s.pos && Number.isFinite(s.pos.x) && Number.isFinite(s.pos.y)) n.position(s.pos);\n          if (s.locked) n.lock(); else n.unlock();\n          if (s.color) {{ n.data('color', s.color); n.style('background-color', s.color); }}\n          if (s.note) {{\n            n.data('note', s.note);\n            const orig = n.data('orig_label') || n.data('label') || n.id();\n            n.data('label', orig + '\\n' + s.note);\n          }}\n        }});\n      }});\n    }}\n\n    function genomeToElements(g) {{\n      // Ensure orig_label availability for annotations\n      const nodes = (g.nodes||[]).map(n => {{\n        const d = n.data || n;\n        return {{ data: Object.assign({{}}, d, {{ orig_label: d.label }}) }};\n      }});\n      const edges = (g.edges||[]).map(e => ({{ data: e.data || e, classes: ((e.data||e).enabled? 'enabled':'disabled') }}));\n      return nodes.concat(edges);\n    }}\n    function populateSelect() {{\n      sel.innerHTML = '';\n      if (!DATA.genomes || DATA.genomes.length===0) {{\n        const opt = document.createElement('option'); opt.text='(no genomes)'; sel.add(opt); sel.disabled=true; return;\n      }}\n      sel.disabled=false;\n      DATA.genomes.forEach((g,i) => {{\n        const meta = g.meta || {{}};\n        const label = (g.id || ('genome_'+i)) + (meta.fitness!==undefined ? (' (fitness='+meta.fitness+')') : '');\n        const opt = document.createElement('option'); opt.value=String(i); opt.text=label; sel.add(opt);\n      }});\n    }}\n    function renderGenome(idx) {{\n      if (!DATA.genomes || !DATA.genomes[idx]) return;\n      const g = DATA.genomes[idx];\n      currentGenome = g;\n      const elements = genomeToElements(g);\n      const styles = [\n        {{ selector:'node', style:{{ 'label':'data(label)', 'font-size':11, 'text-valign':'center', 'text-halign':'center',\n           'text-wrap':'wrap', 'text-max-width': 90, 'background-color':'#999','width':22,'height':22, 'color':'#111','border-color':'#333','border-width':0.5 }} }},\n        {{ selector:'node[type = "input"]',  style:{{ 'background-color':'#009E73' }} }},\n        {{ selector:'node[type = "output"]', style:{{ 'background-color':'#0072B2' }} }},\n        {{ selector:'edge', style:{{ 'line-color':'#888', 'width':'mapData(weight, -2, 2, 0.6, 4)', 'opacity':0.95,\n           'curve-style':'bezier','target-arrow-shape':'triangle','target-arrow-color':'#888' }} }},\n        {{ selector:'edge[weight < 0]',  style:{{ 'line-color':'#D55E00', 'target-arrow-color':'#D55E00' }} }},\n        {{ selector:'edge[weight >= 0]', style:{{ 'line-color':'#56B4E9', 'target-arrow-color':'#56B4E9' }} }},\n        {{ selector:'edge.disabled', style:{{ 'line-style':'dotted','opacity':0.3 }} }},\n        {{ selector:':selected', style:{{ 'border-width':2, 'border-color':'#F0E442' }} }},\n      ];\n      if (cy) cy.destroy();\n      cy = cytoscape({{ container: cyContainer, elements: elements, style: styles, layout: {{ name:'cose', animate:false }},\n        wheelSensitivity:0.2, minZoom:0.2, maxZoom:5 }});\n\n      function showDetail(html) {{ detail.innerHTML = html; }}\n      function nodeHtml(d) {{\n        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');\n        return `<div><b>Node</b></div>\n          <div>ID: ${{a('id')}}</div>\n          <div>Label: ${{a('label')}}</div>\n          <div>Type: ${{a('type')}}</div>\n          <div>Bias: ${{a('bias')}}</div>\n          <div>Activation: ${{a('activation')}}</div>\n          <div>Note: ${{a('note')}}</div>`;\n      }}\n      function edgeHtml(d) {{\n        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');\n        return `<div><b>Edge</b></div>\n          <div>Source: ${{a('source')}}</div>\n          <div>Target: ${{a('target')}}</div>\n          <div>Weight: ${{a('weight')}}</div>\n          <div>Enabled: ${{a('enabled')}}</div>`;\n      }}\n\n      // Click selects → details\n      cy.on('tap','node',(evt)=> showDetail(nodeHtml(evt.target.data())));\n      cy.on('tap','edge',(evt)=> showDetail(edgeHtml(evt.target.data())));\n      cy.on('tap',(evt)=> {{ if (evt.target===cy) showDetail('<div class="fine">ノードやエッジを選択すると詳細が表示されます。</div>'); }});\n\n      // Hover tooltip\n      const moveTip = (e) => {{ tip.style.left=(e.renderedPosition.x + cyContainer.getBoundingClientRect().left)+'px';\n                                tip.style.top=(e.renderedPosition.y + cyContainer.getBoundingClientRect().top)+'px'; }};\n      cy.on('mouseover','node',(evt)=>{{ tip.innerHTML = evt.target.data('label') || evt.target.data('id'); tip.style.display='block'; moveTip(evt); }});\n      cy.on('mousemove','node',(evt)=> moveTip(evt));\n      cy.on('mouseout','node',()=> {{ tip.style.display='none'; }});\n\n      // Persist position/color/note\n      cy.on('free', 'node', saveState);\n      cy.on('lock unlock', 'node', saveState);\n\n      // Apply saved state for this genome\n      applyState();\n\n      // Context menu handlers\n      cy.on('cxttapstart', 'node', (evt) => {{\n        ctxNode = evt.target;\n        openCtxAt(evt.renderedPosition);\n      }});\n      cy.on('cxttapstart', (evt) => {{\n        if (evt.target === cy) closeCtx();\n      }});\n      document.addEventListener('click', (e) => {{\n        if (!ctx.contains(e.target)) closeCtx();\n      }});\n      window.addEventListener('resize', closeCtx);\n      document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeCtx(); }});\n    }}\n\n    // UI wiring\n    populateSelect();\n    if (DATA.genomes && DATA.genomes.length>0) renderGenome(0);\n    sel.addEventListener('change', ()=> {{ const idx=parseInt(sel.value,10); if(!Number.isNaN(idx)) renderGenome(idx); }});\n    layoutBtn.addEventListener('click', ()=> {{ if (cy) cy.layout({{name:'cose', animate:true}}).run(); }});\n\n    // Context menu building\n    const PALETTE = ['#0072B2','#D55E00','#009E73','#CC79A7','#F0E442','#56B4E9','#E69F00','#000000','#777777','#999999'];\n    const hiddenColorPicker = document.createElement('input'); hiddenColorPicker.type='color'; hiddenColorPicker.style.display='none'; document.body.appendChild(hiddenColorPicker);\n\n    function openCtxAt(renderedPos) {{\n      if (!ctxNode) return;\n      const rect = cyContainer.getBoundingClientRect();\n      const x = rect.left + renderedPos.x;\n      const y = rect.top + renderedPos.y;\n      ctx.innerHTML = '';\n      const menu = document.createElement('div');\n\n      // Title\n      const title = document.createElement('div');\n      title.className='ctx-item';\n      title.style.cursor='default';\n      title.innerHTML = '<b>Node:</b> ' + (ctxNode.data('label') || ctxNode.id());\n      ctx.appendChild(title);\n\n      // Fix/Unfix\n      const fix = document.createElement('div');\n      fix.className='ctx-item';\n      const locked = ctxNode.locked();\n      fix.textContent = locked ? '位置の固定を解除' : '位置を固定';\n      fix.onclick = () => {{\n        if (ctxNode.locked()) ctxNode.unlock(); else ctxNode.lock();\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(fix);\n\n      // Color row\n      const colorRow = document.createElement('div');\n      colorRow.className='ctx-item';\n      colorRow.innerHTML = '<div class="ctx-row"><span>色を変更</span><span style="font-size:12px;color:var(--muted)">クリックで適用</span></div>';\n      const sw = document.createElement('div'); sw.className='swatches';\n      PALETTE.forEach(c => {{\n        const d = document.createElement('div'); d.className='swatch'; d.style.background=c;\n        d.title = c;\n        d.onclick = () => {{ ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx(); }};\n        sw.appendChild(d);\n      }});\n      // Custom picker\n      const custom = document.createElement('div');\n      custom.className='ctx-item';\n      custom.textContent='カスタムカラー…';\n      custom.onclick = () => {{\n        hiddenColorPicker.value = ctxNode.data('color') || '#999999';\n        hiddenColorPicker.onchange = () => {{\n          const c = hiddenColorPicker.value;\n          ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx();\n        }};\n        hiddenColorPicker.click();\n      }};\n      colorRow.appendChild(sw);\n      ctx.appendChild(colorRow);\n      ctx.appendChild(custom);\n\n      // Note editor\n      const noteBtn = document.createElement('div');\n      noteBtn.className='ctx-item';\n      noteBtn.textContent='注釈を追加/編集…';\n      noteBtn.onclick = () => {{\n        const cur = ctxNode.data('note') || '';\n        const txt = window.prompt('ノードの注釈（空で削除）', cur);\n        if (txt === null) return;\n        const orig = ctxNode.data('orig_label') || ctxNode.data('label') || ctxNode.id();\n        if (txt.trim() === '') {{\n          ctxNode.data('note', null);\n          ctxNode.data('label', orig);\n        }} else {{\n          ctxNode.data('note', txt);\n          ctxNode.data('label', orig + '\\n' + txt);\n        }}\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(noteBtn);\n\n      // Reset color\n      const resetColor = document.createElement('div');\n      resetColor.className='ctx-item';\n      resetColor.textContent='色をリセット';\n      resetColor.onclick = () => {{\n        ctxNode.data('color', null);\n        // Revert to type-based color by removing inline style\n        ctxNode.removeStyle('background-color');\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(resetColor);\n\n      // Separator\n      const sep = document.createElement('div'); sep.className='ctx-sep'; ctx.appendChild(sep);\n\n      // Save layout now\n      const saveBtn = document.createElement('div');\n      saveBtn.className='ctx-item';\n      saveBtn.textContent='レイアウトを保存';\n      saveBtn.onclick = () => {{ saveState(); closeCtx(); }};\n      ctx.appendChild(saveBtn);\n\n      // Open\n      ctx.style.left = Math.round(x) + 'px';\n      ctx.style.top  = Math.round(y) + 'px';\n      ctx.style.display = 'block';\n    }}\n\n    function closeCtx() {{ ctx.style.display='none'; ctxNode = null; }}\n\n  </script>\n</body>\n</html>"""
+    html = f"""<!doctype html>\n<html lang="ja">\n<head>\n  <meta charset="utf-8"/>\n  <title>{title}</title>\n  <meta name="viewport" content="width=device-width, initial-scale=1"/>\n  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>\n  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>\n  <style>\n    :root {{ --grid:#e5e5e5; --fg:#111; --muted:#666; --ok1:#0072B2; --ok2:#D55E00; --ok3:#009E73; --ok4:#CC79A7; --ok5:#F0E442; --ok6:#56B4E9; --ok7:#E69F00; --ok8:#000; }}\n    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--fg); }}\n    .container {{ max-width:1200px; margin:24px auto; padding:0 16px; }}\n    h1 {{ font-size:22px; margin:0 0 12px; }}\n    .card {{ border:1px solid var(--grid); border-radius:8px; padding:12px; background:#fff; margin-bottom:16px; }}\n    #lc {{ height:360px; }}\n    .panel {{ display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:16px; align-items:start; overflow:hidden; }}\n    .panel > * {{ min-width:0; }}\n    #cy {{ width:100%; height:560px; border:1px solid var(--grid); border-radius:6px; background:#fff; box-sizing:border-box; }}\n    .detail {{ border:1px dashed var(--grid); border-radius:6px; padding:8px; font-size:13px; height:560px; overflow:auto; background:#fafafa; box-sizing:border-box; }}\n    .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }}\n    .row.controls {{ margin-top:4px; font-size:13px; color:var(--muted); }}\n    .row.controls label {{ font-size:13px; color:var(--fg); display:flex; align-items:center; gap:4px; }}\n    select,button,input[type=range] {{ padding:6px 8px; font-size:14px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}\n    input[type=range] {{ padding:0; width:160px; accent-color:#0072B2; }}\n    .dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}\n    .legend {{ display:inline-flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:13px; }}\n    .legend-title {{ font-weight:600; color:var(--muted); margin-right:2px; }}\n    .legend-gradient {{ width:120px; height:10px; border-radius:4px; border:1px solid var(--grid); background:linear-gradient(90deg,#2c7bb6,#abd9e9,#ffffbf,#fdae61,#d7191c); }}\n    .legend-text {{ color:var(--muted); font-size:12px; }}\n    .checkbox {{ display:inline-flex; align-items:center; gap:6px; padding:4px 6px; border:1px solid var(--grid); border-radius:6px; background:#fff; color:var(--fg); }}\n    .checkbox input {{ margin:0; }}\n    #genomeStats {{ font-size:13px; color:var(--muted); margin-top:8px; display:grid; gap:4px; line-height:1.4; }}\n    @media (max-width: 900px) {{\n      .panel {{ grid-template-columns:1fr; }}\n      .detail {{ height:auto; min-height:220px; }}\n      #cy {{ height:420px; }}\n    }}\n    /* Tooltip */\n    .tip {{ position:fixed; pointer-events:none; background:rgba(0,0,0,.8); color:#fff; padding:6px 8px; font-size:12px; border-radius:4px; transform:translate(8px,8px); z-index:1000; display:none; max-width:320px; white-space:nowrap; }}\n    /* Context menu */\n    .ctx-menu {{\n      position: fixed; z-index: 2000; display: none; min-width: 220px;\n      background: #fff; color: var(--fg); border: 1px solid var(--grid); border-radius: 8px;\n      box-shadow: 0 8px 20px rgba(0,0,0,.12); padding: 6px;\n    }}\n    .ctx-item {{ font-size: 13px; padding: 8px 10px; cursor: pointer; border-radius:6px; }}\n    .ctx-item:hover {{ background: #f3f3f3; }}\n    .ctx-sep {{ height:1px; background: var(--grid); margin:6px 0; }}\n    .swatches {{ display:flex; flex-wrap:wrap; gap:6px; padding: 4px 2px 2px; }}\n    .swatch {{ width:18px; height:18px; border-radius:50%; cursor:pointer; border:1px solid rgba(0,0,0,.15); }}\n    .ctx-row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}\n  </style>\n</head>\n<body>\n  <div class="container">\n    <h1>{title}</h1>\n    <div class="card">\n      <h2>Learning Curve</h2>\n      <div id="lc"></div>\n    </div>\n    <div class="card">\n      <h2>Genome Viewer</h2>\n      <div class="row">\n        <label for="genomeSelect">Genome:</label>\n        <select id="genomeSelect"></select>\n        <button id="layoutBtn">Re-layout</button>\n        <span class="legend" id="legendBox"></span>\n      </div>\n      <div class="row controls">\n        <label for="nodeColorMode">ノード色:</label>\n        <select id="nodeColorMode">\n          <option value="type">種類</option>\n          <option value="sensitivity">感受性</option>\n          <option value="momentum">モメンタム</option>\n          <option value="variance">分散</option>\n        </select>\n        <label for="weightFilter">|weight| ≥ <span id="weightFilterValue">0</span></label>\n        <input type="range" id="weightFilter" min="0" max="100" step="1" value="0"/>\n        <label class="checkbox"><input type="checkbox" id="enabledOnly"/> 有効エッジのみ</label>\n      </div>\n      <div class="panel">\n        <div id="cy"></div>\n        <div class="detail" id="detail"><div class="fine">ノードやエッジを選択すると詳細が表示されます。</div></div>\n      </div>\n      <div id="genomeStats"></div>\n    </div>\n  </div>\n  <div class="tip" id="tip"></div>\n  <div class="ctx-menu" id="ctx"></div>\n\n  <script>\n    const DATA = {json.dumps(data, ensure_ascii=False)};\n    // Learning curve\n    (function(){{\n      const traces = [];\n      if (DATA.lc && DATA.lc.x.length) {{\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.best, mode:'lines', name:'best', line:{{width:2, color:'#0072B2'}},\n          hovertemplate:'gen=%{{x}}<br>best=%{{y:.4f}}<extra></extra>' }});\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.avg,  mode:'lines', name:'avg',  line:{{width:2, color:'#D55E00'}},\n          hovertemplate:'gen=%{{x}}<br>avg=%{{y:.4f}}<extra></extra>' }});\n      }}\n      Plotly.newPlot('lc', traces, {{\n        margin:{{l:40,r:10,t:10,b:40}},\n        xaxis:{{title:'Generation', gridcolor:'#eee'}},\n        yaxis:{{title:'Fitness', gridcolor:'#eee'}},\n        legend:{{orientation:'h'}}\n      }}, {{displayModeBar:true, responsive:true}});\n    }})();\n\n    // Genome viewer\n    const cyContainer = document.getElementById('cy');\n    const detail = document.getElementById('detail');\n    const tip = document.getElementById('tip');\n    const sel = document.getElementById('genomeSelect');\n    const layoutBtn = document.getElementById('layoutBtn');\n    const ctx = document.getElementById('ctx');\n    const colorModeSelect = document.getElementById('nodeColorMode');\n    const weightSlider = document.getElementById('weightFilter');\n    const weightLabel = document.getElementById('weightFilterValue');\n    const enabledOnly = document.getElementById('enabledOnly');\n    const legendBox = document.getElementById('legendBox');\n    const statsBox = document.getElementById('genomeStats');\n    let cy = null;\n    let currentGenome = null; // store current genome object\n    let ctxNode = null;\n    const globalStats = computeGlobalStats();\n    let currentEdgeMax = globalStats.maxAbsWeight || 0;\n    let activeColorMode = (colorModeSelect && colorModeSelect.value) || 'type';\n    updateLegend(activeColorMode);\n    applyEdgeFilters();\n\n    function lsKey(gid) {{ return 'NEAT_REPORT_GENOME_STATE::' + String(gid); }}\n    function saveState() {{\n      if (!cy || !currentGenome) return;\n      const st = {{}};\n      cy.nodes().forEach(n => {{\n        st[n.id()] = {{\n          pos: n.position(),\n          locked: n.locked(),\n          color: n.data('color') || null,\n          note: n.data('note') || null\n        }};\n      }});\n      try {{ localStorage.setItem(lsKey(currentGenome.id || 'genome'), JSON.stringify(st)); }} catch(e){{}}\n    }}\n    function applyState() {{\n      if (!cy || !currentGenome) return;\n      let raw = null;\n      try {{ raw = localStorage.getItem(lsKey(currentGenome.id || 'genome')); }} catch(e){{}}\n      if (!raw) return;\n      let st = null;\n      try {{ st = JSON.parse(raw); }} catch(e) {{ return; }}\n      if (!st) return;\n      cy.batch(() => {{\n        cy.nodes().forEach(n => {{\n          const s = st[n.id()]; if (!s) return;\n          if (s.pos && Number.isFinite(s.pos.x) && Number.isFinite(s.pos.y)) n.position(s.pos);\n          if (s.locked) n.lock(); else n.unlock();\n          if (s.color) {{ n.data('color', s.color); n.style('background-color', s.color); }}\n          if (s.note) {{\n            n.data('note', s.note);\n            const orig = n.data('orig_label') || n.data('label') || n.id();\n            n.data('label', orig + '\\n' + s.note);\n          }}\n        }});\n      }});\n    }}\n\n    
+function updateRange(range, value) {{
+  if (!Number.isFinite(value)) return;
+  if (value < range[0]) range[0] = value;
+  if (value > range[1]) range[1] = value;
+}}
+function normalizeRange(range, fallback) {{
+  if (!Number.isFinite(range[0]) || !Number.isFinite(range[1]) || range[0] === Infinity || range[1] === -Infinity) {{
+    range[0] = fallback;
+    range[1] = fallback;
+  }}
+}}
+function computeGlobalStats() {{
+  const ranges = {{
+    sensitivity: [Infinity, -Infinity],
+    momentum: [Infinity, -Infinity],
+    variance: [Infinity, -Infinity],
+  }};
+  let maxAbsWeight = 0;
+  (DATA.genomes || []).forEach(g => {{
+    (g.nodes || []).forEach(n => {{
+      const d = n.data || n;
+      updateRange(ranges.sensitivity, Number(d.sensitivity));
+      updateRange(ranges.momentum, Number(d.momentum));
+      updateRange(ranges.variance, Number(d.variance));
+    }});
+    (g.edges || []).forEach(e => {{
+      const d = e.data || e;
+      const absW = Math.abs(Number(d.abs_weight !== undefined ? d.abs_weight : d.weight));
+      if (Number.isFinite(absW) && absW > maxAbsWeight) maxAbsWeight = absW;
+    }});
+  }});
+  normalizeRange(ranges.sensitivity, 1);
+  normalizeRange(ranges.momentum, 0);
+  normalizeRange(ranges.variance, 0);
+  return {{ ranges, maxAbsWeight }};
+}}
+function formatNumber(value, digits) {{
+  if (!Number.isFinite(value)) return '–';
+  const places = Number.isFinite(digits) ? digits : 2;
+  return Number(value).toFixed(places);
+}}
+function gradientColor(t) {{
+  const stops = [
+    [44, 123, 182],
+    [171, 217, 233],
+    [253, 174, 97],
+    [215, 25, 28],
+  ];
+  const clamped = Math.min(1, Math.max(0, t));
+  const scaled = clamped * (stops.length - 1);
+  const idx = Math.min(stops.length - 2, Math.floor(scaled));
+  const frac = scaled - idx;
+  const start = stops[idx];
+  const end = stops[idx + 1];
+  const comp = start.map((s, i) => Math.round(s + (end[i] - s) * frac));
+  return '#' + comp.map(c => c.toString(16).padStart(2, '0')).join('');
+}}
+function calcStats(values) {{
+  const arr = values.filter(v => Number.isFinite(v));
+  if (!arr.length) return {{ mean: NaN, std: NaN }};
+  const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+  const variance = arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / arr.length;
+  return {{ mean, std: Math.sqrt(variance) }};
+}}
+function computeEdgeMax(g) {{
+  let max = 0;
+  (g.edges || []).forEach(e => {{
+    const d = e.data || e;
+    const absW = Math.abs(Number(d.abs_weight !== undefined ? d.abs_weight : d.weight));
+    if (Number.isFinite(absW) && absW > max) max = absW;
+  }});
+  return max;
+}}
+function applyNodeColorMode(mode) {{
+  activeColorMode = mode || 'type';
+  updateLegend(activeColorMode);
+  if (!cy) return;
+  const keyMap = {{ sensitivity: 'sensitivity', momentum: 'momentum', variance: 'variance' }};
+  const range = globalStats.ranges[activeColorMode] || [0, 1];
+  cy.batch(() => {{
+    cy.nodes().forEach(n => {{
+      const data = n.data();
+      const manual = data.color;
+      if (manual) {{
+        n.data('vizColor', manual);
+        n.style('background-color', manual);
+        return;
+      }}
+      let color = '#999999';
+      if (activeColorMode === 'type') {{
+        if (data.type === 'input') color = '#009E73';
+        else if (data.type === 'output') color = '#0072B2';
+        else color = '#999999';
+      }} else {{
+        const key = keyMap[activeColorMode];
+        const value = Number(data[key]);
+        let t = 0.5;
+        if (Number.isFinite(value)) {{
+          const [min, max] = range;
+          t = (max > min) ? (value - min) / (max - min) : 0.5;
+        }}
+        color = gradientColor(t);
+      }}
+      n.data('vizColor', color);
+      n.style('background-color', color);
+    }});
+  }});
+}}
+function applyEdgeVisuals() {{
+  if (!cy) return;
+  const denom = currentEdgeMax > 0 ? currentEdgeMax : 1;
+  cy.batch(() => {{
+    cy.edges().forEach(e => {{
+      const data = e.data();
+      const w = Number(data.weight) || 0;
+      const absW = Math.abs(w);
+      const baseColor = w >= 0 ? '#56B4E9' : '#D55E00';
+      const width = 0.6 + 3.8 * (absW / denom);
+      const clampedWidth = Math.max(0.6, Math.min(width, 6));
+      e.data('vizColor', baseColor);
+      e.data('vizWidth', clampedWidth);
+      e.style('line-color', baseColor);
+      e.style('target-arrow-color', baseColor);
+      e.style('width', clampedWidth);
+    }});
+  }});
+}}
+function applyEdgeFilters() {{
+  const sliderVal = weightSlider ? Number(weightSlider.value) : 0;
+  const threshold = (currentEdgeMax || 0) * (sliderVal / 100);
+  if (weightLabel) weightLabel.textContent = formatNumber(threshold, 3);
+  if (!cy) return;
+  cy.batch(() => {{
+    cy.edges().forEach(edge => {{
+      const data = edge.data();
+      const absW = Math.abs(Number(data.weight) || 0);
+      let hide = false;
+      if (threshold > 0 && absW < threshold - 1e-9) hide = true;
+      if (enabledOnly && enabledOnly.checked && !data.enabled) hide = true;
+      if (hide) edge.addClass('hidden'); else edge.removeClass('hidden');
+    }});
+  }});
+}}
+function updateLegend(mode) {{
+  if (!legendBox) return;
+  if (mode === 'type') {{
+    legendBox.innerHTML = '<span class="legend-title">Node:</span>' +
+      '<span class="dot" style="background:#009E73"></span> input ' +
+      '<span class="dot" style="background:#999999"></span> hidden ' +
+      '<span class="dot" style="background:#0072B2"></span> output';
+  }} else {{
+    const range = globalStats.ranges[mode] || [0, 0];
+    legendBox.innerHTML = '<span class="legend-title">Node:</span>' +
+      '<span class="legend-gradient"></span>' +
+      `<span class="legend-text">low ${{formatNumber(range[0], 2)}}</span>` +
+      `<span class="legend-text">high ${{formatNumber(range[1], 2)}}</span>`;
+  }}
+}}
+function updateGenomeStats(g) {{
+  if (!statsBox) return;
+  const nodes = g.nodes || [];
+  const edges = g.edges || [];
+  const enabledCount = edges.filter(e => ((e.data||e).enabled)).length;
+  const values = key => nodes.map(n => Number((n.data || n)[key])).filter(v => Number.isFinite(v));
+  const sens = calcStats(values('sensitivity'));
+  const momentum = calcStats(values('momentum'));
+  const jitter = calcStats(values('jitter'));
+  const variance = calcStats(values('variance'));
+  const parts = [
+    `<div>Nodes: ${{nodes.length}} / Edges: ${{edges.length}} (enabled ${{enabledCount}})</div>`,
+    `<div>感受性 μ=${{formatNumber(sens.mean, 3)}} σ=${{formatNumber(sens.std, 3)}}</div>`,
+    `<div>モメンタム μ=${{formatNumber(momentum.mean, 3)}} σ=${{formatNumber(momentum.std, 3)}} ・ ジッター μ=${{formatNumber(jitter.mean, 3)}} σ=${{formatNumber(jitter.std, 3)}} ・ 分散 μ=${{formatNumber(variance.mean, 3)}}</div>`
+  ];
+  statsBox.innerHTML = parts.join('');
+}}
+function genomeToElements(g) {{
+      const nodes = (g.nodes||[]).map(n => {{
+        const d = Object.assign({{}}, n.data || n);
+        if (d.orig_label === undefined) d.orig_label = d.label;
+        if (d.vizColor === undefined) d.vizColor = '#999999';
+        if (d.vizWidth === undefined) d.vizWidth = 2;
+        return {{ data: d }};
+      }});
+      const edges = (g.edges||[]).map(e => {{
+        const d = Object.assign({{}}, e.data || e);
+        if (d.vizColor === undefined) {{
+          const w = Number(d.weight) || 0;
+          d.vizColor = w >= 0 ? '#56B4E9' : '#D55E00';
+        }}
+        const absW = Math.abs(Number(d.abs_weight !== undefined ? d.abs_weight : d.weight)) || 0;
+        if (d.vizWidth === undefined) d.vizWidth = 0.6 + Math.min(3.4, absW);
+        return {{ data: d, classes: (d.enabled ? 'enabled' : 'disabled') }};
+      }});
+      return nodes.concat(edges);
+    }}
+function populateSelect() {{\n      sel.innerHTML = '';\n      if (!DATA.genomes || DATA.genomes.length===0) {{\n        const opt = document.createElement('option'); opt.text='(no genomes)'; sel.add(opt); sel.disabled=true; return;\n      }}\n      sel.disabled=false;\n      DATA.genomes.forEach((g,i) => {{\n        const meta = g.meta || {{}};\n        const label = (g.id || ('genome_'+i)) + (meta.fitness!==undefined ? (' (fitness='+meta.fitness+')') : '');\n        const opt = document.createElement('option'); opt.value=String(i); opt.text=label; sel.add(opt);\n      }});\n    }}\n    function renderGenome(idx) {{\n      if (!DATA.genomes || !DATA.genomes[idx]) return;\n      const g = DATA.genomes[idx];\n      currentGenome = g;\n      const elements = genomeToElements(g);\n      const styles = [
+        {{ selector:'node', style:{{ 'label':'data(label)', 'font-size':11, 'text-valign':'center', 'text-halign':'center',
+           'text-wrap':'wrap', 'text-max-width': 90, 'background-color':'data(vizColor)','width':22,'height':22, 'color':'#111','border-color':'#333','border-width':0.5 }} }},
+        {{ selector:'edge', style:{{ 'line-color':'data(vizColor)', 'target-arrow-color':'data(vizColor)', 'width':'data(vizWidth)', 'opacity':0.95,
+           'curve-style':'bezier','target-arrow-shape':'triangle' }} }},
+        {{ selector:'edge.disabled', style:{{ 'line-style':'dotted','opacity':0.35 }} }},
+        {{ selector:'edge.hidden', style:{{ 'display':'none' }} }},
+        {{ selector:':selected', style:{{ 'border-width':2, 'border-color':'#F0E442' }} }},
+      ];\n      if (cy) cy.destroy();
+      cy = cytoscape({{ container: cyContainer, elements: elements, style: styles, layout: {{ name:'cose', animate:false }},
+        wheelSensitivity:0.2, minZoom:0.2, maxZoom:5 }});
+      currentEdgeMax = Math.max(computeEdgeMax(g), globalStats.maxAbsWeight || 0);
+      applyEdgeVisuals();
+      if (weightSlider) {{
+        if (!cy || cy.edges().length === 0) {{
+          weightSlider.value = '0';
+          weightSlider.disabled = true;
+        }} else {{
+          weightSlider.disabled = false;
+        }}
+      }}
+
+      function showDetail(html) {{ detail.innerHTML = html; }}\n      function nodeHtml(d) {{\n        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');\n        return `<div><b>Node</b></div>\n          <div>ID: ${{a('id')}}</div>\n          <div>Label: ${{a('label')}}</div>\n          <div>Type: ${{a('type')}}</div>\n          <div>Bias: ${{a('bias')}}</div>\n          <div>Activation: ${{a('activation')}}</div>\n          <div>Sensitivity: ${{a('sensitivity')}}</div>\n          <div>Jitter: ${{a('jitter')}}</div>\n          <div>Momentum: ${{a('momentum')}}</div>\n          <div>Variance: ${{a('variance')}}</div>\n          <div>Note: ${{a('note')}}</div>`;\n      }}\n      function edgeHtml(d) {{
+        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');
+        return `<div><b>Edge</b></div>
+          <div>Source: ${{a('source')}}</div>
+          <div>Target: ${{a('target')}}</div>
+          <div>Weight: ${{a('weight')}}</div>
+          <div>|Weight|: ${{a('abs_weight')}}</div>
+          <div>Enabled: ${{a('enabled')}}</div>`;
+      }}
+
+      // Click selects → details\n      cy.on('tap','node',(evt)=> showDetail(nodeHtml(evt.target.data())));\n      cy.on('tap','edge',(evt)=> showDetail(edgeHtml(evt.target.data())));\n      cy.on('tap',(evt)=> {{ if (evt.target===cy) showDetail('<div class="fine">ノードやエッジを選択すると詳細が表示されます。</div>'); }});\n\n      // Hover tooltip\n      const moveTip = (e) => {{ tip.style.left=(e.renderedPosition.x + cyContainer.getBoundingClientRect().left)+'px';\n                                tip.style.top=(e.renderedPosition.y + cyContainer.getBoundingClientRect().top)+'px'; }};\n      const metricKeyMap = {{ sensitivity:'sensitivity', momentum:'momentum', variance:'variance' }};\n      const metricLabelMap = {{ sensitivity:'S', momentum:'M', variance:'V' }};\n      cy.on('mouseover','node',(evt)=>{{
+        const data = evt.target.data();
+        let text = data.label || data.id || '';
+        if (activeColorMode !== 'type') {{
+          const key = metricKeyMap[activeColorMode];
+          const label = metricLabelMap[activeColorMode] || activeColorMode;
+          const val = Number(data[key]);
+          if (Number.isFinite(val)) text += ' · ' + label + '=' + formatNumber(val, 3);
+        }}
+        tip.innerHTML = text;
+        tip.style.display='block';
+        moveTip(evt);
+      }});\n      cy.on('mousemove','node',(evt)=> moveTip(evt));\n      cy.on('mouseout','node',()=> {{ tip.style.display='none'; }});\n\n      // Persist position/color/note\n      cy.on('free', 'node', saveState);\n      cy.on('lock unlock', 'node', saveState);\n\n      // Apply saved state for this genome\n      applyState();\n\n      applyNodeColorMode(activeColorMode);\n      applyEdgeFilters();\n      updateGenomeStats(g);\n      // Context menu handlers\n      cy.on('cxttapstart', 'node', (evt) => {{\n        ctxNode = evt.target;\n        openCtxAt(evt.renderedPosition);\n      }});\n      cy.on('cxttapstart', (evt) => {{\n        if (evt.target === cy) closeCtx();\n      }});\n      document.addEventListener('click', (e) => {{\n        if (!ctx.contains(e.target)) closeCtx();\n      }});\n      window.addEventListener('resize', closeCtx);\n      document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeCtx(); }});\n    }}\n\n    // UI wiring\n    populateSelect();\n    if (DATA.genomes && DATA.genomes.length>0) renderGenome(0);\n    sel.addEventListener('change', ()=> {{ const idx=parseInt(sel.value,10); if(!Number.isNaN(idx)) renderGenome(idx); }});\n    layoutBtn.addEventListener('click', ()=> {{ if (cy) cy.layout({{name:'cose', animate:true}}).run(); }});\n    if (colorModeSelect) colorModeSelect.addEventListener('change', ()=> {{
+      activeColorMode = colorModeSelect.value || 'type';
+      applyNodeColorMode(activeColorMode);
+    }});\n    if (weightSlider) weightSlider.addEventListener('input', ()=> {{ applyEdgeFilters(); }});\n    if (enabledOnly) enabledOnly.addEventListener('change', ()=> {{ applyEdgeFilters(); }});\n\n    // Context menu building\n    const PALETTE = ['#0072B2','#D55E00','#009E73','#CC79A7','#F0E442','#56B4E9','#E69F00','#000000','#777777','#999999'];\n    const hiddenColorPicker = document.createElement('input'); hiddenColorPicker.type='color'; hiddenColorPicker.style.display='none'; document.body.appendChild(hiddenColorPicker);\n\n    function openCtxAt(renderedPos) {{\n      if (!ctxNode) return;\n      const rect = cyContainer.getBoundingClientRect();\n      const x = rect.left + renderedPos.x;\n      const y = rect.top + renderedPos.y;\n      ctx.innerHTML = '';\n      const menu = document.createElement('div');\n\n      // Title\n      const title = document.createElement('div');\n      title.className='ctx-item';\n      title.style.cursor='default';\n      title.innerHTML = '<b>Node:</b> ' + (ctxNode.data('label') || ctxNode.id());\n      ctx.appendChild(title);\n\n      // Fix/Unfix\n      const fix = document.createElement('div');\n      fix.className='ctx-item';\n      const locked = ctxNode.locked();\n      fix.textContent = locked ? '位置の固定を解除' : '位置を固定';\n      fix.onclick = () => {{\n        if (ctxNode.locked()) ctxNode.unlock(); else ctxNode.lock();\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(fix);\n\n      // Color row\n      const colorRow = document.createElement('div');\n      colorRow.className='ctx-item';\n      colorRow.innerHTML = '<div class="ctx-row"><span>色を変更</span><span style="font-size:12px;color:var(--muted)">クリックで適用</span></div>';\n      const sw = document.createElement('div'); sw.className='swatches';\n      PALETTE.forEach(c => {{\n        const d = document.createElement('div'); d.className='swatch'; d.style.background=c;\n        d.title = c;\n        d.onclick = () => {{ ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx(); }};\n        sw.appendChild(d);\n      }});\n      // Custom picker\n      const custom = document.createElement('div');\n      custom.className='ctx-item';\n      custom.textContent='カスタムカラー…';\n      custom.onclick = () => {{\n        hiddenColorPicker.value = ctxNode.data('color') || '#999999';\n        hiddenColorPicker.onchange = () => {{\n          const c = hiddenColorPicker.value;\n          ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx();\n        }};\n        hiddenColorPicker.click();\n      }};\n      colorRow.appendChild(sw);\n      ctx.appendChild(colorRow);\n      ctx.appendChild(custom);\n\n      // Note editor\n      const noteBtn = document.createElement('div');\n      noteBtn.className='ctx-item';\n      noteBtn.textContent='注釈を追加/編集…';\n      noteBtn.onclick = () => {{\n        const cur = ctxNode.data('note') || '';\n        const txt = window.prompt('ノードの注釈（空で削除）', cur);\n        if (txt === null) return;\n        const orig = ctxNode.data('orig_label') || ctxNode.data('label') || ctxNode.id();\n        if (txt.trim() === '') {{\n          ctxNode.data('note', null);\n          ctxNode.data('label', orig);\n        }} else {{\n          ctxNode.data('note', txt);\n          ctxNode.data('label', orig + '\\n' + txt);\n        }}\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(noteBtn);\n\n      // Reset color\n      const resetColor = document.createElement('div');\n      resetColor.className='ctx-item';\n      resetColor.textContent='色をリセット';\n      resetColor.onclick = () => {{\n        ctxNode.data('color', null);\n        // Revert to type-based color by removing inline style\n        ctxNode.removeStyle('background-color');\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(resetColor);\n\n      // Separator\n      const sep = document.createElement('div'); sep.className='ctx-sep'; ctx.appendChild(sep);\n\n      // Save layout now\n      const saveBtn = document.createElement('div');\n      saveBtn.className='ctx-item';\n      saveBtn.textContent='レイアウトを保存';\n      saveBtn.onclick = () => {{ saveState(); closeCtx(); }};\n      ctx.appendChild(saveBtn);\n\n      // Open\n      ctx.style.left = Math.round(x) + 'px';\n      ctx.style.top  = Math.round(y) + 'px';\n      ctx.style.display = 'block';\n    }}\n\n    function closeCtx() {{ ctx.style.display='none'; ctxNode = null; }}\n\n  </script>\n</body>\n</html>"""
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     html = html.replace('</style>', ".build-id{margin:0.4rem 0 0;color:#444;font-size:0.9rem;}</style>", 1)
     html = html.replace('<h1>{title}</h1>', f"<h1>{title}</h1><p class='build-id'>Build: {build_id}</p>", 1)
@@ -6830,6 +7292,27 @@ def rotate_2d(x: np.ndarray, theta: float) -> np.ndarray:
     R = np.array([[c, -s], [s, c]], dtype=np.float32)
     return (R @ x.T).T
 
+
+def _hex_to_rgba(hex_color: Optional[str], alpha: float=0.15) -> Tuple[float, float, float, float]:
+    color = str(hex_color or '').strip()
+    if color.startswith('#'):
+        color = color[1:]
+    if len(color) == 3:
+        color = ''.join((ch * 2 for ch in color))
+    try:
+        r = int(color[0:2], 16) / 255.0
+        g = int(color[2:4], 16) / 255.0
+        b = int(color[4:6], 16) / 255.0
+    except Exception:
+        r = g = b = 0.62
+    return (
+        float(np.clip(r, 0.0, 1.0)),
+        float(np.clip(g, 0.0, 1.0)),
+        float(np.clip(b, 0.0, 1.0)),
+        float(np.clip(alpha, 0.0, 1.0)),
+    )
+
+
 def augment_with_spinor(
     X: np.ndarray,
     theta: float,
@@ -6931,6 +7414,7 @@ def run_spinor_monolith(
     parity = _int_col(tele_rows, 'parity') if tele_rows else np.array([], dtype=np.int32)
     theta_raw = _float_col(tele_rows, 'theta') if tele_rows else np.array([], dtype=np.float64)
     noise_seq = _float_col(tele_rows, 'noise') if tele_rows else np.array([], dtype=np.float64)
+    noise_kind_seq = np.array(_str_col(tele_rows, 'noise_kind')) if tele_rows else np.array([], dtype=object)
     turns_seq = _float_col(tele_rows, 'turns') if tele_rows else np.array([], dtype=np.float64)
     rot_bias_seq = _float_col(tele_rows, 'rot_bias') if tele_rows else np.array([], dtype=np.float64)
     regime_ids = _int_col(tele_rows, 'regime_id') if tele_rows else np.array([], dtype=np.int32)
@@ -6976,6 +7460,60 @@ def run_spinor_monolith(
     fig = plt.gcf()
     _savefig(fig, fig3, dpi=160)
     plt.close()
+
+    fig_noise: Optional[str] = None
+    if g.size:
+        fig_noise = f'{out_prefix}_noise_timeline.png'
+        fig, ax = plt.subplots(figsize=(8.2, 3.8))
+        colors = []
+        for idx in range(len(g)):
+            kind = noise_kind_seq[idx] if noise_kind_seq.size else ''
+            style = _resolve_noise_style(kind, None) if kind else None
+            col = style.get('color', '#6c757d') if style else '#6c757d'
+            colors.append(col)
+        ax.plot(g, noise_seq, color='#495057', lw=1.0, alpha=0.4)
+        if colors:
+            ax.scatter(g, noise_seq, c=colors, s=28, alpha=0.9, edgecolors='none')
+        if noise_kind_seq.size:
+            span_start = 0
+            current_kind = noise_kind_seq[0]
+            for idx in range(1, len(g) + 1):
+                if idx == len(g) or noise_kind_seq[idx] != current_kind:
+                    start_gen = float(g[span_start])
+                    end_gen = float(g[idx - 1]) + 1.0
+                    style = _resolve_noise_style(current_kind, None)
+                    ax.axvspan(start_gen, end_gen, color=_hex_to_rgba(style.get('color'), 0.12), lw=0)
+                    span_start = idx
+                    if idx < len(g):
+                        current_kind = noise_kind_seq[idx]
+        ax.set_xlabel('generation')
+        ax.set_ylabel('noise σ')
+        ax.set_title('Noise schedule & spectral mode')
+        legend_handles: List[Line2D] = []
+        seen_kinds: Set[str] = set()
+        for kind in noise_kind_seq:
+            key = str(kind)
+            if not key or key in seen_kinds:
+                continue
+            style = _resolve_noise_style(key, None)
+            handle = Line2D(
+                [0],
+                [0],
+                marker='o',
+                linestyle='None',
+                markersize=8,
+                markerfacecolor=style.get('color', '#6c757d'),
+                markeredgecolor='none',
+                label=f"{style.get('symbol', '?')} {style.get('label', key)}",
+            )
+            legend_handles.append(handle)
+            seen_kinds.add(key)
+        if legend_handles:
+            ax.legend(handles=legend_handles, loc='upper right', frameon=False, fontsize=9, title='noise kind')
+        ax.grid(True, alpha=0.18, linestyle='--', linewidth=0.6)
+        fig.tight_layout()
+        _savefig(fig, fig_noise, dpi=170)
+        plt.close(fig)
 
     spinor_grid_png: Optional[str] = None
     spinor_transition_gif: Optional[str] = None
@@ -7027,6 +7565,13 @@ def run_spinor_monolith(
                 grp_label = group_label_seq[idx] if group_label_seq.size else ''
                 note = evaluator_notes[idx] if idx < len(evaluator_notes) else ''
                 title = f'gen {int(g[idx])} | regime {int(regime_ids[idx])} | parity {int(parity[idx])}'
+                kind = noise_kind_seq[idx] if noise_kind_seq.size else ''
+                if kind:
+                    style = _resolve_noise_style(kind, None)
+                    title += f" | {style.get('symbol', '?')} {style.get('label', kind)}"
+                    ax.set_facecolor(_hex_to_rgba(style.get('color'), 0.1))
+                else:
+                    ax.set_facecolor('#f8f9fa')
                 if grp_label:
                     title += f' | {grp_label}'
                 if note:
@@ -7053,12 +7598,23 @@ def run_spinor_monolith(
             fig, axs = plt.subplots(1, 2, figsize=(7.0, 3.6))
             ax_data, ax_spin = axs
             ax_data.scatter(X_vis[:, 0], X_vis[:, 1], c=y_vis, cmap='coolwarm', s=14, alpha=0.75, edgecolors='none')
+            kind = noise_kind_seq[idx] if noise_kind_seq.size else ''
+            style = _resolve_noise_style(kind, None) if kind else None
+            if style:
+                ax_data.set_facecolor(_hex_to_rgba(style.get('color'), 0.1))
+                ax_spin.set_facecolor(_hex_to_rgba(style.get('color'), 0.12))
+            else:
+                ax_data.set_facecolor('#f8f9fa')
+                ax_spin.set_facecolor('#f8f9fa')
             ax_data.set_xlim(-1.6, 1.6)
             ax_data.set_ylim(-1.6, 1.6)
             ax_data.set_aspect('equal', 'box')
             ax_data.set_xticks([])
             ax_data.set_yticks([])
-            ax_data.set_title(f'gen {int(g[idx])} | regime {int(regime_ids[idx])}')
+            title_data = f'gen {int(g[idx])} | regime {int(regime_ids[idx])}'
+            if style:
+                title_data += f" | {style.get('symbol', '?')} {style.get('label', kind)}"
+            ax_data.set_title(title_data)
             arrow_dataset = FancyArrowPatch((0.0, 0.0), (math.cos(theta_raw[idx] + rot_bias_seq[idx]), math.sin(theta_raw[idx] + rot_bias_seq[idx])), arrowstyle='->', mutation_scale=12, lw=1.8, color='#2ca02c')
             ax_data.add_patch(arrow_dataset)
 
@@ -7079,6 +7635,8 @@ def run_spinor_monolith(
             if grp_label:
                 summary_line += f' | {grp_label}'
             summary_line += f' | energy {energy:0.2f}'
+            if style:
+                summary_line += f" | {style.get('symbol', '?')} {style.get('label', kind)}"
             ax_spin.text(0.0, -1.15, summary_line, ha='center', va='top', fontsize=10)
             note = evaluator_notes[idx] if idx < len(evaluator_notes) else ''
             title = 'Spinor-fractal transition overview'
@@ -7101,6 +7659,8 @@ def run_spinor_monolith(
                 spinor_transition_gif = None
 
     artifacts: Dict[str, Optional[str]] = {'telemetry_csv': tel.tel_csv, 'regimes_csv': tel.reg_csv, 'phase_png': fig1, 'parity_png': fig2, 'regimes_png': fig3}
+    if fig_noise:
+        artifacts['noise_timeline_png'] = fig_noise
     if resilience_log:
         artifacts['resilience_log'] = resilience_log
     if spinor_grid_png:
@@ -7329,6 +7889,10 @@ class NomologyEnv:
             'band_label': 'white',
         }
     )
+    noise_kind_label: str = 'White'
+    noise_kind_symbol: str = 'W'
+    noise_kind_color: str = '#f6f7fb'
+    noise_kind_code: int = 0
     noise_palette: Tuple[str, ...] = ('white', 'alpha', 'beta', 'black')
     noise_stage_len: int = 6
     noise_jitter: float = 0.006
@@ -7346,6 +7910,7 @@ class NomologyEnv:
     noise_focus: float = 0.0
     noise_entropy: float = 0.0
     noise_harmonics: Dict[str, float] = field(default_factory=dict)
+    noise_style_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     _noise_counter: float = field(default=0.0, init=False, repr=False)
     _last_weaver_error: Optional[str] = field(default=None, init=False, repr=False)
 
@@ -7371,6 +7936,10 @@ class NomologyEnv:
                     pass
         self._noise_counter = 0.0
         self._refresh_noise(surge=True)
+
+    def noise_style(self, kind: Optional[str]=None) -> Dict[str, Any]:
+        target = kind or self.noise_kind
+        return _resolve_noise_style(target, self.noise_style_overrides)
 
     def _noise_ctx(self, surge: bool=False) -> Dict[str, Any]:
         return {
@@ -7419,6 +7988,23 @@ class NomologyEnv:
         self.noise = std
         self.noise_kind = kind
         self.noise_profile = profile
+        style = self.noise_style(kind)
+        self.noise_kind_label = style.get('label', kind)
+        self.noise_kind_symbol = style.get('symbol', kind[:1].upper() if kind else '?')
+        self.noise_kind_color = style.get('color', '#9e9e9e')
+        self.noise_kind_code = int(style.get('index', -1))
+        profile['kind_label'] = self.noise_kind_label
+        profile['kind_symbol'] = self.noise_kind_symbol
+        profile['kind_color'] = self.noise_kind_color
+        profile['kind_code'] = self.noise_kind_code
+        profile['kind_bias'] = float(style.get('bias', 0.0))
+        profile['style'] = {
+            'label': self.noise_kind_label,
+            'symbol': self.noise_kind_symbol,
+            'color': self.noise_kind_color,
+            'index': self.noise_kind_code,
+            'bias': float(style.get('bias', 0.0)),
+        }
         harmonics = profile.get('harmonics') if isinstance(profile, dict) else None
         if isinstance(harmonics, dict) and harmonics:
             clean = {str(k): float(v) for k, v in harmonics.items()}
@@ -7540,6 +8126,17 @@ class SelfReproducingEvaluator:
         noise_norm = float(np.clip(env.noise / 0.2, 0.0, 1.0))
         turns_norm = float(np.clip((env.turns - 0.6) / (3.2 - 0.6 + 1e-09), 0.0, 1.0))
         rot_norm = float((env.rot_bias + math.pi) / (2.0 * math.pi))
+        style = env.noise_style() if hasattr(env, 'noise_style') else _resolve_noise_style(getattr(env, 'noise_kind', ''), None)
+        palette = getattr(env, 'noise_palette', ('white', 'alpha', 'beta', 'black'))
+        palette_span = max(1.0, float(len(palette) - 1))
+        code_idx = float(style.get('index', -1))
+        if code_idx < 0:
+            code_norm = -1.0
+        else:
+            code_norm = float(np.clip((code_idx / palette_span) * 2.0 - 1.0, -1.0, 1.0))
+        focus_norm = float(np.clip(getattr(env, 'noise_focus', 0.0), 0.0, 1.5) / 1.5)
+        entropy_norm = float(np.clip(getattr(env, 'noise_entropy', 0.0), 0.0, 4.0) / 4.0)
+        bias_norm = float(style.get('bias', 0.0))
         base = [
             math.cos(theta),
             math.sin(theta),
@@ -7549,6 +8146,10 @@ class SelfReproducingEvaluator:
             turns_norm,
             rot_norm,
             float(energy / 4.0),
+            focus_norm,
+            entropy_norm,
+            code_norm,
+            bias_norm,
         ]
         if embed is not None:
             base.extend(embed.tolist())
@@ -7702,7 +8303,9 @@ class SelfReproducingEvaluator:
             summary = f'mutate-failed {type(mutate_err).__name__}'
         noise_kind = getattr(env, 'noise_kind', None)
         if noise_kind:
-            summary = f'{summary} | noise {noise_kind}'
+            label = getattr(env, 'noise_kind_label', noise_kind)
+            symbol = getattr(env, 'noise_kind_symbol', noise_kind[:1].upper())
+            summary = f"{summary} | noise {symbol}({label})"
         focus = getattr(env, 'noise_focus', None)
         if isinstance(focus, (int, float)) and focus > 0:
             summary = f'{summary} | focus {float(focus):.2f}'
@@ -7739,7 +8342,7 @@ class Telemetry:
     def __init__(self, tel_csv: str, regime_csv: str) -> None:
         self.tel_csv = tel_csv
         self.reg_csv = regime_csv
-        expected_cols = 27
+        expected_cols = 31
         if os.path.exists(self.tel_csv):
             try:
                 with open(self.tel_csv, 'r', newline='') as f:
@@ -7764,6 +8367,10 @@ class Telemetry:
                     'regime_id',
                     'noise',
                     'noise_kind',
+                    'noise_kind_label',
+                    'noise_kind_symbol',
+                    'noise_kind_code',
+                    'noise_kind_color',
                     'noise_cycle',
                     'noise_wave_hz',
                     'noise_spectral_bias',
@@ -7808,6 +8415,14 @@ class Telemetry:
             eval_note = evaluator_meta.get('note', '')
         profile = getattr(env, 'noise_profile', {}) or {}
         noise_kind = getattr(env, 'noise_kind', '')
+        if hasattr(env, 'noise_style'):
+            style = env.noise_style(noise_kind)
+        else:
+            style = _resolve_noise_style(noise_kind, None)
+        noise_label = style.get('label', noise_kind)
+        noise_symbol = style.get('symbol', noise_kind[:1].upper() if noise_kind else '')
+        noise_code = int(style.get('index', -1))
+        noise_color = style.get('color', '#9e9e9e')
         noise_cycle = float(profile.get('cycle_phase', 0.0))
         noise_wave = profile.get('wave_freq_hz')
         noise_wave = '' if noise_wave is None else float(noise_wave)
@@ -7834,6 +8449,10 @@ class Telemetry:
                 env.regime_id,
                 env.noise,
                 noise_kind,
+                noise_label,
+                noise_symbol,
+                noise_code,
+                noise_color,
                 noise_cycle,
                 noise_wave,
                 noise_spectral,
@@ -7882,8 +8501,8 @@ class SpinorNomologyDatasetController:
         self.evaluator = evaluator
         self.evaluator_seed = evaluator_seed
         embed_dim = self.spin.group.embed_dim if self.spin.group else 0
-        self.feature_dim = 5 + embed_dim
-        self.evaluator_feature_dim = 8 + embed_dim
+        self.feature_dim = 12 + embed_dim
+        self.evaluator_feature_dim = 12 + embed_dim
         self.last_bundle: Optional[Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]] = None
         self.lazy_feedback_smoothing = 0.4
         self._lazy_feedback: Dict[str, Any] = {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0}
