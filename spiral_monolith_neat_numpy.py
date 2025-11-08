@@ -4,7 +4,6 @@
 # - "Part 1" NEAT (with optional planarian-like regeneration) + "Part 2" Backprop NEAT.
 # - Clean, single-file design for reproducible demos and paper-ready figures.
 #
-# Additions in this build:
 #   * Auto-export of regen/morph GIFs from evolution snapshots
 #   * Learning curve with moving average + rolling-std "CI" (line styles only)
 #   * Decision boundaries for Circles/XOR/Spiral as separate PNGs
@@ -5671,6 +5670,76 @@ def plot_learning_and_complexity(history: List[Tuple[float, float]], hidden_coun
     fig.tight_layout()
     _savefig(fig, out_path, dpi=200)
     plt.close(fig)
+    return (csv_path, png_path)
+
+
+def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: str, png_path: str, title: str='Diversity & Environment Trajectory') -> Tuple[Optional[str], Optional[str]]:
+    if not div_history:
+        return (None, None)
+    os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
+    os.makedirs(os.path.dirname(png_path) or '.', exist_ok=True)
+    fields = [
+        'gen',
+        'entropy',
+        'scarcity',
+        'complexity_mean',
+        'complexity_std',
+        'structural_spread',
+        'diversity_bonus',
+        'diversity_power',
+        'env_noise',
+        'env_focus',
+        'env_entropy',
+        'lazy_share',
+        'unique_signatures',
+        'complexity_baseline',
+        'complexity_span',
+        'complexity_span_quantile',
+        'complexity_max',
+        'complexity_bonus_limit',
+    ]
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in div_history:
+            payload = {key: row.get(key, '') for key in fields}
+            writer.writerow(payload)
+    gens = np.array([int(item.get('gen', idx)) for idx, item in enumerate(div_history)], dtype=np.int32)
+    entropy = np.array([float(item.get('entropy', 0.0)) for item in div_history], dtype=np.float64)
+    scarcity = np.array([float(item.get('scarcity', 0.0)) for item in div_history], dtype=np.float64)
+    spread = np.array([float(item.get('structural_spread', 0.0)) for item in div_history], dtype=np.float64)
+    bonus = np.array([float(item.get('diversity_bonus', 0.0)) for item in div_history], dtype=np.float64)
+    env_noise = np.array([float(item.get('env_noise', 0.0)) for item in div_history], dtype=np.float64)
+    env_focus = np.array([float(item.get('env_focus', 0.0)) for item in div_history], dtype=np.float64)
+    env_entropy = np.array([float(item.get('env_entropy', 0.0)) for item in div_history], dtype=np.float64)
+    lazy_share = np.array([float(item.get('lazy_share', 0.0)) for item in div_history], dtype=np.float64)
+    fig, axes = plt.subplots(2, 1, sharex=True, figsize=(7.4, 6.0))
+    ax_top, ax_bottom = axes
+    ax_top.plot(gens, entropy, label='entropy (structural)', color='#1f78b4', linewidth=1.8)
+    ax_top.plot(gens, scarcity, label='scarcity', color='#d62728', linewidth=1.6)
+    ax_top.fill_between(gens, 0.0, scarcity, color='#ff9896', alpha=0.25)
+    ax_top.set_ylabel('entropy / scarcity')
+    ax_top.legend(loc='upper right', frameon=False, fontsize=9)
+    ax_top.grid(True, linestyle='--', alpha=0.2)
+    ax_mid = ax_bottom.twinx()
+    ax_bottom.plot(gens, bonus, label='diversity bonus', color='#2ca02c', linewidth=1.7)
+    ax_bottom.plot(gens, spread, label='structural spread', color='#9467bd', linewidth=1.5, linestyle='--')
+    ax_bottom.plot(gens, lazy_share, label='lazy share', color='#8c564b', linewidth=1.3, linestyle=':')
+    ax_bottom.set_ylabel('bonus / spread / lazy share')
+    ax_bottom.legend(loc='upper left', frameon=False, fontsize=9)
+    ax_bottom.grid(True, linestyle='--', alpha=0.2)
+    ax_mid.plot(gens, env_noise, label='env noise', color='#17becf', linewidth=1.4)
+    ax_mid.plot(gens, env_focus, label='env focus', color='#ff7f0e', linewidth=1.2, linestyle='-.')
+    ax_mid.plot(gens, env_entropy, label='env entropy', color='#7f7f7f', linewidth=1.0, linestyle=':')
+    ax_mid.set_ylabel('environmental metrics')
+    ax_mid.legend(loc='upper right', frameon=False, fontsize=8)
+    ax_bottom.set_xlabel('generation')
+    if title:
+        fig.suptitle(title, fontsize=13)
+    fig.tight_layout(rect=[0, 0.02, 1, 0.98])
+    _savefig(fig, png_path, dpi=220)
+    plt.close(fig)
+    return (csv_path, png_path)
 
 
 def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: str, png_path: str, title: str='Diversity & Environment Trajectory') -> Tuple[Optional[str], Optional[str]]:
