@@ -5128,6 +5128,110 @@ def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50
     plt.close(fig)
     return {'figure': out_path, 'history': loss, 'profile': profile}
 
+def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    gg = genome.copy()
+    profile: Dict[str, Any] = {}
+    history = train_with_backprop_numpy(gg, X, y, steps=steps, lr=lr, l2=l2, profile_out=profile)
+    loss = np.asarray(history, dtype=np.float64)
+    step_profiles = np.asarray(
+        profile.get('step_profiles', np.zeros((0, len(profile.get('node_order', []))), dtype=np.float64)),
+        dtype=np.float64,
+    )
+    if step_profiles.ndim != 2 or step_profiles.shape[0] == 0:
+        step_profiles = None
+    node_order = profile.get('node_order', [])
+    node_types = profile.get('node_types', [])
+    labels = []
+    for nid, t in zip(node_order, node_types):
+        prefix = (t[0].upper() + ':') if t else 'N:'
+        labels.append(f'{prefix}{nid}')
+    initial_sens = np.asarray(profile.get('initial_sensitivity', []), dtype=np.float64)
+    final_sens = np.asarray(profile.get('final_sensitivity', []), dtype=np.float64)
+    final_momentum = np.asarray(profile.get('final_momentum', []), dtype=np.float64)
+    final_variance = np.asarray(profile.get('final_variance', []), dtype=np.float64)
+    final_jitter = np.asarray(profile.get('final_jitter', []), dtype=np.float64)
+    idx_pool = [i for i, t in enumerate(node_types) if t == 'hidden']
+    if not idx_pool:
+        idx_pool = list(range(len(labels)))
+    delta = final_sens - initial_sens if initial_sens.size and final_sens.size else np.zeros(len(labels), dtype=np.float64)
+    order_idx = sorted(idx_pool, key=lambda i: abs(delta[i]) if i < delta.size else 0.0, reverse=True)
+    if len(order_idx) > 10:
+        order_idx = order_idx[:10]
+    scatter_idx = sorted(idx_pool, key=lambda i: (final_variance[i] if i < final_variance.size else 0.0) + 0.25 * abs(final_momentum[i] if i < final_momentum.size else 0.0), reverse=True)
+    if len(scatter_idx) > 12:
+        scatter_idx = scatter_idx[:12]
+    fig = plt.figure(figsize=(10.5, 6.2))
+    gs = _gridspec.GridSpec(2, 2, height_ratios=[1.7, 1.0], width_ratios=[1.0, 1.0], hspace=0.32, wspace=0.28)
+    ax_top = fig.add_subplot(gs[0, :])
+    steps_axis = np.arange(1, loss.size + 1, dtype=np.float64) if loss.size else np.arange(1, steps + 1, dtype=np.float64)
+    handles = []
+    labels_legend = []
+    if step_profiles is not None:
+        mean_profile = step_profiles.mean(axis=1)
+        std_profile = step_profiles.std(axis=1)
+        mp = mean_profile[:steps_axis.size]
+        sp = std_profile[:steps_axis.size]
+        ax_top.fill_between(steps_axis[:mp.size], mp - sp[:mp.size], mp + sp[:mp.size], color='#8ecae6', alpha=0.35, label='pulse ±σ')
+        line_mp, = ax_top.plot(steps_axis[:mp.size], mp, color='#219ebc', lw=2.0, label='pulse mean')
+        handles.append(line_mp)
+        labels_legend.append('pulse mean')
+    if loss.size:
+        ax_loss = ax_top.twinx()
+        line_loss, = ax_loss.plot(steps_axis[:loss.size], loss, color='#f07167', lw=1.8, label='loss')
+        ax_loss.set_ylabel('loss', color='#f07167')
+        ax_loss.tick_params(axis='y', colors='#f07167')
+        handles.append(line_loss)
+        labels_legend.append('loss')
+    ax_top.set_xlabel('backprop step')
+    ax_top.set_ylabel('pulse magnitude')
+    ax_top.set_title('Backprop pulse landscape')
+    if handles:
+        ax_top.legend(handles, labels_legend, loc='upper right', frameon=False, fontsize=9)
+    ax_left = fig.add_subplot(gs[1, 0])
+    if order_idx and initial_sens.size and final_sens.size:
+        y_pos = np.arange(len(order_idx))
+        init_vals = initial_sens[order_idx]
+        final_vals = final_sens[order_idx]
+        delta_vals = final_vals - init_vals
+        ax_left.barh(y_pos - 0.18, init_vals, height=0.3, color='#c1d3fe', alpha=0.75, label='initial')
+        ax_left.barh(y_pos + 0.18, final_vals, height=0.3, color='#5e60ce', alpha=0.9, label='post-train')
+        ax_left.axvline(1.0, color='#333333', lw=0.8, ls='--', alpha=0.6)
+        for k, idx in enumerate(order_idx):
+            lbl = labels[idx] if idx < len(labels) else f'n{idx}'
+            ax_left.text(final_vals[k] + 0.04, y_pos[k] + 0.2, f'Δ{delta_vals[k]:+.2f}', fontsize=8, color='#333333')
+        ax_left.set_yticks(y_pos)
+        ax_left.set_yticklabels([labels[idx] if idx < len(labels) else f'n{idx}' for idx in order_idx])
+        ax_left.set_xlabel('sensitivity')
+        ax_left.set_title('Hidden node sensitivity drift')
+        ax_left.legend(frameon=False, fontsize=8, loc='lower right')
+    else:
+        ax_left.text(0.5, 0.5, 'No hidden nodes tracked', ha='center', va='center', fontsize=10)
+        ax_left.set_axis_off()
+    ax_right = fig.add_subplot(gs[1, 1])
+    if scatter_idx and final_momentum.size and final_variance.size:
+        mom_vals = final_momentum[scatter_idx]
+        var_vals = final_variance[scatter_idx]
+        jit_vals = final_jitter[scatter_idx] if final_jitter.size else np.zeros_like(mom_vals)
+        sc = ax_right.scatter(mom_vals, var_vals, c=jit_vals, cmap='coolwarm', s=60, edgecolors='k', linewidths=0.35)
+        for k, idx in enumerate(scatter_idx):
+            lbl = labels[idx] if idx < len(labels) else f'n{idx}'
+            ax_right.text(mom_vals[k] + 0.02, var_vals[k] + 0.02, lbl, fontsize=8)
+        ax_right.set_xlabel('momentum (smoothed)')
+        ax_right.set_ylabel('variance trace')
+        ax_right.set_title('Post-train temperament field')
+        if len(scatter_idx) >= 3:
+            cb = fig.colorbar(sc, ax=ax_right, fraction=0.046, pad=0.04)
+            cb.set_label('jitter', fontsize=9)
+    else:
+        ax_right.text(0.5, 0.5, 'No temperament statistics', ha='center', va='center', fontsize=10)
+        ax_right.set_axis_off()
+    fig.suptitle(f'Backprop Variation | steps={steps}', fontsize=12)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    _savefig(fig, out_path, dpi=220)
+    plt.close(fig)
+    return {'figure': out_path, 'history': loss, 'profile': profile}
+
 def export_decision_boundaries_all(genome: Genome, out_dir: str, steps: int=50, seed: int=0):
     os.makedirs(out_dir or '.', exist_ok=True)
     Xc, yc = make_circles(512, r=0.6, noise=0.05, seed=seed)
@@ -6927,7 +7031,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
         return _run_default_fractal_demo()
     _ensure_matplotlib_agg(force=True)
     ap = argparse.ArgumentParser(description='Spiral-NEAT NumPy | built-in CLI')
-    ap.add_argument('--task', choices=['xor', 'circles', 'spiral'])
+    ap.add_argument('--task', dest='tasks_single', action='append', nargs='+', choices=['xor', 'circles', 'spiral'], help='one or more supervised tasks to evolve (repeatable)')
+    ap.add_argument('--tasks', dest='tasks_single', action='append', nargs='+', choices=['xor', 'circles', 'spiral'], help=argparse.SUPPRESS)
     ap.add_argument('--gens', type=int, default=60)
     ap.add_argument('--pop', type=int, default=64)
     ap.add_argument('--steps', type=int, default=80)
@@ -6941,14 +7046,15 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--rl-temp', type=float, default=1.0)
     ap.add_argument('--rl-gameplay-gif', action='store_true')
     ap.add_argument('--out', default='out_monolith_cli')
-    ap.add_argument('--make-gifs', action='store_true')
-    ap.add_argument('--make-lineage', action='store_true')
-    ap.add_argument('--gallery', nargs='*', default=[])
-    ap.add_argument('--gallery-analysis-only', action='store_true', help='compose gallery from current run without rerun')
     ap.add_argument('--report', action='store_true')
     ap.add_argument('--version', action='store_true', help='print build information and exit')
     ap.add_argument('--sync-spinor-seeds', action='store_true', help='bind spinor evaluator and weaver RNGs to --seed')
     args = ap.parse_args(argv_list)
+    requested_tasks: List[str] = []
+    if getattr(args, 'tasks_single', None):
+        for chunk in args.tasks_single:
+            requested_tasks.extend(chunk)
+    requested_tasks = list(dict.fromkeys(requested_tasks))
     if args.version:
         info = _resolve_build_info()
         print(_build_stamp_text())
@@ -6960,75 +7066,87 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     _SPINOR_BOUND_SEED = args.seed if args.sync_spinor_seeds else None
     script_name = os.path.basename(__file__) if '__file__' in globals() else 'spiral_monolith_neat_numpy.py'
     os.makedirs(args.out, exist_ok=True)
-    figs: Dict[str, Optional[str]] = {}
-    report_meta: Dict[str, Optional[Dict[str, Any]]] = {'supervised': None, 'rl': None}
-    if args.task:
-        np.random.seed(args.seed)
-        res = run_backprop_neat_experiment(args.task, gens=args.gens, pop=args.pop, steps=args.steps, out_prefix=os.path.join(args.out, args.task), make_gifs=args.make_gifs, make_lineage=args.make_lineage, rng_seed=args.seed)
-        figs['図1 学習曲線＋複雑度'] = res.get('learning_curve')
-        figs['図2 最良トポロジ'] = res.get('topology')
-        db_path = res.get('decision_boundary')
-        if db_path and os.path.exists(db_path):
-            figs['図3 決定境界'] = db_path
-        regen_gif = res.get('regen_gif')
-        if regen_gif and os.path.exists(regen_gif) and (imageio is not None):
-            with imageio.get_reader(regen_gif) as r:
-                idx = max(0, r.get_length() // 2 - 1)
-                frame = r.get_data(idx)
-                fig3 = os.path.join(args.out, f'{args.task}_fig3_regen_frame.png')
-                _imwrite_image(fig3, frame)
-                figs['図3A 再生ダイジェスト代表フレーム'] = fig3
-        scars_spiral_path = res.get('scars_spiral')
-        has_scars_spiral = bool(scars_spiral_path and os.path.exists(scars_spiral_path))
-        if has_scars_spiral:
-            figs['図4 螺旋再生ヒートマップ'] = scars_spiral_path
-        else:
-            figs['図4 螺旋再生ヒートマップ'] = res.get('scars_spiral')
-        lineage_path = res.get('lineage')
-        has_lineage = bool(lineage_path and os.path.exists(lineage_path))
-        if has_lineage:
-            figs['図5 系統ラインエイジ'] = lineage_path
-        regen_log = res.get('lcs_log')
-        has_regen_log = bool(regen_log and os.path.exists(regen_log))
-        if has_regen_log:
-            figs['LCS Healing Log'] = regen_log
-        ribbon = res.get('lcs_ribbon')
-        has_ribbon = bool(ribbon and os.path.exists(ribbon))
-        if has_ribbon:
-            figs['LCS Ribbon'] = ribbon
-        timeline = res.get('lcs_timeline')
-        has_timeline = bool(timeline and os.path.exists(timeline))
-        if has_timeline:
-            figs['LCS Timeline'] = timeline
-        resilience_log = res.get('resilience_log')
-        has_resilience_log = bool(resilience_log and os.path.exists(resilience_log))
-        if has_resilience_log:
-            figs['Resilience Tracebacks'] = resilience_log
-        history = res.get('history') or []
-        best_fit = max((b for b, _a in history), default=None)
-        final_best = history[-1][0] if history else None
-        final_avg = history[-1][1] if history else None
-        initial_best = history[0][0] if history else None
-        report_meta['supervised'] = {'task': args.task, 'gens': args.gens, 'pop': args.pop, 'steps': args.steps, 'best_fit': best_fit, 'final_best': final_best, 'final_avg': final_avg, 'initial_best': initial_best, 'has_lineage': has_lineage, 'has_regen_log': has_regen_log, 'has_lcs_viz': bool(has_ribbon or has_timeline), 'has_spiral': has_scars_spiral, 'has_resilience': has_resilience_log}
+    figs: Dict[str, Optional[str]] = OrderedDict()
+    report_meta: Dict[str, Any] = {'supervised': [], 'rl': None}
+    supervised_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 
-        # If analysis-only gallery is requested, compose from current run and skip rerun
-    if args.gallery and args.gallery_analysis_only and args.task:
-        gal_dir = os.path.join(args.out, 'gallery')
-        os.makedirs(gal_dir, exist_ok=True)
-        gal = compose_gallery_from_existing(res, out_dir=gal_dir, task=args.task, idx=1)
-        for k, v in gal.items():
-            figs[f'ギャラリー {k}'] = v
-        args.gallery = []
-    if args.gallery:
-        gal = export_task_gallery(
-            tasks=tuple(args.gallery),
-            gens=max(6, args.gens),
-            pop=max(12, args.pop),
-            steps=max(10, args.steps),
-            out_dir=os.path.join(args.out, 'gallery'),
-        )
-        for k, v in gal.items():
-            figs[f'ギャラリー {k}'] = v
+    def _add_artifact(label: str, path: Optional[str]):
+        if not path:
+            return
+        try:
+            resolved = os.path.abspath(path)
+        except Exception:
+            resolved = path
+        if os.path.exists(resolved):
+            figs[label] = resolved
+
+    if requested_tasks:
+        np.random.seed(args.seed)
+        for task in requested_tasks:
+            out_prefix = os.path.join(args.out, task)
+            res = run_backprop_neat_experiment(task, gens=args.gens, pop=args.pop, steps=args.steps, out_prefix=out_prefix, make_gifs=True, make_lineage=True, rng_seed=args.seed)
+            supervised_results[task] = res
+            label_base = task.upper()
+            _add_artifact(f'{label_base} | Learning Curve + Complexity', res.get('learning_curve'))
+            _add_artifact(f'{label_base} | Decision Boundary', res.get('decision_boundary'))
+            _add_artifact(f'{label_base} | Best Topology', res.get('topology'))
+            for idx, path in enumerate(res.get('top3_topologies') or [], 1):
+                _add_artifact(f'{label_base} | Topology Rank {idx}', path)
+            regen_gif = res.get('regen_gif')
+            _add_artifact(f'{label_base} | Regeneration GIF', regen_gif)
+            if regen_gif and os.path.exists(regen_gif) and imageio is not None:
+                try:
+                    with imageio.get_reader(regen_gif) as reader:
+                        idx = max(0, reader.get_length() // 2 - 1)
+                        frame = reader.get_data(idx)
+                    frame_path = os.path.join(args.out, f'{task}_regen_frame.png')
+                    _imwrite_image(frame_path, frame)
+                    _add_artifact(f'{label_base} | Regeneration Snapshot', frame_path)
+                except Exception:
+                    pass
+            morph_gif = res.get('morph_gif')
+            _add_artifact(f'{label_base} | Morph GIF', morph_gif)
+            lineage_path = res.get('lineage')
+            _add_artifact(f'{label_base} | Lineage', lineage_path)
+            scars_spiral_path = res.get('scars_spiral')
+            _add_artifact(f'{label_base} | Spiral Scar Map', scars_spiral_path)
+            regen_log = res.get('lcs_log')
+            _add_artifact(f'{label_base} | LCS Healing Log', regen_log)
+            ribbon = res.get('lcs_ribbon')
+            _add_artifact(f'{label_base} | LCS Ribbon', ribbon)
+            timeline = res.get('lcs_timeline')
+            _add_artifact(f'{label_base} | LCS Timeline', timeline)
+            resilience_log = res.get('resilience_log')
+            _add_artifact(f'{label_base} | Resilience Tracebacks', resilience_log)
+            bp_variant = res.get('backprop_variation')
+            if isinstance(bp_variant, dict):
+                _add_artifact(f'{label_base} | Backprop Variation', bp_variant.get('figure'))
+            summary_decisions = res.get('summary_decisions') or {}
+            if isinstance(summary_decisions, dict):
+                for variant_name, variant_path in summary_decisions.items():
+                    _add_artifact(f'{label_base} | Decision {variant_name}', variant_path)
+            history = res.get('history') or []
+            best_fit = max((b for b, _a in history), default=None)
+            final_best = history[-1][0] if history else None
+            final_avg = history[-1][1] if history else None
+            initial_best = history[0][0] if history else None
+            sup_summary = {
+                'task': task,
+                'gens': args.gens,
+                'pop': args.pop,
+                'steps': args.steps,
+                'best_fit': best_fit,
+                'final_best': final_best,
+                'final_avg': final_avg,
+                'initial_best': initial_best,
+                'has_lineage': bool(lineage_path and os.path.exists(lineage_path)),
+                'has_regen_log': bool(regen_log and os.path.exists(regen_log)),
+                'has_lcs_viz': bool((ribbon and os.path.exists(ribbon)) or (timeline and os.path.exists(timeline))),
+                'has_spiral': bool(scars_spiral_path and os.path.exists(scars_spiral_path)),
+                'has_resilience': bool(resilience_log and os.path.exists(resilience_log)),
+            }
+            report_meta['supervised'].append(sup_summary)
+    rl_history: List[Tuple[float, float]] = []
     if args.rl_env:
         try:
             gym = _import_gym()
@@ -7051,6 +7169,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                     os.remove(regen_log_path)
             fit = gym_fitness_factory(args.rl_env, stochastic=args.rl_stochastic, temp=args.rl_temp, max_steps=args.rl_max_steps, episodes=args.rl_episodes)
             best, hist = neat.evolve(fit, n_generations=args.rl_gens, verbose=True, env_schedule=_default_difficulty_schedule)
+            rl_history = list(hist)
             rl_resilience_log = None
             rl_failures = list(getattr(neat, '_resilience_failures', [])) if hasattr(neat, '_resilience_failures') else []
             if rl_failures:
@@ -7115,17 +7234,20 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
         except Exception as e:
             print('[WARN] RL branch skipped:', e)
     if args.report:
-        if args.task:
-            title = f'{args.task.upper()} | Interactive NEAT Report'
-            html_path = os.path.join(args.out, f'{args.task}_interactive.html')
-            export_interactive_html_report(html_path, title=title, history=res.get('history', []), genomes=res.get('genomes_cyto', []), max_genomes=60)
-        if args.rl_env:
+        for task, res in supervised_results.items():
+            title = f'{task.upper()} | Interactive NEAT Report'
+            html_path = os.path.join(args.out, f'{task}_interactive.html')
+            try:
+                export_interactive_html_report(html_path, title=title, history=res.get('history', []), genomes=res.get('genomes_cyto', []), max_genomes=60)
+            except Exception as report_err:
+                print(f'[WARN] Interactive report failed for {task}:', report_err)
+        if args.rl_env and rl_history:
             title = f'{args.rl_env} | Interactive NEAT Report'
             html_path = os.path.join(args.out, f"{args.rl_env.replace(':', '_')}_interactive.html")
             try:
-                export_interactive_html_report(html_path, title=title, history=hist, genomes=[], max_genomes=1)
-            except Exception:
-                pass
+                export_interactive_html_report(html_path, title=title, history=rl_history, genomes=[], max_genomes=1)
+            except Exception as rl_report_err:
+                print('[WARN] RL interactive report failed:', rl_report_err)
         if figs:
 
             def _data_uri(p: str) -> Tuple[str, str]:
@@ -7150,10 +7272,9 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                 f.write("<style>body{font-family:'Hiragino Sans','Noto Sans JP',sans-serif;background:#fafafa;color:#222;line-height:1.6;padding:2rem;}header.cover{background:#fff;border:1px solid #ddd;border-radius:12px;padding:1.5rem;margin-bottom:2rem;box-shadow:0 8px 20px rgba(0,0,0,0.05);}header.cover h1{margin-top:0;font-size:1.9rem;}header.cover p.meta{margin:0.35rem 0 0.6rem 0;}header.cover ul{margin:0;padding-left:1.2rem;}section.summary,section.legend,section.narrative,section.examples{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:1.25rem;margin-bottom:2rem;box-shadow:0 10px 24px rgba(0,0,0,0.035);}section.summary h2,section.legend h2,section.narrative h2,section.examples h2{margin-top:0;font-size:1.35rem;}section.summary ul{margin:0;padding-left:1.4rem;}section.legend ol{margin:0;padding-left:1.4rem;}section.narrative p{margin:0 0 0.8rem 0;}section.examples ul{margin:0;padding-left:1.4rem;}section.examples li{margin:0 0 0.65rem 0;}section.examples code{background:#f4f4f4;border-radius:6px;display:block;padding:0.35rem 0.55rem;font-size:0.92rem;}figure{background:#fff;border:1px solid #e8e8e8;border-radius:12px;padding:1rem;margin:0 0 2rem 0;box-shadow:0 12px 24px rgba(0,0,0,0.04);}figure img,figure video{width:100%;height:auto;border-radius:8px;}figcaption{margin-top:0.75rem;font-weight:600;}</style></head><body>")
                 f.write("<header class='cover'>")
                 f.write('<h1>Spiral Monolith NEAT Report / スパイラル・モノリスNEATレポート</h1>')
-                f.write(f"<p class='meta'>Generated at / 生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Primary Task / 主タスク: {(args.task.upper() if args.task else 'N/A')}</p>")
+                primary_label = ', '.join(t.upper() for t in requested_tasks) if requested_tasks else 'N/A'
+                f.write(f"<p class='meta'>Generated at / 生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Supervised Tasks / 教師ありタスク: {primary_label}</p>")
                 f.write(f"<p class='meta'>Build / ビルド: {_build_stamp_short()}</p>")
-                if args.gallery:
-                    f.write("<p class='meta'>Gallery Tasks / ギャラリー対象: " + ', '.join((htmllib.escape(t.upper()) for t in args.gallery)) + '</p>')
                 f.write('<ul>')
                 f.write(f'<li>Generations / 世代数: {args.gens}</li>')
                 f.write(f'<li>Population / 個体数: {args.pop}</li>')
@@ -7166,8 +7287,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
 
                 def _fmt_float(val: Optional[float]) -> str:
                     return '–' if val is None else f'{val:.4f}'
-                sup_meta = report_meta.get('supervised')
-                if sup_meta:
+                for sup_meta in report_meta.get('supervised') or []:
                     extras = []
                     if sup_meta.get('has_regen_log'):
                         extras.append('LCS log')
@@ -7207,7 +7327,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                 f.write("<section class='narrative'><h2>Evolution Digest / 進化ダイジェスト</h2>")
                 f.write('<p>Early generations showed smooth structural adaptation and convergence under low-difficulty conditions.</p>')
                 f.write('<p>However, as environmental difficulty and noise increased, regeneration-driven mutations began to trigger bursts of morphological diversification, resembling biological punctuated equilibria.</p>')
-                if sup_meta and sup_meta.get('has_regen_log'):
+                any_sup = next((m for m in report_meta.get('supervised') or [] if m.get('has_regen_log')), None)
+                if any_sup:
                     f.write('<p>LCS metrics highlighted how severed pathways recovered within the allowed healing window, aligning regenerative bursts with topology repairs.</p>')
                 f.write('</section>')
                 if entries:
@@ -7215,11 +7336,14 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                     for label, path in entries:
                         f.write(f'<li><strong>{htmllib.escape(label)}</strong><br><small>{htmllib.escape(os.path.basename(path))}</small></li>')
                     f.write('</ol></section>')
-                cli_examples = [f"python {script_name} --task {htmllib.escape(args.task or 'spiral')} --gens {max(args.gens, 60)} --pop {max(args.pop, 64)} --steps {max(args.steps, 80)} --make-gifs --make-lineage --report --out demo_{htmllib.escape(args.task or 'spiral')}", f'python {script_name} --task xor --gallery spiral circles --gens 40 --pop 48 --steps 60 --report --out gallery_pack']
+                cli_examples = [
+                    f"python {script_name} --task spiral xor --gens {max(args.gens, 60)} --pop {max(args.pop, 64)} --steps {max(args.steps, 80)} --report --out demo_multitask",
+                    f"python {script_name} --task circles --gens {max(40, args.gens)} --pop {max(48, args.pop)} --steps {max(60, args.steps)} --report --out circles_run",
+                ]
                 rl_example_env = args.rl_env or 'CartPole-v1'
                 cli_examples.append(f"python {script_name} --rl-env {htmllib.escape(rl_example_env)} --rl-gens {max(args.rl_gens, 30)} --rl-pop {max(args.rl_pop, 32)} --rl-episodes {max(args.rl_episodes, 2)} --rl-max-steps {args.rl_max_steps} --report --out rl_{htmllib.escape(rl_example_env.replace(':', '_'))}")
                 f.write("<section class='examples'><h2>CLI Quickstart / CLIクイックスタート</h2>")
-                f.write('<p>Use the following commands as templates for supervised runs, gallery batches, and Gym integrations.</p>')
+                f.write('<p>Use the following commands as templates for supervised batches and Gym integrations.</p>')
                 f.write('<ul>')
                 for cmd in cli_examples:
                     f.write(f'<li><code>{cmd}</code></li>')
