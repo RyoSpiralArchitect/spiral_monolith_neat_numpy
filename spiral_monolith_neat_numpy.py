@@ -28,6 +28,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
 from matplotlib import font_manager as _font_manager
+from matplotlib import gridspec as _gridspec
 import csv
 import json
 import math
@@ -238,6 +239,8 @@ class NodeGene:
     activation: str = 'tanh'
     backprop_sensitivity: float = 1.0
     sensitivity_jitter: float = 0.0
+    sensitivity_momentum: float = 0.0
+    sensitivity_variance: float = 0.0
 
 @dataclass
 class ConnectionGene:
@@ -432,6 +435,8 @@ class Genome:
                 n.activation,
                 getattr(n, 'backprop_sensitivity', 1.0),
                 getattr(n, 'sensitivity_jitter', 0.0),
+                getattr(n, 'sensitivity_momentum', 0.0),
+                getattr(n, 'sensitivity_variance', 0.0),
             )
             for nid, n in self.nodes.items()
         }
@@ -711,6 +716,8 @@ class Genome:
             template.activation,
             getattr(template, 'backprop_sensitivity', 1.0),
             getattr(template, 'sensitivity_jitter', 0.0),
+            getattr(template, 'sensitivity_momentum', 0.0),
+            getattr(template, 'sensitivity_variance', 0.0),
         )
         added = 0
         for src, dst, weight in proposals:
@@ -822,6 +829,8 @@ class Genome:
                 'tanh',
                 float(rng.uniform(0.9, 1.1)),
                 float(np.clip(rng.normal(0.0, 0.04), -0.15, 0.15)),
+                0.0,
+                0.0,
             )
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
@@ -1368,6 +1377,8 @@ def _regenerate_head(g: Genome, rng: np.random.Generator, innov: InnovationTrack
         'tanh',
         float(rng.uniform(0.9, 1.1)),
         float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
+        0.0,
+        0.0,
     )
     inn1 = innov.get_conn_innovation(chosen.in_node, new_id)
     inn2 = innov.get_conn_innovation(new_id, chosen.out_node)
@@ -1414,6 +1425,8 @@ def _regenerate_split(g: Genome, rng: np.random.Generator, innov: InnovationTrac
                 'tanh',
                 float(rng.uniform(0.9, 1.1)),
                 float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
+                0.0,
+                0.0,
             )
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
@@ -1429,6 +1442,8 @@ def _regenerate_split(g: Genome, rng: np.random.Generator, innov: InnovationTrac
         'tanh',
         float(rng.uniform(0.9, 1.1)),
         float(np.clip(rng.normal(0.0, 0.05), -0.18, 0.18)),
+        0.0,
+        0.0,
     )
     incomings = [c for c in g.enabled_connections() if c.out_node == target]
     for cin in incomings:
@@ -1547,6 +1562,8 @@ def _soft_regenerate_head(g, rng, innov, intensity=0.5):
                 'tanh',
                 float(rng_local.uniform(0.9, 1.1)),
                 float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
+                0.0,
+                0.0,
             )
         inn1 = innov.get_conn_innovation(c.in_node, new_id)
         inn2 = innov.get_conn_innovation(new_id, c.out_node)
@@ -1597,6 +1614,8 @@ def _soft_regenerate_split(g, rng, innov, intensity=0.5):
                 'tanh',
                 float(rng_local.uniform(0.9, 1.1)),
                 float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
+                0.0,
+                0.0,
             )
         inn1 = innov.get_conn_innovation(c.in_node, new_nid)
         inn2 = innov.get_conn_innovation(new_nid, c.out_node)
@@ -1612,6 +1631,8 @@ def _soft_regenerate_split(g, rng, innov, intensity=0.5):
         'tanh',
         float(rng_local.uniform(0.9, 1.1)),
         float(np.clip(rng_local.normal(0.0, 0.05), -0.18, 0.18)),
+        0.0,
+        0.0,
     )
     incomings = [c for c in g.enabled_connections() if c.out_node == target]
     changed = False
@@ -2485,6 +2506,8 @@ class ReproPlanaNEATPlus:
                     n.activation,
                     getattr(n, 'backprop_sensitivity', 1.0),
                     getattr(n, 'sensitivity_jitter', 0.0),
+                    getattr(n, 'sensitivity_momentum', 0.0),
+                    getattr(n, 'sensitivity_variance', 0.0),
                 )
         all_innovs = sorted(set(mother.connections.keys()).union(father.connections.keys()))
         for inn in all_innovs:
@@ -2516,6 +2539,8 @@ class ReproPlanaNEATPlus:
                             n.activation,
                             getattr(n, 'backprop_sensitivity', 1.0),
                             getattr(n, 'sensitivity_jitter', 0.0),
+                            getattr(n, 'sensitivity_momentum', 0.0),
+                            getattr(n, 'sensitivity_variance', 0.0),
                         )
         child = Genome(child_nodes, child_conns)
         child.max_hidden_nodes = self.max_hidden_nodes
@@ -3383,6 +3408,14 @@ def compile_genome(g: Genome):
         [float(np.clip(getattr(g.nodes[n], 'sensitivity_jitter', 0.0), -0.25, 0.25)) for n in order],
         dtype=np.float64,
     )
+    node_momentum = np.array(
+        [float(getattr(g.nodes[n], 'sensitivity_momentum', 0.0)) for n in order],
+        dtype=np.float64,
+    )
+    node_variance = np.array(
+        [float(max(0.0, getattr(g.nodes[n], 'sensitivity_variance', 0.0))) for n in order],
+        dtype=np.float64,
+    )
     in_ids = [nid for nid in order if g.nodes[nid].type == 'input']
     bias_ids = [nid for nid in order if g.nodes[nid].type == 'bias']
     out_ids = [nid for nid in order if g.nodes[nid].type == 'output']
@@ -3413,6 +3446,8 @@ def compile_genome(g: Genome):
         'out_edges': out_edges,
         'node_sensitivity': node_sensitivity,
         'node_jitter': node_jitter,
+        'node_momentum': node_momentum,
+        'node_variance': node_variance,
     }
     try:
         g._compiled_cache = compiled
@@ -3507,6 +3542,16 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
         node_jitter = _np.zeros(n, dtype=_np.float64)
     else:
         node_jitter = _np.clip(_np.asarray(node_jitter, dtype=_np.float64), -0.3, 0.3)
+    node_momentum = comp.get('node_momentum')
+    if node_momentum is None or getattr(node_momentum, 'shape', (0,))[0] != n:
+        node_momentum = _np.zeros(n, dtype=_np.float64)
+    else:
+        node_momentum = _np.asarray(node_momentum, dtype=_np.float64)
+    node_variance = comp.get('node_variance')
+    if node_variance is None or getattr(node_variance, 'shape', (0,))[0] != n:
+        node_variance = _np.zeros(n, dtype=_np.float64)
+    else:
+        node_variance = _np.clip(_np.asarray(node_variance, dtype=_np.float64), 0.0, 5.0)
     node_signal = _np.zeros(n, dtype=_np.float64)
     node_push = _np.zeros(n, dtype=_np.float64)
     for j, oi in enumerate(comp['outputs']):
@@ -3519,20 +3564,27 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
             dz_raw = delta_z[:, j]
         else:
             dz_raw = delta_a[:, j] * act_deriv(comp['acts'][j], Z[:, j])
-        dest_scale = float(node_scale[j])
-        dest_jitter = 1.0 + 0.05 * float(node_jitter[j])
-        dz = dz_raw * dest_scale * dest_jitter
+        dest_mom = float(node_momentum[j])
+        dest_var = float(node_variance[j])
+        dest_scale = float(node_scale[j]) * (1.0 + 0.04 * _np.tanh(dest_mom))
+        dest_jitter = 1.0 + 0.05 * float(node_jitter[j]) + 0.03 * _np.tanh(dest_var)
+        dest_mix = dest_scale * dest_jitter
+        dz = dz_raw * dest_mix
         delta_z[:, j] = dz
-        node_signal[j] += float(_np.mean(_np.abs(dz)))
+        node_signal[j] += float(_np.mean(_np.abs(dz))) * (1.0 + 0.1 * _np.tanh(dest_var))
         for e in comp['in_edges'][j]:
             s = comp['src'][e]
-            src_scale = float(node_scale[s])
-            src_jitter = 1.0 + 0.05 * float(node_jitter[s])
-            edge_scale = 0.5 * (dest_scale * dest_jitter + src_scale * src_jitter)
+            src_mom = float(node_momentum[s])
+            src_var = float(node_variance[s])
+            src_scale = float(node_scale[s]) * (1.0 + 0.04 * _np.tanh(src_mom))
+            src_jitter = 1.0 + 0.05 * float(node_jitter[s]) + 0.03 * _np.tanh(src_var)
+            src_mix = src_scale * src_jitter
+            edge_scale = 0.5 * (dest_mix + src_mix)
             contrib = _np.dot(A[:, s], dz)
             grad_w[e] += edge_scale * contrib
-            node_push[s] += float(_np.mean(_np.abs(dz * w[e]))) * edge_scale
-            delta_a[:, s] += dz * w[e] * src_scale * src_jitter
+            flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom)
+            node_push[s] += float(_np.mean(_np.abs(dz * w[e]))) * edge_scale * flow_bias
+            delta_a[:, s] += dz * w[e] * src_mix
     grad_w = grad_w / max(1, B) + l2 * w
     if not _np.all(_np.isfinite(grad_w)):
         grad_w = _np.nan_to_num(grad_w, nan=0.0, posinf=0.0, neginf=0.0)
@@ -3547,7 +3599,18 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
     profile = _np.nan_to_num(profile, nan=0.0, posinf=0.0, neginf=0.0)
     return (w_new, float(loss), profile)
 
-def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=0.01, l2=0.0001, grad_clip=5.0, w_clip=12.0):
+def train_with_backprop_numpy(
+    genome: Genome,
+    X,
+    y,
+    steps=50,
+    lr=0.01,
+    l2=0.0001,
+    grad_clip=5.0,
+    w_clip=12.0,
+    profile_out: Optional[Dict[str, Any]]=None,
+    rng: Optional[np.random.Generator]=None,
+):
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
     np.nan_to_num(X, copy=False)
@@ -3556,6 +3619,21 @@ def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=0.01, l2=0.0001
     w = comp['w'].copy()
     history = []
     node_profile_accum = np.zeros(len(comp['order']), dtype=np.float64)
+    node_profile_sumsq = np.zeros(len(comp['order']), dtype=np.float64)
+    step_profiles: List[np.ndarray] = [] if profile_out is not None else []
+    if profile_out is not None:
+        profile_out.clear()
+        profile_out['node_order'] = list(comp['order'])
+        profile_out['node_types'] = list(comp['types'])
+        init_sens = [float(getattr(genome.nodes[nid], 'backprop_sensitivity', 1.0)) for nid in comp['order']]
+        init_jit = [float(getattr(genome.nodes[nid], 'sensitivity_jitter', 0.0)) for nid in comp['order']]
+        init_mom = [float(getattr(genome.nodes[nid], 'sensitivity_momentum', 0.0)) for nid in comp['order']]
+        init_var = [float(getattr(genome.nodes[nid], 'sensitivity_variance', 0.0)) for nid in comp['order']]
+        profile_out['initial_sensitivity'] = np.asarray(init_sens, dtype=np.float64)
+        profile_out['initial_jitter'] = np.asarray(init_jit, dtype=np.float64)
+        profile_out['initial_momentum'] = np.asarray(init_mom, dtype=np.float64)
+        profile_out['initial_variance'] = np.asarray(init_var, dtype=np.float64)
+    rng_local = rng or np.random.default_rng()
     if w.size == 0:
         return history
     for _ in range(int(steps)):
@@ -3565,21 +3643,71 @@ def train_with_backprop_numpy(genome: Genome, X, y, steps=50, lr=0.01, l2=0.0001
         history.append(L)
         if profile is not None and profile.shape[0] == node_profile_accum.shape[0]:
             node_profile_accum += profile
+            node_profile_sumsq += profile * profile
+            if profile_out is not None:
+                step_profiles.append(np.asarray(profile, dtype=np.float64))
     for e_idx, inn in enumerate(comp['eid']):
         genome.connections[inn].weight = float(w[e_idx])
     if node_profile_accum.size:
         avg_profile = node_profile_accum / max(1, float(steps))
+        mean_sq = node_profile_sumsq / max(1, float(steps))
+        var_profile = np.maximum(0.0, mean_sq - avg_profile ** 2)
+        global_mean = float(np.mean(avg_profile)) if avg_profile.size else 0.0
+        global_rms = float(np.sqrt(np.maximum(1e-09, np.mean(var_profile)))) if var_profile.size else 0.0
         for idx, nid in enumerate(comp['order']):
             node = genome.nodes.get(nid)
             if node is None:
                 continue
             baseline = float(getattr(node, 'backprop_sensitivity', 1.0))
-            target = 1.0 + 0.25 * float(np.tanh(avg_profile[idx]))
-            node.backprop_sensitivity = float(np.clip(0.85 * baseline + 0.15 * target, 0.2, 5.0))
+            prev_momentum = float(getattr(node, 'sensitivity_momentum', 0.0))
+            prev_variance = float(getattr(node, 'sensitivity_variance', 0.0))
+            local = float(avg_profile[idx])
+            centered = local - global_mean
+            tone = float(np.tanh(centered / (global_rms + 1e-06))) if global_rms > 0 else float(np.tanh(centered))
+            target = 1.0 + 0.24 * float(np.tanh(local)) + 0.08 * tone
+            node.backprop_sensitivity = float(
+                np.clip(
+                    0.78 * baseline + 0.17 * target + 0.05 * (1.0 + np.tanh(prev_momentum)),
+                    0.2,
+                    5.0,
+                )
+            )
+            var_local = float(np.sqrt(float(var_profile[idx]))) if idx < var_profile.size else 0.0
+            node.sensitivity_momentum = float(
+                np.clip(0.62 * prev_momentum + 0.38 * tone, -1.5, 1.5)
+            )
+            node.sensitivity_variance = float(
+                np.clip(0.7 * prev_variance + 0.3 * var_local, 0.0, 3.0)
+            )
             jitter_base = float(getattr(node, 'sensitivity_jitter', 0.0))
-            jitter_scale = 0.03 + 0.02 * float(np.clip(avg_profile[idx], 0.0, 3.0))
-            jitter_target = float(np.clip(np.random.normal(0.0, jitter_scale), -0.2, 0.2))
-            node.sensitivity_jitter = float(np.clip(0.8 * jitter_base + 0.2 * jitter_target, -0.25, 0.25))
+            jitter_scale = 0.02 + 0.018 * float(np.clip(node.sensitivity_variance, 0.0, 3.0))
+            jitter_drive = 0.15 * node.sensitivity_momentum
+            jitter_target = float(np.clip(jitter_drive + rng_local.normal(0.0, jitter_scale), -0.3, 0.3))
+            node.sensitivity_jitter = float(np.clip(0.74 * jitter_base + 0.26 * jitter_target, -0.25, 0.25))
+        if profile_out is not None:
+            profile_out['avg_profile'] = np.asarray(avg_profile, dtype=np.float64)
+            profile_out['profile_var'] = np.asarray(var_profile, dtype=np.float64)
+            profile_out['final_sensitivity'] = np.asarray(
+                [float(getattr(genome.nodes[nid], 'backprop_sensitivity', 1.0)) for nid in comp['order']],
+                dtype=np.float64,
+            )
+            profile_out['final_jitter'] = np.asarray(
+                [float(getattr(genome.nodes[nid], 'sensitivity_jitter', 0.0)) for nid in comp['order']],
+                dtype=np.float64,
+            )
+            profile_out['final_momentum'] = np.asarray(
+                [float(getattr(genome.nodes[nid], 'sensitivity_momentum', 0.0)) for nid in comp['order']],
+                dtype=np.float64,
+            )
+            profile_out['final_variance'] = np.asarray(
+                [float(getattr(genome.nodes[nid], 'sensitivity_variance', 0.0)) for nid in comp['order']],
+                dtype=np.float64,
+            )
+            if step_profiles:
+                profile_out['step_profiles'] = np.stack(step_profiles, axis=0)
+            else:
+                profile_out['step_profiles'] = np.zeros((0, len(comp['order'])), dtype=np.float64)
+            profile_out['loss_history'] = np.asarray(history, dtype=np.float64)
     try:
         genome.invalidate_caches(weights=True)
     except Exception:
@@ -4207,6 +4335,109 @@ def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, c
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
+def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    gg = genome.copy()
+    profile: Dict[str, Any] = {}
+    history = train_with_backprop_numpy(gg, X, y, steps=steps, lr=lr, l2=l2, profile_out=profile)
+    loss = np.asarray(history, dtype=np.float64)
+    step_profiles = np.asarray(
+        profile.get('step_profiles', np.zeros((0, len(profile.get('node_order', []))), dtype=np.float64)),
+        dtype=np.float64,
+    )
+    if step_profiles.ndim != 2 or step_profiles.shape[0] == 0:
+        step_profiles = None
+    node_order = profile.get('node_order', [])
+    node_types = profile.get('node_types', [])
+    labels = []
+    for nid, t in zip(node_order, node_types):
+        prefix = (t[0].upper() + ':') if t else 'N:'
+        labels.append(f'{prefix}{nid}')
+    initial_sens = np.asarray(profile.get('initial_sensitivity', []), dtype=np.float64)
+    final_sens = np.asarray(profile.get('final_sensitivity', []), dtype=np.float64)
+    final_momentum = np.asarray(profile.get('final_momentum', []), dtype=np.float64)
+    final_variance = np.asarray(profile.get('final_variance', []), dtype=np.float64)
+    final_jitter = np.asarray(profile.get('final_jitter', []), dtype=np.float64)
+    idx_pool = [i for i, t in enumerate(node_types) if t == 'hidden']
+    if not idx_pool:
+        idx_pool = list(range(len(labels)))
+    delta = final_sens - initial_sens if initial_sens.size and final_sens.size else np.zeros(len(labels), dtype=np.float64)
+    order_idx = sorted(idx_pool, key=lambda i: abs(delta[i]) if i < delta.size else 0.0, reverse=True)
+    if len(order_idx) > 10:
+        order_idx = order_idx[:10]
+    scatter_idx = sorted(idx_pool, key=lambda i: (final_variance[i] if i < final_variance.size else 0.0) + 0.25 * abs(final_momentum[i] if i < final_momentum.size else 0.0), reverse=True)
+    if len(scatter_idx) > 12:
+        scatter_idx = scatter_idx[:12]
+    fig = plt.figure(figsize=(10.5, 6.2))
+    gs = _gridspec.GridSpec(2, 2, height_ratios=[1.7, 1.0], width_ratios=[1.0, 1.0], hspace=0.32, wspace=0.28)
+    ax_top = fig.add_subplot(gs[0, :])
+    steps_axis = np.arange(1, loss.size + 1, dtype=np.float64) if loss.size else np.arange(1, steps + 1, dtype=np.float64)
+    handles = []
+    labels_legend = []
+    if step_profiles is not None:
+        mean_profile = step_profiles.mean(axis=1)
+        std_profile = step_profiles.std(axis=1)
+        mp = mean_profile[:steps_axis.size]
+        sp = std_profile[:steps_axis.size]
+        ax_top.fill_between(steps_axis[:mp.size], mp - sp[:mp.size], mp + sp[:mp.size], color='#8ecae6', alpha=0.35, label='pulse ±σ')
+        line_mp, = ax_top.plot(steps_axis[:mp.size], mp, color='#219ebc', lw=2.0, label='pulse mean')
+        handles.append(line_mp)
+        labels_legend.append('pulse mean')
+    if loss.size:
+        ax_loss = ax_top.twinx()
+        line_loss, = ax_loss.plot(steps_axis[:loss.size], loss, color='#f07167', lw=1.8, label='loss')
+        ax_loss.set_ylabel('loss', color='#f07167')
+        ax_loss.tick_params(axis='y', colors='#f07167')
+        handles.append(line_loss)
+        labels_legend.append('loss')
+    ax_top.set_xlabel('backprop step')
+    ax_top.set_ylabel('pulse magnitude')
+    ax_top.set_title('Backprop pulse landscape')
+    if handles:
+        ax_top.legend(handles, labels_legend, loc='upper right', frameon=False, fontsize=9)
+    ax_left = fig.add_subplot(gs[1, 0])
+    if order_idx and initial_sens.size and final_sens.size:
+        y_pos = np.arange(len(order_idx))
+        init_vals = initial_sens[order_idx]
+        final_vals = final_sens[order_idx]
+        delta_vals = final_vals - init_vals
+        ax_left.barh(y_pos - 0.18, init_vals, height=0.3, color='#c1d3fe', alpha=0.75, label='initial')
+        ax_left.barh(y_pos + 0.18, final_vals, height=0.3, color='#5e60ce', alpha=0.9, label='post-train')
+        ax_left.axvline(1.0, color='#333333', lw=0.8, ls='--', alpha=0.6)
+        for k, idx in enumerate(order_idx):
+            lbl = labels[idx] if idx < len(labels) else f'n{idx}'
+            ax_left.text(final_vals[k] + 0.04, y_pos[k] + 0.2, f'Δ{delta_vals[k]:+.2f}', fontsize=8, color='#333333')
+        ax_left.set_yticks(y_pos)
+        ax_left.set_yticklabels([labels[idx] if idx < len(labels) else f'n{idx}' for idx in order_idx])
+        ax_left.set_xlabel('sensitivity')
+        ax_left.set_title('Hidden node sensitivity drift')
+        ax_left.legend(frameon=False, fontsize=8, loc='lower right')
+    else:
+        ax_left.text(0.5, 0.5, 'No hidden nodes tracked', ha='center', va='center', fontsize=10)
+        ax_left.set_axis_off()
+    ax_right = fig.add_subplot(gs[1, 1])
+    if scatter_idx and final_momentum.size and final_variance.size:
+        mom_vals = final_momentum[scatter_idx]
+        var_vals = final_variance[scatter_idx]
+        jit_vals = final_jitter[scatter_idx] if final_jitter.size else np.zeros_like(mom_vals)
+        sc = ax_right.scatter(mom_vals, var_vals, c=jit_vals, cmap='coolwarm', s=60, edgecolors='k', linewidths=0.35)
+        for k, idx in enumerate(scatter_idx):
+            lbl = labels[idx] if idx < len(labels) else f'n{idx}'
+            ax_right.text(mom_vals[k] + 0.02, var_vals[k] + 0.02, lbl, fontsize=8)
+        ax_right.set_xlabel('momentum (smoothed)')
+        ax_right.set_ylabel('variance trace')
+        ax_right.set_title('Post-train temperament field')
+        cb = fig.colorbar(sc, ax=ax_right, fraction=0.046, pad=0.04)
+        cb.set_label('jitter', fontsize=9)
+    else:
+        ax_right.text(0.5, 0.5, 'No temperament statistics', ha='center', va='center', fontsize=10)
+        ax_right.set_axis_off()
+    fig.suptitle(f'Backprop Variation | steps={steps}', fontsize=12)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    return {'figure': out_path, 'history': loss, 'profile': profile}
+
 def export_decision_boundaries_all(genome: Genome, out_dir: str, steps: int=50, seed: int=0):
     os.makedirs(out_dir or '.', exist_ok=True)
     Xc, yc = make_circles(512, r=0.6, noise=0.05, seed=seed)
@@ -4470,6 +4701,13 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
     topo_path = f'{out_prefix}_topology.png'
     scars = diff_scars(None, best, None, birth_gen=gens, regen_mode_for_new='split')
     draw_genome_png(best, scars, topo_path, title=f'Best Topology (Gen {gens})')
+    backprop_variation = None
+    bp_path = f'{out_prefix}_backprop_variation.png'
+    try:
+        backprop_variation = export_backprop_variation(best, Xtr, ytr, bp_path, steps=steps, lr=0.005, l2=0.0001)
+    except Exception as bp_err:
+        print('[WARN] Backprop variation export failed:', bp_err)
+        backprop_variation = None
     regen_gif = None
     morph_gif = None
     if make_gifs and len(neat.snapshots_genomes) >= 2:
@@ -4528,7 +4766,7 @@ def run_backprop_neat_experiment(task: str, gens=60, pop=64, steps=80, out_prefi
         except Exception as log_err:
             print('[WARN] Resilience log write failed:', log_err)
             resilience_log = None
-    return {'learning_curve': lc_path, 'decision_boundary': db_path, 'topology': topo_path, 'top3_topologies': top3_paths, 'regen_gif': regen_gif, 'morph_gif': morph_gif, 'lineage': lineage_path, 'scars_spiral': scars_spiral, 'summary_decisions': summary_paths, 'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None, 'lcs_ribbon': lcs_ribbon, 'lcs_timeline': lcs_timeline, 'history': hist, 'genomes_cyto': genomes_cyto, 'resilience_log': resilience_log}
+    return {'learning_curve': lc_path, 'decision_boundary': db_path, 'topology': topo_path, 'top3_topologies': top3_paths, 'regen_gif': regen_gif, 'morph_gif': morph_gif, 'lineage': lineage_path, 'scars_spiral': scars_spiral, 'summary_decisions': summary_paths, 'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None, 'lcs_ribbon': lcs_ribbon, 'lcs_timeline': lcs_timeline, 'history': hist, 'genomes_cyto': genomes_cyto, 'resilience_log': resilience_log, 'backprop_variation': backprop_variation}
 
 def _fig_to_rgb(fig):
     """
@@ -5849,7 +6087,7 @@ _SHM_META = {}
 _SHM_CACHE = {}
 _SHM_HANDLES = {}
 STRUCTURAL_EPS = 1e-09
-__all__ = ['NodeGene', 'ConnectionGene', 'InnovationTracker', 'Genome', 'compatibility_distance', 'HouseholdManager', 'EvalMode', 'ReproPlanaNEATPlus', 'compile_genome', 'forward_batch', 'train_with_backprop_numpy', 'predict', 'predict_proba', 'fitness_backprop_classifier', 'make_circles', 'make_xor', 'make_spirals', 'draw_genome_png', 'export_regen_gif', 'export_morph_gif', 'export_double_exposure', 'plot_learning_and_complexity', 'plot_decision_boundary', 'export_decision_boundaries_all', 'render_lineage', 'export_scars_spiral_map', 'output_dim_from_space', 'build_action_mapper', 'eval_with_node_activations', 'run_policy_in_env', 'run_gym_neat_experiment', 'LCSMonitor', 'summarize_graph_changes', 'load_lcs_log', 'export_lcs_ribbon_png', 'export_lcs_timeline_gif', 'PerSampleSequenceStopperPro']
+__all__ = ['NodeGene', 'ConnectionGene', 'InnovationTracker', 'Genome', 'compatibility_distance', 'HouseholdManager', 'EvalMode', 'ReproPlanaNEATPlus', 'compile_genome', 'forward_batch', 'train_with_backprop_numpy', 'predict', 'predict_proba', 'fitness_backprop_classifier', 'make_circles', 'make_xor', 'make_spirals', 'draw_genome_png', 'export_regen_gif', 'export_morph_gif', 'export_double_exposure', 'plot_learning_and_complexity', 'plot_decision_boundary', 'export_backprop_variation', 'export_decision_boundaries_all', 'render_lineage', 'export_scars_spiral_map', 'output_dim_from_space', 'build_action_mapper', 'eval_with_node_activations', 'run_policy_in_env', 'run_gym_neat_experiment', 'LCSMonitor', 'summarize_graph_changes', 'load_lcs_log', 'export_lcs_ribbon_png', 'export_lcs_timeline_gif', 'PerSampleSequenceStopperPro']
 INF = 10 ** 12
 PATCHED_PATH = __file__
 spec = None
