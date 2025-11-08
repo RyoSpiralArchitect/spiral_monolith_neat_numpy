@@ -19,6 +19,7 @@ from collections import deque, defaultdict, OrderedDict
 import math, argparse, os, mimetypes, csv
 import sys
 import time
+import subprocess
 import matplotlib
 import warnings
 import pickle as _pickle
@@ -35,6 +36,62 @@ import math
 import os
 from typing import Dict, Optional, Tuple
 import importlib.util
+from datetime import datetime, timezone
+
+_BUILD_INFO_CACHE: Optional[Dict[str, Any]] = None
+_SPINOR_BOUND_SEED: Optional[int] = None
+
+
+def _resolve_build_info() -> Dict[str, Any]:
+    """Return cached build metadata including git short hash and UTC timestamp."""
+
+    global _BUILD_INFO_CACHE
+    if _BUILD_INFO_CACHE is not None:
+        return _BUILD_INFO_CACHE
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    stamp_ts = now_utc.strftime('%Y%m%dT%H%M%SZ')
+    short_hash = 'nogit'
+    repo_root = None
+    try:
+        here = os.path.abspath(__file__)
+        repo_root = os.path.dirname(here)
+    except Exception:
+        repo_root = os.getcwd()
+    probe = repo_root
+    while probe and not os.path.isdir(os.path.join(probe, '.git')):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            probe = None
+            break
+        probe = parent
+    if probe:
+        try:
+            raw = subprocess.check_output(
+                ['git', 'rev-parse', '--short', 'HEAD'],
+                cwd=probe,
+                stderr=subprocess.DEVNULL,
+            )
+            short_hash = raw.decode('ascii', errors='ignore').strip() or 'nogit'
+        except Exception:
+            short_hash = 'nogit'
+    build_id = f'{short_hash}-{stamp_ts}'
+    _BUILD_INFO_CACHE = {
+        'hash': short_hash,
+        'timestamp': stamp_ts,
+        'datetime': now_utc,
+        'id': build_id,
+    }
+    return _BUILD_INFO_CACHE
+
+
+def _build_stamp_text(prefix: str='Spiral Monolith NEAT') -> str:
+    info = _resolve_build_info()
+    return f"{prefix} build {info['id']}"
+
+
+def _build_stamp_short() -> str:
+    info = _resolve_build_info()
+    return info['id']
 
 def _is_picklable(obj) -> bool:
     """Process 並列に切り替える前に picklable かを事前検査（非picklableなら thread に自動フォールバック）"""
@@ -225,12 +282,75 @@ def _imread_image(src):
 
 def _imwrite_image(path, array):
     """Write an image array using imageio or Pillow."""
+    stamped = _stamp_image_array(np.asarray(array))
     if imageio is not None:
-        imageio.imwrite(path, array)
+        imageio.imwrite(path, stamped)
         return
     if Image is None:
         raise RuntimeError('imageio is unavailable and Pillow is not installed; cannot write image')
-    Image.fromarray(np.asarray(array)).save(path)
+    Image.fromarray(stamped).save(path)
+
+
+def _stamp_figure(fig: 'plt.Figure') -> 'plt.Figure':
+    """Watermark a matplotlib figure with the current build stamp."""
+
+    if fig is None:
+        return fig
+    if getattr(fig, '_build_stamp_applied', False):
+        return fig
+    text = _build_stamp_text()
+    try:
+        fig.text(
+            0.995,
+            0.01,
+            text,
+            ha='right',
+            va='bottom',
+            fontsize=6,
+            color='#4a4a4a',
+            alpha=0.78,
+        )
+    except Exception:
+        pass
+    else:
+        setattr(fig, '_build_stamp_applied', True)
+    return fig
+
+
+def _savefig(fig: 'plt.Figure', path: str, **kwargs) -> None:
+    """Save a matplotlib figure with a build watermark."""
+
+    _stamp_figure(fig)
+    fig.savefig(path, **kwargs)
+
+
+def _stamp_image_array(arr: np.ndarray) -> np.ndarray:
+    """Overlay the build stamp onto a numpy image array when Pillow is available."""
+
+    try:
+        from PIL import Image as _PILImage, ImageDraw
+    except Exception:
+        return np.asarray(arr)
+    if arr.ndim < 2:
+        return np.asarray(arr)
+    try:
+        img = _PILImage.fromarray(np.asarray(arr))
+    except Exception:
+        return np.asarray(arr)
+    draw = ImageDraw.Draw(img)
+    text = _build_stamp_text()
+    w, h = img.size
+    margin = max(3, int(min(w, h) * 0.01))
+    anchor_point = (w - margin, h - margin)
+    try:
+        draw.text(anchor_point, text, anchor='rd', fill=(68, 68, 68))
+    except Exception:
+        try:
+            x, y = anchor_point
+            draw.text((x - margin, y - margin), text, fill=(68, 68, 68))
+        except Exception:
+            pass
+    return np.asarray(img)
 
 @dataclass
 class NodeGene:
@@ -1212,7 +1332,7 @@ def export_lcs_ribbon_png(lcs_rows: List[Dict[str, Any]], path: str, series: Opt
     fig.suptitle('Local Continuity Signature overview', y=0.98, fontsize=12)
     fig.text(0.02, 0.03, summary_text, fontsize=9, family='monospace')
     fig.tight_layout(rect=[0, 0.06, 1, 0.95])
-    fig.savefig(path, dpi=dpi)
+    _savefig(fig, path, dpi=dpi)
     _plt.close(fig)
     return path
 
@@ -2174,7 +2294,7 @@ class LCSMonitor:
         for _r in rows:
             _r['birth_mode'] = birth_mode or ''
             _r['is_regen_child'] = int(bool(is_regen_child)) if is_regen_child is not None else 0
-        header = ['birth_mode', 'is_regen_child', 'gen', 'lineage_id', 'mut_id', 'o', 'changed_nodes', 'changed_edges', 'R0', 'R1', 'P0', 'P1', 'd0', 'd1', 'detour', 'delta_paths', 'delta_sp', 'heal_flag', 'time_to_heal', 'disjoint_paths0', 'disjoint_paths1']
+        header = ['birth_mode', 'is_regen_child', 'gen', 'lineage_id', 'mut_id', 'o', 'changed_nodes', 'changed_edges', 'R0', 'R1', 'P0', 'P1', 'd0', 'd1', 'detour', 'delta_paths', 'delta_sp', 'heal_flag', 'time_to_heal', 'disjoint_paths0', 'disjoint_paths1', 'build_id']
         need_header = not os.path.exists(self.csv_path)
         try:
             with open(self.csv_path, 'a', newline='') as f:
@@ -2182,6 +2302,7 @@ class LCSMonitor:
                 if need_header:
                     writer.writeheader()
                 for row in rows:
+                    row['build_id'] = _build_stamp_short()
                     writer.writerow(row)
         except Exception as exc:
             print(f'[LCS] CSV write error: {exc}')
@@ -4091,7 +4212,7 @@ def draw_genome_png(genome: Genome, scars: Optional[Dict[int, 'Scar']], path: st
     ax.set_aspect('equal', adjustable='box')
     ax.axis('off')
     fig.tight_layout()
-    fig.savefig(path, dpi=200)
+    _savefig(fig, path, dpi=200)
     plt.close(fig)
 
 def _normalize_scar_snapshot(entry: Optional[Dict[Any, Any]]) -> Tuple[Dict[int, int], Dict[Tuple[int, int], int]]:
@@ -4315,7 +4436,7 @@ def export_double_exposure(genome: Genome, lineage_edges: List[Tuple[Optional[in
     if title:
         ax.set_title(title)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=220)
+    _savefig(fig, out_path, dpi=220)
     plt.close(fig)
 
 def _infer_generations(lineage_edges: Iterable[Tuple[Optional[int], Optional[int], int, int, str]]):
@@ -4502,7 +4623,7 @@ def render_lineage(neat, path='lineage.png', title='Lineage', max_edges: Optiona
                 continue
             ax.text(x + 0.012, y - 0.05, text, fontsize=5.5, ha='left', va='top', alpha=0.85, family='monospace')
     fig.tight_layout()
-    fig.savefig(path, dpi=dpi)
+    _savefig(fig, path, dpi=dpi)
     plt.close(fig)
 
 def _moving_stats(arr: List[float], window: int):
@@ -4543,7 +4664,7 @@ def plot_learning_and_complexity(history: List[Tuple[float, float]], hidden_coun
     if title:
         ax1.set_title(title)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=200)
+    _savefig(fig, out_path, dpi=200)
     plt.close(fig)
 
 def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, contour_cmap: str='coolwarm', point_cmap: Optional[str]=None, point_size: float=12.0, point_alpha: float=0.85, add_colorbar: bool=False):
@@ -4569,7 +4690,7 @@ def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, c
     ax.set_xlabel('x')
     ax.set_ylabel('y')
     fig.tight_layout()
-    fig.savefig(out_path, dpi=220)
+    _savefig(fig, out_path, dpi=220)
     plt.close(fig)
 
 def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
@@ -4664,14 +4785,15 @@ def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50
         ax_right.set_xlabel('momentum (smoothed)')
         ax_right.set_ylabel('variance trace')
         ax_right.set_title('Post-train temperament field')
-        cb = fig.colorbar(sc, ax=ax_right, fraction=0.046, pad=0.04)
-        cb.set_label('jitter', fontsize=9)
+        if len(scatter_idx) >= 3:
+            cb = fig.colorbar(sc, ax=ax_right, fraction=0.046, pad=0.04)
+            cb.set_label('jitter', fontsize=9)
     else:
         ax_right.text(0.5, 0.5, 'No temperament statistics', ha='center', va='center', fontsize=10)
         ax_right.set_axis_off()
     fig.suptitle(f'Backprop Variation | steps={steps}', fontsize=12)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
-    fig.savefig(out_path, dpi=220)
+    _savefig(fig, out_path, dpi=220)
     plt.close(fig)
     return {'figure': out_path, 'history': loss, 'profile': profile}
 
@@ -4704,7 +4826,7 @@ def compose_gallery_from_existing(result: Dict[str, str], out_dir: str, task: st
             ax.set_title(title, fontsize=11)
             ax.axis('off')
         fig.tight_layout()
-        fig.savefig(combo, dpi=220)
+        _savefig(fig, combo, dpi=220)
         plt.close(fig)
         outputs[f'{idx:02d} {task.upper()} 学習曲線＋決定境界'] = combo
     else:
@@ -4740,7 +4862,7 @@ def export_task_gallery(tasks: Tuple[str, ...], gens: int, pop: int, steps: int,
                 ax.set_title(f'{task.upper()} | {title}')
                 ax.axis('off')
             fig.tight_layout()
-            fig.savefig(combo, dpi=220)
+            _savefig(fig, combo, dpi=220)
             plt.close(fig)
             outputs[f'{idx:02d} {task.upper()} 学習曲線＋決定境界'] = combo
         else:
@@ -5025,6 +5147,7 @@ def _fig_to_rgb(fig):
         return buf[:, :, 1:4].copy()
     import io
     bio = io.BytesIO()
+    _stamp_figure(fig)
     fig.savefig(bio, format='png', dpi=fig.dpi, bbox_inches='tight', pad_inches=0.0)
     bio.seek(0)
     img = _imread_image(bio)
@@ -5432,7 +5555,7 @@ def export_scars_spiral_map(snapshots_genomes: List[Genome], snapshots_scars: Li
     if any((xs[k] for k in xs)):
         ax.legend(loc='upper left', frameon=False, fontsize=9, handlelength=1.0)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=dpi)
+    _savefig(fig, out_path, dpi=dpi)
     _plt.close(fig)
     return out_path
 
@@ -5447,7 +5570,10 @@ def _import_gym():
     try:
         import gymnasium as gym
     except ImportError:
-        import gym
+        try:
+            import gym
+        except ImportError as exc:
+            raise ImportError('Gym/Gymnasium is not installed. RL機能は無効です。pip install gymnasium[toy_text] 等をお試しください。') from exc
     return gym
 
 def output_dim_from_space(space) -> int:
@@ -6105,7 +6231,8 @@ def run_gym_neat_experiment(env_id: str, gens: int=20, pop: int=24, episodes: in
     plt.title(f'{env_id} | Average Episode Reward')
     plt.legend()
     plt.tight_layout()
-    plt.savefig(rc_png, dpi=150)
+    fig = plt.gcf()
+    _savefig(fig, rc_png, dpi=150)
     plt.close()
     lcs_ribbon = None
     lcs_timeline = None
@@ -6158,9 +6285,12 @@ def export_interactive_html_report(path: str, title: str, history, genomes, *, m
         genomes = [genomes[i] for i in idxs]
     if genomes and 'nodes' not in genomes[0]:
         genomes = [_genome_to_cyto(g) for g in genomes]
-    data = {'title': title, 'lc': {'x': xs, 'best': ys_best, 'avg': ys_avg}, 'genomes': genomes}
+    build_id = _build_stamp_short()
+    data = {'title': title, 'lc': {'x': xs, 'best': ys_best, 'avg': ys_avg}, 'genomes': genomes, 'build': build_id}
     html = f"""<!doctype html>\n<html lang="ja">\n<head>\n  <meta charset="utf-8"/>\n  <title>{title}</title>\n  <meta name="viewport" content="width=device-width, initial-scale=1"/>\n  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>\n  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>\n  <style>\n    :root {{ --grid:#e5e5e5; --fg:#111; --muted:#666; --ok1:#0072B2; --ok2:#D55E00; --ok3:#009E73; --ok4:#CC79A7; --ok5:#F0E442; --ok6:#56B4E9; --ok7:#E69F00; --ok8:#000; }}\n    body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--fg); }}\n    .container {{ max-width:1200px; margin:24px auto; padding:0 16px; }}\n    h1 {{ font-size:22px; margin:0 0 12px; }}\n    .card {{ border:1px solid var(--grid); border-radius:8px; padding:12px; background:#fff; margin-bottom:16px; }}\n    #lc {{ height:360px; }}\n    .panel {{ display:grid; grid-template-columns:1fr 320px; gap:16px; }}\n    #cy {{ width:100%; height:560px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}\n    .detail {{ border:1px dashed var(--grid); border-radius:6px; padding:8px; font-size:13px; height:560px; overflow:auto; background:#fafafa; }}\n    .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }}\n    select,button {{ padding:6px 8px; font-size:14px; border:1px solid var(--grid); border-radius:6px; background:#fff; }}\n    .dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}\n    .legend {{ display:inline-flex; gap:8px; align-items:center; }}\n    /* Tooltip */\n    .tip {{ position:fixed; pointer-events:none; background:rgba(0,0,0,.8); color:#fff; padding:6px 8px; font-size:12px; border-radius:4px; transform:translate(8px,8px); z-index:1000; display:none; max-width:320px; white-space:nowrap; }}\n    /* Context menu */\n    .ctx-menu {{\n      position: fixed; z-index: 2000; display: none; min-width: 220px;\n      background: #fff; color: var(--fg); border: 1px solid var(--grid); border-radius: 8px;\n      box-shadow: 0 8px 20px rgba(0,0,0,.12); padding: 6px;\n    }}\n    .ctx-item {{ font-size: 13px; padding: 8px 10px; cursor: pointer; border-radius:6px; }}\n    .ctx-item:hover {{ background: #f3f3f3; }}\n    .ctx-sep {{ height:1px; background: var(--grid); margin:6px 0; }}\n    .swatches {{ display:flex; flex-wrap:wrap; gap:6px; padding: 4px 2px 2px; }}\n    .swatch {{ width:18px; height:18px; border-radius:50%; cursor:pointer; border:1px solid rgba(0,0,0,.15); }}\n    .ctx-row {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}\n  </style>\n</head>\n<body>\n  <div class="container">\n    <h1>{title}</h1>\n    <div class="card">\n      <h2>Learning Curve</h2>\n      <div id="lc"></div>\n    </div>\n    <div class="card">\n      <h2>Genome Viewer</h2>\n      <div class="row">\n        <label for="genomeSelect">Genome:</label>\n        <select id="genomeSelect"></select>\n        <button id="layoutBtn">Re-layout</button>\n        <span class="legend">\n          <span class="dot" style="background:#009E73"></span> input\n          <span class="dot" style="background:#999"></span> hidden\n          <span class="dot" style="background:#0072B2"></span> output\n        </span>\n      </div>\n      <div class="panel">\n        <div id="cy"></div>\n        <div class="detail" id="detail"><div class="fine">ノードやエッジを選択すると詳細が表示されます。</div></div>\n      </div>\n    </div>\n  </div>\n  <div class="tip" id="tip"></div>\n  <div class="ctx-menu" id="ctx"></div>\n\n  <script>\n    const DATA = {json.dumps(data, ensure_ascii=False)};\n    // Learning curve\n    (function(){{\n      const traces = [];\n      if (DATA.lc && DATA.lc.x.length) {{\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.best, mode:'lines', name:'best', line:{{width:2, color:'#0072B2'}},\n          hovertemplate:'gen=%{{x}}<br>best=%{{y:.4f}}<extra></extra>' }});\n        traces.push({{ x: DATA.lc.x, y: DATA.lc.avg,  mode:'lines', name:'avg',  line:{{width:2, color:'#D55E00'}},\n          hovertemplate:'gen=%{{x}}<br>avg=%{{y:.4f}}<extra></extra>' }});\n      }}\n      Plotly.newPlot('lc', traces, {{\n        margin:{{l:40,r:10,t:10,b:40}},\n        xaxis:{{title:'Generation', gridcolor:'#eee'}},\n        yaxis:{{title:'Fitness', gridcolor:'#eee'}},\n        legend:{{orientation:'h'}}\n      }}, {{displayModeBar:true, responsive:true}});\n    }})();\n\n    // Genome viewer\n    const cyContainer = document.getElementById('cy');\n    const detail = document.getElementById('detail');\n    const tip = document.getElementById('tip');\n    const sel = document.getElementById('genomeSelect');\n    const layoutBtn = document.getElementById('layoutBtn');\n    const ctx = document.getElementById('ctx');\n    let cy = null;\n    let currentGenome = null; // store current genome object\n    let ctxNode = null;\n\n    function lsKey(gid) {{ return 'NEAT_REPORT_GENOME_STATE::' + String(gid); }}\n    function saveState() {{\n      if (!cy || !currentGenome) return;\n      const st = {{}};\n      cy.nodes().forEach(n => {{\n        st[n.id()] = {{\n          pos: n.position(),\n          locked: n.locked(),\n          color: n.data('color') || null,\n          note: n.data('note') || null\n        }};\n      }});\n      try {{ localStorage.setItem(lsKey(currentGenome.id || 'genome'), JSON.stringify(st)); }} catch(e){{}}\n    }}\n    function applyState() {{\n      if (!cy || !currentGenome) return;\n      let raw = null;\n      try {{ raw = localStorage.getItem(lsKey(currentGenome.id || 'genome')); }} catch(e){{}}\n      if (!raw) return;\n      let st = null;\n      try {{ st = JSON.parse(raw); }} catch(e) {{ return; }}\n      if (!st) return;\n      cy.batch(() => {{\n        cy.nodes().forEach(n => {{\n          const s = st[n.id()]; if (!s) return;\n          if (s.pos && Number.isFinite(s.pos.x) && Number.isFinite(s.pos.y)) n.position(s.pos);\n          if (s.locked) n.lock(); else n.unlock();\n          if (s.color) {{ n.data('color', s.color); n.style('background-color', s.color); }}\n          if (s.note) {{\n            n.data('note', s.note);\n            const orig = n.data('orig_label') || n.data('label') || n.id();\n            n.data('label', orig + '\\n' + s.note);\n          }}\n        }});\n      }});\n    }}\n\n    function genomeToElements(g) {{\n      // Ensure orig_label availability for annotations\n      const nodes = (g.nodes||[]).map(n => {{\n        const d = n.data || n;\n        return {{ data: Object.assign({{}}, d, {{ orig_label: d.label }}) }};\n      }});\n      const edges = (g.edges||[]).map(e => ({{ data: e.data || e, classes: ((e.data||e).enabled? 'enabled':'disabled') }}));\n      return nodes.concat(edges);\n    }}\n    function populateSelect() {{\n      sel.innerHTML = '';\n      if (!DATA.genomes || DATA.genomes.length===0) {{\n        const opt = document.createElement('option'); opt.text='(no genomes)'; sel.add(opt); sel.disabled=true; return;\n      }}\n      sel.disabled=false;\n      DATA.genomes.forEach((g,i) => {{\n        const meta = g.meta || {{}};\n        const label = (g.id || ('genome_'+i)) + (meta.fitness!==undefined ? (' (fitness='+meta.fitness+')') : '');\n        const opt = document.createElement('option'); opt.value=String(i); opt.text=label; sel.add(opt);\n      }});\n    }}\n    function renderGenome(idx) {{\n      if (!DATA.genomes || !DATA.genomes[idx]) return;\n      const g = DATA.genomes[idx];\n      currentGenome = g;\n      const elements = genomeToElements(g);\n      const styles = [\n        {{ selector:'node', style:{{ 'label':'data(label)', 'font-size':11, 'text-valign':'center', 'text-halign':'center',\n           'text-wrap':'wrap', 'text-max-width': 90, 'background-color':'#999','width':22,'height':22, 'color':'#111','border-color':'#333','border-width':0.5 }} }},\n        {{ selector:'node[type = "input"]',  style:{{ 'background-color':'#009E73' }} }},\n        {{ selector:'node[type = "output"]', style:{{ 'background-color':'#0072B2' }} }},\n        {{ selector:'edge', style:{{ 'line-color':'#888', 'width':'mapData(weight, -2, 2, 0.6, 4)', 'opacity':0.95,\n           'curve-style':'bezier','target-arrow-shape':'triangle','target-arrow-color':'#888' }} }},\n        {{ selector:'edge[weight < 0]',  style:{{ 'line-color':'#D55E00', 'target-arrow-color':'#D55E00' }} }},\n        {{ selector:'edge[weight >= 0]', style:{{ 'line-color':'#56B4E9', 'target-arrow-color':'#56B4E9' }} }},\n        {{ selector:'edge.disabled', style:{{ 'line-style':'dotted','opacity':0.3 }} }},\n        {{ selector:':selected', style:{{ 'border-width':2, 'border-color':'#F0E442' }} }},\n      ];\n      if (cy) cy.destroy();\n      cy = cytoscape({{ container: cyContainer, elements: elements, style: styles, layout: {{ name:'cose', animate:false }},\n        wheelSensitivity:0.2, minZoom:0.2, maxZoom:5 }});\n\n      function showDetail(html) {{ detail.innerHTML = html; }}\n      function nodeHtml(d) {{\n        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');\n        return `<div><b>Node</b></div>\n          <div>ID: ${{a('id')}}</div>\n          <div>Label: ${{a('label')}}</div>\n          <div>Type: ${{a('type')}}</div>\n          <div>Bias: ${{a('bias')}}</div>\n          <div>Activation: ${{a('activation')}}</div>\n          <div>Note: ${{a('note')}}</div>`;\n      }}\n      function edgeHtml(d) {{\n        const a=(k)=> (d[k]!==undefined && d[k]!==null ? String(d[k]) : '');\n        return `<div><b>Edge</b></div>\n          <div>Source: ${{a('source')}}</div>\n          <div>Target: ${{a('target')}}</div>\n          <div>Weight: ${{a('weight')}}</div>\n          <div>Enabled: ${{a('enabled')}}</div>`;\n      }}\n\n      // Click selects → details\n      cy.on('tap','node',(evt)=> showDetail(nodeHtml(evt.target.data())));\n      cy.on('tap','edge',(evt)=> showDetail(edgeHtml(evt.target.data())));\n      cy.on('tap',(evt)=> {{ if (evt.target===cy) showDetail('<div class="fine">ノードやエッジを選択すると詳細が表示されます。</div>'); }});\n\n      // Hover tooltip\n      const moveTip = (e) => {{ tip.style.left=(e.renderedPosition.x + cyContainer.getBoundingClientRect().left)+'px';\n                                tip.style.top=(e.renderedPosition.y + cyContainer.getBoundingClientRect().top)+'px'; }};\n      cy.on('mouseover','node',(evt)=>{{ tip.innerHTML = evt.target.data('label') || evt.target.data('id'); tip.style.display='block'; moveTip(evt); }});\n      cy.on('mousemove','node',(evt)=> moveTip(evt));\n      cy.on('mouseout','node',()=> {{ tip.style.display='none'; }});\n\n      // Persist position/color/note\n      cy.on('free', 'node', saveState);\n      cy.on('lock unlock', 'node', saveState);\n\n      // Apply saved state for this genome\n      applyState();\n\n      // Context menu handlers\n      cy.on('cxttapstart', 'node', (evt) => {{\n        ctxNode = evt.target;\n        openCtxAt(evt.renderedPosition);\n      }});\n      cy.on('cxttapstart', (evt) => {{\n        if (evt.target === cy) closeCtx();\n      }});\n      document.addEventListener('click', (e) => {{\n        if (!ctx.contains(e.target)) closeCtx();\n      }});\n      window.addEventListener('resize', closeCtx);\n      document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeCtx(); }});\n    }}\n\n    // UI wiring\n    populateSelect();\n    if (DATA.genomes && DATA.genomes.length>0) renderGenome(0);\n    sel.addEventListener('change', ()=> {{ const idx=parseInt(sel.value,10); if(!Number.isNaN(idx)) renderGenome(idx); }});\n    layoutBtn.addEventListener('click', ()=> {{ if (cy) cy.layout({{name:'cose', animate:true}}).run(); }});\n\n    // Context menu building\n    const PALETTE = ['#0072B2','#D55E00','#009E73','#CC79A7','#F0E442','#56B4E9','#E69F00','#000000','#777777','#999999'];\n    const hiddenColorPicker = document.createElement('input'); hiddenColorPicker.type='color'; hiddenColorPicker.style.display='none'; document.body.appendChild(hiddenColorPicker);\n\n    function openCtxAt(renderedPos) {{\n      if (!ctxNode) return;\n      const rect = cyContainer.getBoundingClientRect();\n      const x = rect.left + renderedPos.x;\n      const y = rect.top + renderedPos.y;\n      ctx.innerHTML = '';\n      const menu = document.createElement('div');\n\n      // Title\n      const title = document.createElement('div');\n      title.className='ctx-item';\n      title.style.cursor='default';\n      title.innerHTML = '<b>Node:</b> ' + (ctxNode.data('label') || ctxNode.id());\n      ctx.appendChild(title);\n\n      // Fix/Unfix\n      const fix = document.createElement('div');\n      fix.className='ctx-item';\n      const locked = ctxNode.locked();\n      fix.textContent = locked ? '位置の固定を解除' : '位置を固定';\n      fix.onclick = () => {{\n        if (ctxNode.locked()) ctxNode.unlock(); else ctxNode.lock();\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(fix);\n\n      // Color row\n      const colorRow = document.createElement('div');\n      colorRow.className='ctx-item';\n      colorRow.innerHTML = '<div class="ctx-row"><span>色を変更</span><span style="font-size:12px;color:var(--muted)">クリックで適用</span></div>';\n      const sw = document.createElement('div'); sw.className='swatches';\n      PALETTE.forEach(c => {{\n        const d = document.createElement('div'); d.className='swatch'; d.style.background=c;\n        d.title = c;\n        d.onclick = () => {{ ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx(); }};\n        sw.appendChild(d);\n      }});\n      // Custom picker\n      const custom = document.createElement('div');\n      custom.className='ctx-item';\n      custom.textContent='カスタムカラー…';\n      custom.onclick = () => {{\n        hiddenColorPicker.value = ctxNode.data('color') || '#999999';\n        hiddenColorPicker.onchange = () => {{\n          const c = hiddenColorPicker.value;\n          ctxNode.data('color', c); ctxNode.style('background-color', c); saveState(); closeCtx();\n        }};\n        hiddenColorPicker.click();\n      }};\n      colorRow.appendChild(sw);\n      ctx.appendChild(colorRow);\n      ctx.appendChild(custom);\n\n      // Note editor\n      const noteBtn = document.createElement('div');\n      noteBtn.className='ctx-item';\n      noteBtn.textContent='注釈を追加/編集…';\n      noteBtn.onclick = () => {{\n        const cur = ctxNode.data('note') || '';\n        const txt = window.prompt('ノードの注釈（空で削除）', cur);\n        if (txt === null) return;\n        const orig = ctxNode.data('orig_label') || ctxNode.data('label') || ctxNode.id();\n        if (txt.trim() === '') {{\n          ctxNode.data('note', null);\n          ctxNode.data('label', orig);\n        }} else {{\n          ctxNode.data('note', txt);\n          ctxNode.data('label', orig + '\\n' + txt);\n        }}\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(noteBtn);\n\n      // Reset color\n      const resetColor = document.createElement('div');\n      resetColor.className='ctx-item';\n      resetColor.textContent='色をリセット';\n      resetColor.onclick = () => {{\n        ctxNode.data('color', null);\n        // Revert to type-based color by removing inline style\n        ctxNode.removeStyle('background-color');\n        saveState(); closeCtx();\n      }};\n      ctx.appendChild(resetColor);\n\n      // Separator\n      const sep = document.createElement('div'); sep.className='ctx-sep'; ctx.appendChild(sep);\n\n      // Save layout now\n      const saveBtn = document.createElement('div');\n      saveBtn.className='ctx-item';\n      saveBtn.textContent='レイアウトを保存';\n      saveBtn.onclick = () => {{ saveState(); closeCtx(); }};\n      ctx.appendChild(saveBtn);\n\n      // Open\n      ctx.style.left = Math.round(x) + 'px';\n      ctx.style.top  = Math.round(y) + 'px';\n      ctx.style.display = 'block';\n    }}\n\n    function closeCtx() {{ ctx.style.display='none'; ctxNode = null; }}\n\n  </script>\n</body>\n</html>"""
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    html = html.replace('</style>', ".build-id{margin:0.4rem 0 0;color:#444;font-size:0.9rem;}</style>", 1)
+    html = html.replace('<h1>{title}</h1>', f"<h1>{title}</h1><p class='build-id'>Build: {build_id}</p>", 1)
     with open(path, 'w', encoding='utf-8') as f:
         f.write(html)
     print('[REPORT]', path)
@@ -6224,7 +6354,18 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--gallery', nargs='*', default=[])
     ap.add_argument('--gallery-analysis-only', action='store_true', help='compose gallery from current run without rerun')
     ap.add_argument('--report', action='store_true')
+    ap.add_argument('--version', action='store_true', help='print build information and exit')
+    ap.add_argument('--sync-spinor-seeds', action='store_true', help='bind spinor evaluator and weaver RNGs to --seed')
     args = ap.parse_args(argv_list)
+    if args.version:
+        info = _resolve_build_info()
+        print(_build_stamp_text())
+        print(f"git hash : {info['hash']}")
+        print(f"timestamp: {info['timestamp']}")
+        return 0
+    print(f"[INFO] {_build_stamp_text()}")
+    global _SPINOR_BOUND_SEED
+    _SPINOR_BOUND_SEED = args.seed if args.sync_spinor_seeds else None
     script_name = os.path.basename(__file__) if '__file__' in globals() else 'spiral_monolith_neat_numpy.py'
     os.makedirs(args.out, exist_ok=True)
     figs: Dict[str, Optional[str]] = {}
@@ -6343,7 +6484,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             plt.title(f'{args.rl_env} | Average Episode Reward')
             plt.legend()
             plt.tight_layout()
-            plt.savefig(rc_png, dpi=150)
+            fig = plt.gcf()
+            _savefig(fig, rc_png, dpi=150)
             plt.close()
             figs['RL 平均エピソード報酬'] = rc_png
             if rl_resilience_log and os.path.exists(rl_resilience_log):
@@ -6417,6 +6559,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                 f.write("<header class='cover'>")
                 f.write('<h1>Spiral Monolith NEAT Report / スパイラル・モノリスNEATレポート</h1>')
                 f.write(f"<p class='meta'>Generated at / 生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Primary Task / 主タスク: {(args.task.upper() if args.task else 'N/A')}</p>")
+                f.write(f"<p class='meta'>Build / ビルド: {_build_stamp_short()}</p>")
                 if args.gallery:
                     f.write("<p class='meta'>Gallery Tasks / ギャラリー対象: " + ', '.join((htmllib.escape(t.upper()) for t in args.gallery)) + '</p>')
                 f.write('<ul>')
@@ -6502,6 +6645,19 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                         f.write(f"<figure><a href='{uri}'>download {htmllib.escape(os.path.basename(p))}</a><figcaption><strong>{escaped_label}</strong></figcaption></figure>")
                 f.write('</body></html>')
             print('[REPORT]', html)
+        manifest_path = os.path.join(args.out, 'artifact_manifest.json')
+        manifest_payload = {
+            'build_id': _build_stamp_short(),
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+            'figures': {k: v for k, v in figs.items()},
+            'report_meta': report_meta,
+        }
+        try:
+            with open(manifest_path, 'w', encoding='utf-8') as mf:
+                json.dump(manifest_payload, mf, indent=2, ensure_ascii=False)
+            print(f'[REPORT] manifest → {manifest_path}')
+        except Exception as manifest_err:
+            print('[WARN] Failed to write artifact manifest:', manifest_err)
     print('[OK] outputs in:', args.out)
     return 0
 try:
@@ -6561,14 +6717,39 @@ def augment_with_spinor(
         parts.append(ge_tiled)
     return (np.concatenate(parts, axis=1).astype(np.float32), p)
 
-def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_std: float=0.07, nomology_intensity: float=0.25, drift_scale: float=0.006, seed: int=0, out_prefix: str='/mnt/data/spinor_neat') -> Dict[str, str]:
+def run_spinor_monolith(
+    gens: int=40,
+    pop: int=80,
+    period_gens: int=36,
+    jitter_std: float=0.07,
+    nomology_intensity: float=0.25,
+    drift_scale: float=0.006,
+    seed: int=0,
+    out_prefix: str='/mnt/data/spinor_neat',
+    spinor_bind_seed: Optional[int]=None,
+) -> Dict[str, str]:
     os.environ['NEAT_EVAL_BACKEND'] = 'thread'
+    global _SPINOR_BOUND_SEED
+    if spinor_bind_seed is None:
+        spinor_bind_seed = _SPINOR_BOUND_SEED
     rng = np.random.default_rng(seed)
     group = SpinorGroupInteraction.dihedral(order=6, seed=seed)
     spin = SpinorScheduler(period_gens=period_gens, jitter_std=jitter_std, seed=seed, group=group)
-    env = NomologyEnv(intensity=nomology_intensity, drift_scale=drift_scale, seed=seed)
+    env = NomologyEnv(
+        intensity=nomology_intensity,
+        drift_scale=drift_scale,
+        seed=seed,
+        noise_weaver_seed=spinor_bind_seed if spinor_bind_seed is not None else None,
+    )
     tel = Telemetry(f'{out_prefix}_telemetry.csv', f'{out_prefix}_regimes.csv')
-    controller = SpinorNomologyDatasetController(spin, env, rng, n_tr=512, n_va=256)
+    controller = SpinorNomologyDatasetController(
+        spin,
+        env,
+        rng,
+        n_tr=512,
+        n_va=256,
+        evaluator_seed=spinor_bind_seed,
+    )
     controller.telemetry = tel
     controller.update_for_generation(0, shmem=False)
     out_dim = 2
@@ -6635,7 +6816,8 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     plt.ylabel('theta mod 4π')
     fig1 = f'{out_prefix}_phase.png'
     plt.tight_layout()
-    plt.savefig(fig1, dpi=160)
+    fig = plt.gcf()
+    _savefig(fig, fig1, dpi=160)
     plt.close()
     plt.figure()
     if g.size:
@@ -6644,7 +6826,8 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     plt.ylabel('parity (2π branch)')
     fig2 = f'{out_prefix}_parity.png'
     plt.tight_layout()
-    plt.savefig(fig2, dpi=160)
+    fig = plt.gcf()
+    _savefig(fig, fig2, dpi=160)
     plt.close()
     plt.figure()
     if g.size:
@@ -6660,7 +6843,8 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     plt.ylabel('theta mod 4π (regimes)')
     fig3 = f'{out_prefix}_regimes.png'
     plt.tight_layout()
-    plt.savefig(fig3, dpi=160)
+    fig = plt.gcf()
+    _savefig(fig, fig3, dpi=160)
     plt.close()
 
     spinor_grid_png: Optional[str] = None
@@ -6727,9 +6911,9 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
                 ax.grid(False)
             for ax in axes_arr[len(snapshots):]:
                 ax.axis('off')
-            plt.tight_layout()
+            fig.tight_layout()
             spinor_grid_png = f'{out_prefix}_spinor_transition_grid.png'
-            plt.savefig(spinor_grid_png, dpi=170)
+            _savefig(fig, spinor_grid_png, dpi=170)
             plt.close(fig)
 
         step = max(1, len(g) // 60)
@@ -6995,6 +7179,7 @@ class NomologyEnv:
     intensity: float = 0.2
     drift_scale: float = 0.004
     seed: Optional[int] = None
+    noise_weaver_seed: Optional[int] = None
     _rng: np.random.Generator = field(init=False, repr=False)
     noise: float = 0.06
     turns: float = 1.6
@@ -7038,7 +7223,8 @@ class NomologyEnv:
         self._rng = np.random.default_rng(self.seed)
         if self.noise_weaver is None:
             try:
-                self.noise_weaver = SpectralNoiseWeaver(palette=self.noise_palette, seed=self.seed)
+                weaver_seed = self.noise_weaver_seed if self.noise_weaver_seed is not None else self.seed
+                self.noise_weaver = SpectralNoiseWeaver(palette=self.noise_palette, seed=weaver_seed)
             except Exception as weaver_err:
                 self._last_weaver_error = f'{type(weaver_err).__name__}: {weaver_err}'
                 self.noise_weaver = None
@@ -7047,6 +7233,12 @@ class NomologyEnv:
                 self.noise_weaver.palette = tuple(self.noise_palette)
             except Exception:
                 pass
+            if self.noise_weaver_seed is not None:
+                try:
+                    self.noise_weaver.seed = self.noise_weaver_seed
+                    self.noise_weaver._rng = np.random.default_rng(self.noise_weaver_seed)
+                except Exception:
+                    pass
         self._noise_counter = 0.0
         self._refresh_noise(surge=True)
 
@@ -7148,6 +7340,7 @@ class SelfReproducingEvaluator:
     base_env: NomologyEnv
     population_size: int = 4
     rng: Optional[np.random.Generator] = None
+    seed: Optional[int] = None
     mutate_weights_prob: float = 0.65
     mutate_connection_prob: float = 0.35
     mutate_node_prob: float = 0.2
@@ -7171,7 +7364,10 @@ class SelfReproducingEvaluator:
     )
 
     def __post_init__(self) -> None:
-        self._rng = self.rng if self.rng is not None else np.random.default_rng()
+        if self.rng is not None:
+            self._rng = self.rng
+        else:
+            self._rng = np.random.default_rng(self.seed)
         bias = self.feature_dim + 1
         outputs = 3
         self._innov = InnovationTracker(next_node_id=bias + outputs)
@@ -7413,7 +7609,7 @@ class Telemetry:
     def __init__(self, tel_csv: str, regime_csv: str) -> None:
         self.tel_csv = tel_csv
         self.reg_csv = regime_csv
-        expected_cols = 26
+        expected_cols = 27
         if os.path.exists(self.tel_csv):
             try:
                 with open(self.tel_csv, 'r', newline='') as f:
@@ -7456,10 +7652,11 @@ class Telemetry:
                     'lazy_stasis',
                     'evaluator_id',
                     'evaluator_note',
+                    'build_id',
                 ])
         if not os.path.exists(self.reg_csv):
             with open(self.reg_csv, 'w', newline='') as f:
-                csv.writer(f).writerow(['gen', 'event', 'regime_id'])
+                csv.writer(f).writerow(['gen', 'event', 'regime_id', 'build_id'])
 
     def log_step(
         self,
@@ -7525,11 +7722,12 @@ class Telemetry:
                 lazy_stasis,
                 eval_id,
                 eval_note,
+                _build_stamp_short(),
             ])
 
     def log_regime(self, gen: int, env: NomologyEnv) -> None:
         with open(self.reg_csv, 'a', newline='') as f:
-            csv.writer(f).writerow([gen, 'switch', env.regime_id])
+            csv.writer(f).writerow([gen, 'switch', env.regime_id, _build_stamp_short()])
 
 class SpinorNomologyDatasetController:
     """Updates shared datasets each generation. Why: make fitness see non-stationary regime."""
@@ -7542,6 +7740,7 @@ class SpinorNomologyDatasetController:
         n_tr: int=512,
         n_va: int=256,
         evaluator: Optional[SelfReproducingEvaluator]=None,
+        evaluator_seed: Optional[int]=None,
     ) -> None:
         self.spin = spin
         self.env = env
@@ -7551,6 +7750,7 @@ class SpinorNomologyDatasetController:
         self.last_gen = None
         self.telemetry: Optional[Telemetry] = None
         self.evaluator = evaluator
+        self.evaluator_seed = evaluator_seed
         embed_dim = self.spin.group.embed_dim if self.spin.group else 0
         self.feature_dim = 5 + embed_dim
         self.evaluator_feature_dim = 8 + embed_dim
@@ -7565,8 +7765,21 @@ class SpinorNomologyDatasetController:
         except Exception:
             pass
         if self.evaluator is None and self.evaluator_feature_dim > 0:
-            eval_rng = np.random.default_rng(int(self.rng.integers(1 << 30)))
-            self.evaluator = SelfReproducingEvaluator(self.evaluator_feature_dim, self.spin, self.env, rng=eval_rng)
+            if evaluator_seed is None:
+                evaluator_seed = int(self.rng.integers(1 << 30))
+            eval_rng = np.random.default_rng(int(evaluator_seed))
+            self.evaluator = SelfReproducingEvaluator(
+                self.evaluator_feature_dim,
+                self.spin,
+                self.env,
+                rng=eval_rng,
+                seed=int(evaluator_seed),
+            )
+        elif self.evaluator is not None and evaluator_seed is not None:
+            try:
+                self.evaluator.seed = int(evaluator_seed)
+            except Exception:
+                pass
 
     def _dataset_core(
         self,
