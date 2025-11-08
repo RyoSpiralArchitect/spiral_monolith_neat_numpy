@@ -426,6 +426,35 @@ class Genome:
         self.max_edges: Optional[int] = None
         self.mutation_will = float(mutation_will) if mutation_will is not None else float(np.random.uniform(0.0, 1.0))
         self.cooperative = bool(cooperative)
+        self.meta_reflections: List[Dict[str, Any]] = []
+        self._meta_revision = 0
+
+    def meta_reflect(self, event: str, payload: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+        info = dict(payload or {})
+        comp_before = self.structural_complexity_stats()
+        info.setdefault('structure_rev', self._structure_rev)
+        info.setdefault('weights_rev', self._weights_rev)
+        info['complexity'] = self._complexity_dict(comp_before)
+        try:
+            info['signature'] = self.structural_signature()
+        except Exception:
+            info['signature'] = None
+        info['event'] = event
+        info['timestamp'] = time.time()
+        self.meta_reflections.append(info)
+        self._meta_revision += 1
+        return info
+
+    @staticmethod
+    def _complexity_dict(stats: Tuple[int, int, float, float, float]) -> Dict[str, float]:
+        hidden, edges, branching, depth_spread, score = stats
+        return {
+            'hidden': int(hidden),
+            'edges': int(edges),
+            'branching': float(branching),
+            'depth_spread': float(depth_spread),
+            'score': float(score),
+        }
 
     def copy(self):
         nodes = {
@@ -469,6 +498,9 @@ class Genome:
         self._compiled_cache_rev = (-1, -1)
         self._compat_token = None
         self._compat_token_rev = (-1, -1)
+
+    def _invalidate_cache(self):
+        self.invalidate_caches(structure=True)
 
     def enabled_connections(self):
         return [c for c in self.connections.values() if c.enabled]
@@ -685,6 +717,7 @@ class Genome:
             if len(hidden_ids) >= int(self.max_hidden_nodes):
                 return False
         template_id = int(rng.choice(hidden_ids))
+        baseline = self.structural_complexity_stats()
         incoming = [c for c in self.connections.values() if c.enabled and c.out_node == template_id]
         outgoing = [c for c in self.connections.values() if c.enabled and c.in_node == template_id]
         if not incoming and not outgoing:
@@ -737,29 +770,52 @@ class Genome:
                     self.connections[bridge_inn] = ConnectionGene(template_id, new_node_id, bridge_w, True, bridge_inn)
                 except Exception:
                     pass
+        self.invalidate_caches(structure=True)
+        after = self.structural_complexity_stats()
+        payload = {
+            'template': template_id,
+            'new_node': new_node_id,
+            'before': self._complexity_dict(baseline),
+            'after': self._complexity_dict(after),
+            'delta_score': float(after[-1] - baseline[-1]),
+        }
+        self.meta_reflect('duplicate_node', payload)
         return True
 
     def mutate_weights(self, rng: np.random.Generator, perturb_chance=0.9, sigma=0.8, reset_range=2.0):
+        before = {inn: c.weight for inn, c in self.connections.items()}
         for c in self.connections.values():
             if rng.random() < perturb_chance:
                 c.weight += float(rng.normal(0, sigma))
             else:
                 c.weight = float(rng.uniform(-reset_range, reset_range))
         self.invalidate_caches(weights=True)
+        deltas = [abs(self.connections[inn].weight - w) for inn, w in before.items()]
+        payload = {
+            'mean_abs_delta': float(np.mean(deltas)) if deltas else 0.0,
+            'max_abs_delta': float(np.max(deltas)) if deltas else 0.0,
+            'changed': len(deltas),
+        }
+        self.meta_reflect('mutate_weights', payload)
 
     def mutate_toggle_enable(self, rng: np.random.Generator, prob=0.01):
         changed = False
+        toggled = 0
         for c in self.connections.values():
             if rng.random() >= prob:
                 continue
             if c.enabled:
                 c.enabled = False
                 changed = True
+                toggled += 1
             elif not self._creates_cycle(c.in_node, c.out_node):
                 c.enabled = True
                 changed = True
+                toggled += 1
         if changed:
             self.invalidate_caches(structure=True)
+            payload = {'toggled': toggled, 'prob': prob}
+            self.meta_reflect('toggle_enable', payload)
 
     def _choose_conn_for_node_add(self, rng: np.random.Generator, bias: str):
         enabled = [c for c in self.connections.values() if c.enabled]
@@ -788,6 +844,7 @@ class Genome:
             if sum((1 for c in self.connections.values() if c.enabled)) >= int(self.max_edges):
                 return False
         node_ids = list(self.nodes.keys())
+        baseline = self.structural_complexity_stats()
         for _ in range(tries):
             in_id = int(rng.choice(node_ids))
             out_id = int(rng.choice(node_ids))
@@ -807,6 +864,16 @@ class Genome:
             inn = innov.get_conn_innovation(in_id, out_id)
             self.connections[inn] = ConnectionGene(in_id, out_id, w, True, inn)
             self._invalidate_cache()
+            after = self.structural_complexity_stats()
+            payload = {
+                'in': in_id,
+                'out': out_id,
+                'weight': w,
+                'before': self._complexity_dict(baseline),
+                'after': self._complexity_dict(after),
+                'delta_score': float(after[-1] - baseline[-1]),
+            }
+            self.meta_reflect('add_connection', payload)
             return True
         return False
 
@@ -820,6 +887,8 @@ class Genome:
         c = chosen
         if not c.enabled:
             return False
+        baseline = self.structural_complexity_stats()
+        split_edge = (c.in_node, c.out_node)
         c.enabled = False
         new_nid = innov.get_or_create_split_node(c.in_node, c.out_node)
         if new_nid not in self.nodes:
@@ -837,6 +906,15 @@ class Genome:
         self.connections[inn1] = ConnectionGene(c.in_node, new_nid, 1.0, True, inn1)
         self.connections[inn2] = ConnectionGene(new_nid, c.out_node, c.weight, True, inn2)
         self.invalidate_caches(structure=True)
+        after = self.structural_complexity_stats()
+        payload = {
+            'new_node': new_nid,
+            'split_edge': split_edge,
+            'before': self._complexity_dict(baseline),
+            'after': self._complexity_dict(after),
+            'delta_score': float(after[-1] - baseline[-1]),
+        }
+        self.meta_reflect('add_node', payload)
         return True
 
     def mutate_sex(self, rng: np.random.Generator):
@@ -2267,6 +2345,7 @@ class ReproPlanaNEATPlus:
         self.edge_counts_history = []
         self.best_ids = []
         self.lineage_edges = []
+        self.lineage_annotations: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
         self.env_history = []
         self.snapshots_genomes: List[Genome] = []
         self.snapshots_scars: List[Dict[int, 'Scar']] = []
@@ -2301,6 +2380,14 @@ class ReproPlanaNEATPlus:
             penalty = max(0.0, self.penalty_far * (d - self.distance_cutoff) / self.distance_cutoff)
             peak *= 1.0 - min(0.9, penalty)
         return float(peak)
+
+    def _note_lineage(self, gid: int, gen: int, summary: str) -> None:
+        if not summary:
+            return
+        notes = self.lineage_annotations.setdefault(gid, [])
+        notes.append((gen, summary))
+        if len(notes) > 6:
+            self.lineage_annotations[gid] = notes[-6:]
 
     def _compat_distance(self, g1: Genome, g2: Genome) -> float:
         try:
@@ -2709,13 +2796,22 @@ class ReproPlanaNEATPlus:
             if monitor is not None and parent_adj_before_regen is not None:
                 regen_adj = child.weighted_adjacency()
                 changed_nodes, changed_edges = summarize_graph_changes(parent_adj_before_regen, regen_adj, weight_tol)
-                monitor.log_step(parent_adj_before_regen, regen_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_regen', changed_edges=changed_edges)
+                rows_regen = monitor.log_step(parent_adj_before_regen, regen_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_regen', changed_edges=changed_edges)
+                regen_summary = _summarize_lineage_rows(rows_regen)
+                if regen_summary:
+                    self._note_lineage(child.id, child.birth_gen, regen_summary)
             pre_adj = child.weighted_adjacency() if monitor is not None else None
             self._mutate(child, context='regen' if mode == 'asexual_regen' else None)
             if monitor is not None and pre_adj is not None:
                 post_adj = child.weighted_adjacency()
                 changed_nodes, changed_edges = summarize_graph_changes(pre_adj, post_adj, weight_tol)
-                monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_{mode}', changed_edges=changed_edges)
+                rows_mut = monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_{mode}', changed_edges=changed_edges)
+                summary = _summarize_lineage_rows(rows_mut)
+                summary = _merge_meta_summary(child, summary)
+                self._note_lineage(child.id, child.birth_gen, summary)
+            elif monitor is None:
+                summary = _merge_meta_summary(child, '')
+                self._note_lineage(child.id, child.birth_gen, summary)
             if mode is None:
                 mode = 'asexual_clone'
             new_pop.append(child)
@@ -2770,7 +2866,13 @@ class ReproPlanaNEATPlus:
                 if monitor is not None and pre_adj is not None:
                     post_adj = child.weighted_adjacency()
                     changed_nodes, changed_edges = summarize_graph_changes(pre_adj, post_adj, weight_tol)
-                    monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_asexual_clone', changed_edges=changed_edges)
+                    rows_clone = monitor.log_step(pre_adj, post_adj, changed_nodes, child.id, self.generation + 1, f'{child.id}_asexual_clone', changed_edges=changed_edges)
+                    summary = _summarize_lineage_rows(rows_clone)
+                    summary = _merge_meta_summary(child, summary)
+                    self._note_lineage(child.id, child.birth_gen, summary)
+                elif monitor is None:
+                    summary = _merge_meta_summary(child, '')
+                    self._note_lineage(child.id, child.birth_gen, summary)
                 new_pop.append(child)
                 gen_events['asexual_clone'] += 1
         elif len(new_pop) > self.pop_size:
@@ -4178,6 +4280,47 @@ def _fallback_lineage_layout(nodes: List[int], gen_map: Dict[int, int]):
             pos[n] = (0.5, 0.5)
     return pos
 
+def _summarize_lineage_rows(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return ''
+    parts: List[str] = []
+    changed_nodes = rows[0].get('changed_nodes', 0)
+    changed_edges = rows[0].get('changed_edges', 0)
+    if changed_nodes:
+        parts.append(f'ΔN={changed_nodes}')
+    if changed_edges:
+        parts.append(f'ΔE={changed_edges}')
+    delta_paths = sum(int(row.get('delta_paths', 0) or 0) for row in rows)
+    if delta_paths:
+        parts.append(f'ΔP={delta_paths:+d}')
+    detours = [float(row['detour']) for row in rows if isinstance(row.get('detour'), (int, float))]
+    if detours:
+        parts.append(f'↺{float(np.mean(detours)):+.2f}')
+    if any(int(row.get('heal_flag', 0)) for row in rows):
+        parts.append('heal')
+    return ' '.join(parts)
+
+def _merge_meta_summary(genome: Genome, summary: str='') -> str:
+    latest = None
+    meta = getattr(genome, 'meta_reflections', None)
+    if meta:
+        latest = meta[-1]
+    if not latest:
+        return summary
+    event = latest.get('event', '')
+    delta = latest.get('delta_score')
+    if event == 'mutate_weights':
+        mean_delta = latest.get('mean_abs_delta')
+        desc = f'{event}' + (f' μΔw={mean_delta:.3f}' if isinstance(mean_delta, (int, float)) else '')
+    else:
+        if isinstance(delta, (int, float)):
+            desc = f'{event} ΔC={delta:+.2f}'
+        else:
+            desc = event
+    if summary and desc:
+        return f'{summary} || {desc}'
+    return desc or summary
+
 def render_lineage(neat, path='lineage.png', title='Lineage', max_edges: Optional[int]=10000, highlight: Optional[Iterable[int]]=None, dpi=200):
     edges = getattr(neat, 'lineage_edges', None)
     if not edges:
@@ -4264,6 +4407,17 @@ def render_lineage(neat, path='lineage.png', title='Lineage', max_edges: Optiona
     if len(nodes) <= 1200:
         for nid, (x, y) in pos.items():
             ax.text(x, y + 0.02, str(nid), fontsize=6, ha='center', va='bottom', alpha=0.9)
+    annotations: Dict[int, List[Tuple[int, str]]] = getattr(neat, 'lineage_annotations', {}) or {}
+    if annotations:
+        for nid, (x, y) in pos.items():
+            notes = annotations.get(nid)
+            if not notes:
+                continue
+            snippet = notes[-3:]
+            text = '\n'.join(f'g{gen}: {msg}' for gen, msg in snippet if msg)
+            if not text:
+                continue
+            ax.text(x + 0.012, y - 0.05, text, fontsize=5.5, ha='left', va='top', alpha=0.85, family='monospace')
     fig.tight_layout()
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
@@ -6087,7 +6241,7 @@ _SHM_META = {}
 _SHM_CACHE = {}
 _SHM_HANDLES = {}
 STRUCTURAL_EPS = 1e-09
-__all__ = ['NodeGene', 'ConnectionGene', 'InnovationTracker', 'Genome', 'compatibility_distance', 'HouseholdManager', 'EvalMode', 'ReproPlanaNEATPlus', 'compile_genome', 'forward_batch', 'train_with_backprop_numpy', 'predict', 'predict_proba', 'fitness_backprop_classifier', 'make_circles', 'make_xor', 'make_spirals', 'draw_genome_png', 'export_regen_gif', 'export_morph_gif', 'export_double_exposure', 'plot_learning_and_complexity', 'plot_decision_boundary', 'export_backprop_variation', 'export_decision_boundaries_all', 'render_lineage', 'export_scars_spiral_map', 'output_dim_from_space', 'build_action_mapper', 'eval_with_node_activations', 'run_policy_in_env', 'run_gym_neat_experiment', 'LCSMonitor', 'summarize_graph_changes', 'load_lcs_log', 'export_lcs_ribbon_png', 'export_lcs_timeline_gif', 'PerSampleSequenceStopperPro']
+__all__ = ['NodeGene', 'ConnectionGene', 'InnovationTracker', 'Genome', 'compatibility_distance', 'HouseholdManager', 'EvalMode', 'ReproPlanaNEATPlus', 'SpinorGroupInteraction', 'SpinorScheduler', 'NomologyEnv', 'SelfReproducingEvaluator', 'SpinorNomologyDatasetController', 'SpinorNomologyFitness', 'compile_genome', 'forward_batch', 'train_with_backprop_numpy', 'predict', 'predict_proba', 'fitness_backprop_classifier', 'make_circles', 'make_xor', 'make_spirals', 'draw_genome_png', 'export_regen_gif', 'export_morph_gif', 'export_double_exposure', 'plot_learning_and_complexity', 'plot_decision_boundary', 'export_backprop_variation', 'export_decision_boundaries_all', 'render_lineage', 'export_scars_spiral_map', 'output_dim_from_space', 'build_action_mapper', 'eval_with_node_activations', 'run_policy_in_env', 'run_gym_neat_experiment', 'LCSMonitor', 'summarize_graph_changes', 'load_lcs_log', 'export_lcs_ribbon_png', 'export_lcs_timeline_gif', 'PerSampleSequenceStopperPro']
 INF = 10 ** 12
 PATCHED_PATH = __file__
 spec = None
@@ -6099,27 +6253,38 @@ def rotate_2d(x: np.ndarray, theta: float) -> np.ndarray:
     R = np.array([[c, -s], [s, c]], dtype=np.float32)
     return (R @ x.T).T
 
-def augment_with_spinor(X: np.ndarray, theta: float) -> Tuple[np.ndarray, int]:
+def augment_with_spinor(
+    X: np.ndarray,
+    theta: float,
+    parity: Optional[int]=None,
+    group_embed: Optional[np.ndarray]=None,
+) -> Tuple[np.ndarray, int]:
     s = SpinorScheduler.spinor_vec(theta)
-    p = SpinorScheduler.parity(theta)
+    p = SpinorScheduler.parity(theta) if parity is None else int(parity)
     s_tiled = np.tile(s.reshape(1, 2), (X.shape[0], 1))
     p_col = np.full((X.shape[0], 1), float(p), dtype=np.float32)
-    return (np.concatenate([X, s_tiled, p_col], axis=1).astype(np.float32), p)
+    parts = [X, s_tiled, p_col]
+    if group_embed is not None:
+        ge = np.asarray(group_embed, dtype=np.float32).reshape(1, -1)
+        ge_tiled = np.tile(ge, (X.shape[0], 1))
+        parts.append(ge_tiled)
+    return (np.concatenate(parts, axis=1).astype(np.float32), p)
 
 def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_std: float=0.07, nomology_intensity: float=0.25, drift_scale: float=0.006, seed: int=0, out_prefix: str='/mnt/data/spinor_neat') -> Dict[str, str]:
     os.environ['NEAT_EVAL_BACKEND'] = 'thread'
     rng = np.random.default_rng(seed)
-    spin = SpinorScheduler(period_gens=period_gens, jitter_std=jitter_std, seed=seed)
+    group = SpinorGroupInteraction.dihedral(order=6, seed=seed)
+    spin = SpinorScheduler(period_gens=period_gens, jitter_std=jitter_std, seed=seed, group=group)
     env = NomologyEnv(intensity=nomology_intensity, drift_scale=drift_scale, seed=seed)
     tel = Telemetry(f'{out_prefix}_telemetry.csv', f'{out_prefix}_regimes.csv')
-    out_dim = 2
-    neat_inst = neat.ReproPlanaNEATPlus(num_inputs=5, num_outputs=out_dim, population_size=pop, output_activation='identity', rng=rng)
-    neat._apply_stable_neat_defaults(neat_inst)
-    neat_inst.max_hidden_nodes = max(getattr(neat_inst, 'max_hidden_nodes', 128), 192)
-    neat_inst.max_edges = max(getattr(neat_inst, 'max_edges', 1024), 2048)
     controller = SpinorNomologyDatasetController(spin, env, rng, n_tr=512, n_va=256)
     controller.telemetry = tel
     controller.update_for_generation(0, shmem=False)
+    out_dim = 2
+    neat_inst = neat.ReproPlanaNEATPlus(num_inputs=controller.feature_dim, num_outputs=out_dim, population_size=pop, output_activation='identity', rng=rng)
+    neat._apply_stable_neat_defaults(neat_inst)
+    neat_inst.max_hidden_nodes = max(getattr(neat_inst, 'max_hidden_nodes', 128), 192)
+    neat_inst.max_edges = max(getattr(neat_inst, 'max_edges', 1024), 2048)
     fit = SpinorNomologyFitness(controller=controller, get_generation=lambda: neat_inst.generation, steps=40, lr=0.005, l2=0.0001, alpha_nodes=0.001, alpha_edges=0.0005)
     hist = neat_inst.evolve(fit, n_generations=gens, target_fitness=None, verbose=True, env_schedule=None)
     resilience_log = None
@@ -6155,6 +6320,9 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
                 out.append(0)
         return np.array(out, dtype=np.int32)
 
+    def _str_col(rows: List[Dict[str, str]], key: str) -> List[str]:
+        return [str(row.get(key, '')) for row in rows]
+
     g = _int_col(tele_rows, 'gen') if tele_rows else np.array([], dtype=np.int32)
     theta4 = _float_col(tele_rows, 'theta_mod_4pi') if tele_rows else np.array([], dtype=np.float64)
     parity = _int_col(tele_rows, 'parity') if tele_rows else np.array([], dtype=np.int32)
@@ -6163,6 +6331,10 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     turns_seq = _float_col(tele_rows, 'turns') if tele_rows else np.array([], dtype=np.float64)
     rot_bias_seq = _float_col(tele_rows, 'rot_bias') if tele_rows else np.array([], dtype=np.float64)
     regime_ids = _int_col(tele_rows, 'regime_id') if tele_rows else np.array([], dtype=np.int32)
+    group_idx_seq = _int_col(tele_rows, 'group_idx') if tele_rows else np.array([], dtype=np.int32)
+    group_energy_seq = _float_col(tele_rows, 'group_energy') if tele_rows else np.array([], dtype=np.float64)
+    group_label_seq = np.array(_str_col(tele_rows, 'group_label')) if tele_rows else np.array([], dtype=object)
+    evaluator_notes = _str_col(tele_rows, 'evaluator_note') if tele_rows else []
 
     plt.figure()
     if g.size:
@@ -6246,7 +6418,14 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
             for ax, idx in zip(axes_arr, snapshots):
                 X_vis, y_vis = _synth_snapshot(idx)
                 ax.scatter(X_vis[:, 0], X_vis[:, 1], c=y_vis, cmap='coolwarm', s=12, alpha=0.7, edgecolors='none')
-                ax.set_title(f'gen {int(g[idx])} | regime {int(regime_ids[idx])} | parity {int(parity[idx])}')
+                grp_label = group_label_seq[idx] if group_label_seq.size else ''
+                note = evaluator_notes[idx] if idx < len(evaluator_notes) else ''
+                title = f'gen {int(g[idx])} | regime {int(regime_ids[idx])} | parity {int(parity[idx])}'
+                if grp_label:
+                    title += f' | {grp_label}'
+                if note:
+                    title += f' | {note}'
+                ax.set_title(title)
                 ax.add_patch(FancyArrowPatch((0.0, 0.0), (math.cos(theta_raw[idx] + rot_bias_seq[idx]), math.sin(theta_raw[idx] + rot_bias_seq[idx])), arrowstyle='->', mutation_scale=12, lw=1.5, color='#444444'))
                 ax.set_xlim(-1.6, 1.6)
                 ax.set_ylim(-1.6, 1.6)
@@ -6288,8 +6467,18 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
             ax_spin.axis('off')
             theta_deg = (float(theta_raw[idx]) % (2.0 * math.pi)) * 180.0 / math.pi
             ax_spin.set_title('spinor orientation')
-            ax_spin.text(0.0, -1.15, f'θ={theta_deg:5.1f}° | parity {int(parity[idx])}', ha='center', va='top', fontsize=10)
-            fig.suptitle('Spinor-fractal transition overview', fontsize=12)
+            grp_label = group_label_seq[idx] if group_label_seq.size else ''
+            energy = group_energy_seq[idx] if group_energy_seq.size else 0.0
+            summary_line = f'θ={theta_deg:5.1f}° | parity {int(parity[idx])}'
+            if grp_label:
+                summary_line += f' | {grp_label}'
+            summary_line += f' | energy {energy:0.2f}'
+            ax_spin.text(0.0, -1.15, summary_line, ha='center', va='top', fontsize=10)
+            note = evaluator_notes[idx] if idx < len(evaluator_notes) else ''
+            title = 'Spinor-fractal transition overview'
+            if note:
+                title += f' ← {note}'
+            fig.suptitle(title, fontsize=12)
             fig.tight_layout()
             fig.canvas.draw()
             w, h = fig.canvas.get_width_height()
@@ -6315,20 +6504,141 @@ def run_spinor_monolith(gens: int=40, pop: int=80, period_gens: int=36, jitter_s
     return artifacts
 
 @dataclass
-class SpinorScheduler:
-    period_gens: int = 40
-    jitter_std: float = 0.06
+class SpinorGroupInteraction:
+    name: str
+    elements: np.ndarray
+    cayley: np.ndarray
+    generator_weights: Optional[np.ndarray] = None
+    jitter: float = 0.0
     seed: Optional[int] = None
-    base_phase: float = 0.0
     _rng: np.random.Generator = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        elems = np.asarray(self.elements, dtype=np.float32)
+        if elems.ndim != 3 or elems.shape[1:] != (2, 2):
+            raise ValueError('SpinorGroupInteraction.elements must be (k, 2, 2).')
+        cayley = np.asarray(self.cayley, dtype=np.int64)
+        if cayley.shape != (elems.shape[0], elems.shape[0]):
+            raise ValueError('SpinorGroupInteraction.cayley must be square with size equal to number of elements.')
+        self.elements = elems
+        self.cayley = cayley
+        n = elems.shape[0]
+        if self.generator_weights is not None:
+            weights = np.asarray(self.generator_weights, dtype=np.float64)
+            if weights.ndim != 1 or weights.size != n:
+                raise ValueError('generator_weights must be 1D with same length as elements.')
+            weights = np.maximum(1e-09, weights)
+            self.generator_weights = weights / weights.sum()
+        else:
+            self.generator_weights = np.full(n, 1.0 / n, dtype=np.float64)
         self._rng = np.random.default_rng(self.seed)
+
+    @property
+    def size(self) -> int:
+        return int(self.elements.shape[0])
+
+    @property
+    def embed_dim(self) -> int:
+        return 4
+
+    def matrix(self, idx: int) -> np.ndarray:
+        return self.elements[int(idx)]
+
+    def embed(self, idx: int) -> np.ndarray:
+        mat = self.matrix(idx)
+        return mat.reshape(-1).astype(np.float32)
+
+    def describe(self, idx: Optional[int]) -> str:
+        if idx is None:
+            return 'identity'
+        return f'{self.name}[{int(idx)}]'
+
+    def step(self, state: int) -> int:
+        gen_idx = int(self._rng.choice(self.size, p=self.generator_weights))
+        next_state = int(self.cayley[state, gen_idx])
+        if self.jitter > 0.0:
+            noise = float(self._rng.normal(0.0, self.jitter))
+            if abs(noise) > 0.5:
+                next_state = int(self.cayley[next_state, gen_idx])
+        return int(next_state % self.size)
+
+    @classmethod
+    def dihedral(cls, order: int=4, twist: float=0.0, seed: Optional[int]=None) -> 'SpinorGroupInteraction':
+        if order <= 0:
+            raise ValueError('order must be positive for dihedral group.')
+        rotations = []
+        for k in range(order):
+            ang = 2.0 * math.pi * k / order
+            c = math.cos(ang)
+            s = math.sin(ang)
+            rotations.append(np.array([[c, -s], [s, c]], dtype=np.float32))
+        reflections = []
+        for k in range(order):
+            ang = math.pi * k / order + twist
+            c = math.cos(ang)
+            s = math.sin(ang)
+            reflections.append(np.array([[c, s], [s, -c]], dtype=np.float32))
+        elems = np.stack(rotations + reflections, axis=0)
+        n = elems.shape[0]
+        cayley = np.zeros((n, n), dtype=np.int64)
+        for i in range(n):
+            for j in range(n):
+                mat = elems[i] @ elems[j]
+                diff = np.linalg.norm(elems - mat, axis=(1, 2))
+                idx = int(np.argmin(diff))
+                cayley[i, j] = idx
+        weights = np.ones(n, dtype=np.float64)
+        weights[:order] = 2.0
+        weights[order:] = 1.0
+        return cls(name=f'D_{order}', elements=elems, cayley=cayley, generator_weights=weights, seed=seed)
+
+@dataclass
+class SpinorScheduler:
+    period_gens: int = 48
+    jitter_std: float = 0.06
+    seed: Optional[int] = None
+    base_phase: float = 0.0
+    group: Optional[SpinorGroupInteraction] = None
+    _rng: np.random.Generator = field(init=False, repr=False)
+    _group_states: Dict[int, int] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._rng = np.random.default_rng(self.seed)
+        if self.group is not None and not isinstance(self.group, SpinorGroupInteraction):
+            raise TypeError('SpinorScheduler.group must be SpinorGroupInteraction or None.')
 
     def phase(self, gen: int) -> float:
         omega = 4.0 * math.pi / float(max(1, self.period_gens))
         jitter = float(self._rng.normal(0.0, self.jitter_std))
         return self.base_phase + omega * float(gen) + jitter
+
+    def _group_state_for(self, gen: int) -> Tuple[Optional[int], Optional[np.ndarray], Optional[np.ndarray]]:
+        if self.group is None:
+            return (None, None, None)
+        if gen in self._group_states:
+            idx = self._group_states[gen]
+        else:
+            if gen == 0:
+                idx = 0
+            else:
+                prev_idx = self._group_state_for(gen - 1)[0] or 0
+                idx = self.group.step(prev_idx)
+            self._group_states[gen] = idx
+        mat = self.group.matrix(idx)
+        embed = self.group.embed(idx)
+        return (idx, mat, embed)
+
+    def phase_bundle(self, gen: int) -> Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]:
+        theta = self.phase(gen)
+        parity = SpinorScheduler.parity(theta)
+        idx, mat, embed = self._group_state_for(gen)
+        energy = float(np.linalg.norm(mat)) if mat is not None else 0.0
+        return (theta, parity, idx, mat, embed, energy)
+
+    def describe_group(self, idx: Optional[int]) -> str:
+        if self.group is None:
+            return 'singlet'
+        return self.group.describe(idx)
 
     @staticmethod
     def spinor_vec(theta: float) -> np.ndarray:
@@ -6366,6 +6676,143 @@ class NomologyEnv:
         self.rot_bias += float(self._rng.normal(0.0, self.drift_scale))
         self.turns = float(np.clip(self.turns + self._rng.normal(0.0, self.drift_scale), 0.6, 3.2))
 
+@dataclass
+class SelfReproducingEvaluator:
+    feature_dim: int
+    spin: SpinorScheduler
+    base_env: NomologyEnv
+    population_size: int = 4
+    rng: Optional[np.random.Generator] = None
+    mutate_weights_prob: float = 0.65
+    mutate_connection_prob: float = 0.35
+    mutate_node_prob: float = 0.2
+    output_scale: Tuple[float, float, float] = (0.08, 1.0, math.pi / 4.0)
+    _population: List[Genome] = field(default_factory=list, init=False, repr=False)
+    _rng: np.random.Generator = field(init=False, repr=False)
+    _innov: InnovationTracker = field(init=False, repr=False)
+    _next_gid: int = field(init=False, repr=False)
+    last_event: Optional[str] = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        self._rng = self.rng if self.rng is not None else np.random.default_rng()
+        bias = self.feature_dim + 1
+        outputs = 3
+        self._innov = InnovationTracker(next_node_id=bias + outputs)
+        self._next_gid = int(self._rng.integers(1 << 30))
+        if not self._population:
+            for _ in range(self.population_size):
+                self._population.append(self._seed_genome())
+
+    def _seed_genome(self) -> Genome:
+        nodes: Dict[int, NodeGene] = {}
+        for i in range(self.feature_dim):
+            nodes[i] = NodeGene(i, 'input', 'identity')
+        bias_id = self.feature_dim
+        nodes[bias_id] = NodeGene(bias_id, 'bias', 'identity')
+        out_ids = []
+        for j in range(3):
+            nid = self.feature_dim + 1 + j
+            nodes[nid] = NodeGene(nid, 'output', 'tanh')
+            out_ids.append(nid)
+        conns: Dict[int, ConnectionGene] = {}
+        for src in range(self.feature_dim + 1):
+            for dst in out_ids:
+                inn = self._innov.get_conn_innovation(src, dst)
+                weight = float(self._rng.normal(0.0, 0.5))
+                conns[inn] = ConnectionGene(src, dst, weight, True, inn)
+        gid = self._next_gid
+        self._next_gid += 1
+        g = Genome(nodes, conns, gid=gid, birth_gen=0, parents=(None, None), cooperative=True)
+        g.meta_reflect('init_env_genome', {'role': 'environment'})
+        return g
+
+    def _feature_vector(
+        self,
+        bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
+        env: NomologyEnv,
+        generation: int,
+    ) -> np.ndarray:
+        theta, parity, _, _, embed, energy = bundle
+        gen_norm = float((generation % max(1, self.spin.period_gens)) / max(1, self.spin.period_gens))
+        noise_norm = float(np.clip(env.noise / 0.2, 0.0, 1.0))
+        turns_norm = float(np.clip((env.turns - 0.6) / (3.2 - 0.6 + 1e-09), 0.0, 1.0))
+        rot_norm = float((env.rot_bias + math.pi) / (2.0 * math.pi))
+        base = [
+            math.cos(theta),
+            math.sin(theta),
+            float(parity),
+            gen_norm,
+            noise_norm,
+            turns_norm,
+            rot_norm,
+            float(energy / 4.0),
+        ]
+        if embed is not None:
+            base.extend(embed.tolist())
+        vec = np.asarray(base, dtype=np.float32)
+        if vec.size < self.feature_dim:
+            vec = np.pad(vec, (0, self.feature_dim - vec.size))
+        elif vec.size > self.feature_dim:
+            vec = vec[:self.feature_dim]
+        return vec.astype(np.float32)
+
+    def _mutate_child(self, parent: Genome, bundle, features: np.ndarray, outputs: np.ndarray, generation: int) -> str:
+        child = parent.copy()
+        changed = False
+        if self._rng.random() < self.mutate_weights_prob:
+            child.mutate_weights(self._rng)
+            changed = True
+        if self._rng.random() < self.mutate_connection_prob:
+            changed = child.mutate_add_connection(self._rng, self._innov) or changed
+        if self._rng.random() < self.mutate_node_prob:
+            changed = child.mutate_add_node(self._rng, self._innov) or changed
+        if not changed:
+            return 'steady-state'
+        child.parents = (parent.id, None)
+        child.id = self._next_gid
+        self._next_gid += 1
+        child.birth_gen = generation + 1
+        child.meta_reflect(
+            'env_self_reproduce',
+            {
+                'features': features.tolist(),
+                'outputs': outputs.tolist(),
+                'generation': generation,
+                'parent': parent.id,
+            },
+        )
+        self._population.insert(0, child)
+        if len(self._population) > self.population_size:
+            self._population.pop()
+        return f'spawned {child.id} ← {parent.id}'
+
+    def step(
+        self,
+        bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
+        env: NomologyEnv,
+        generation: int,
+    ) -> Dict[str, Any]:
+        if not self._population:
+            self._population.append(self._seed_genome())
+        leader = self._population[0]
+        feats = self._feature_vector(bundle, env, generation)
+        compiled = compile_genome(leader)
+        out = forward_batch(compiled, feats.reshape(1, -1))[0]
+        out = np.asarray(out, dtype=np.float32)
+        scale_noise, scale_turns, scale_rot = self.output_scale
+        env.noise = float(np.clip(0.05 + scale_noise * float(out[0]), 0.0, 0.25))
+        env.turns = float(np.clip(1.6 + scale_turns * float(out[1]), 0.6, 3.2))
+        env.rot_bias = float(((env.rot_bias + scale_rot * float(out[2])) + math.pi) % (2.0 * math.pi) - math.pi)
+        summary = self._mutate_child(leader, bundle, feats, out, generation)
+        self.last_event = summary
+        return {'genome_id': leader.id, 'note': summary}
+
+    @property
+    def leader(self) -> Genome:
+        if not self._population:
+            self._population.append(self._seed_genome())
+        return self._population[0]
+
 class Telemetry:
 
     def __init__(self, tel_csv: str, regime_csv: str) -> None:
@@ -6373,16 +6820,61 @@ class Telemetry:
         self.reg_csv = regime_csv
         if not os.path.exists(self.tel_csv):
             with open(self.tel_csv, 'w', newline='') as f:
-                csv.writer(f).writerow(['gen', 'theta', 'theta_mod_2pi', 'theta_mod_4pi', 'parity', 'regime_id', 'noise', 'turns', 'rot_bias'])
+                csv.writer(f).writerow([
+                    'gen',
+                    'theta',
+                    'theta_mod_2pi',
+                    'theta_mod_4pi',
+                    'parity',
+                    'regime_id',
+                    'noise',
+                    'turns',
+                    'rot_bias',
+                    'group_idx',
+                    'group_label',
+                    'group_energy',
+                    'evaluator_id',
+                    'evaluator_note',
+                ])
         if not os.path.exists(self.reg_csv):
             with open(self.reg_csv, 'w', newline='') as f:
                 csv.writer(f).writerow(['gen', 'event', 'regime_id'])
 
-    def log_step(self, gen: int, theta: float, parity: int, env: NomologyEnv) -> None:
+    def log_step(
+        self,
+        gen: int,
+        theta: float,
+        parity: int,
+        env: NomologyEnv,
+        group_idx: Optional[int]=None,
+        group_label: Optional[str]=None,
+        group_energy: float=0.0,
+        evaluator_meta: Optional[Dict[str, Any]]=None,
+    ) -> None:
         t2 = theta % (2.0 * math.pi)
         t4 = theta % (4.0 * math.pi)
+        eval_id = ''
+        eval_note = ''
+        if isinstance(evaluator_meta, dict):
+            eval_id = evaluator_meta.get('genome_id', '')
+            eval_note = evaluator_meta.get('note', '')
         with open(self.tel_csv, 'a', newline='') as f:
-            csv.writer(f).writerow([gen, theta, t2, t4, parity, env.regime_id, env.noise, env.turns, env.rot_bias])
+            csv.writer(f).writerow([
+                gen,
+                theta,
+                t2,
+                t4,
+                parity,
+                env.regime_id,
+                env.noise,
+                env.turns,
+                env.rot_bias,
+                '' if group_idx is None else int(group_idx),
+                group_label or '',
+                float(group_energy),
+                eval_id,
+                eval_note,
+            ])
 
     def log_regime(self, gen: int, env: NomologyEnv) -> None:
         with open(self.reg_csv, 'a', newline='') as f:
@@ -6391,39 +6883,75 @@ class Telemetry:
 class SpinorNomologyDatasetController:
     """Updates shared datasets each generation. Why: make fitness see non-stationary regime."""
 
-    def __init__(self, spin: SpinorScheduler, env: NomologyEnv, rng: np.random.Generator, n_tr: int=512, n_va: int=256) -> None:
+    def __init__(
+        self,
+        spin: SpinorScheduler,
+        env: NomologyEnv,
+        rng: np.random.Generator,
+        n_tr: int=512,
+        n_va: int=256,
+        evaluator: Optional[SelfReproducingEvaluator]=None,
+    ) -> None:
         self.spin = spin
         self.env = env
         self.rng = rng
         self.n_tr = n_tr
         self.n_va = n_va
         self.last_gen = None
+        self.telemetry: Optional[Telemetry] = None
+        self.evaluator = evaluator
+        embed_dim = self.spin.group.embed_dim if self.spin.group else 0
+        self.feature_dim = 5 + embed_dim
+        self.evaluator_feature_dim = 8 + embed_dim
+        if self.evaluator is None and self.evaluator_feature_dim > 0:
+            eval_rng = np.random.default_rng(int(self.rng.integers(1 << 30)))
+            self.evaluator = SelfReproducingEvaluator(self.evaluator_feature_dim, self.spin, self.env, rng=eval_rng)
 
-    def _dataset_core(self, n: int, theta: float) -> Tuple[np.ndarray, np.ndarray]:
+    def _dataset_core(
+        self,
+        n: int,
+        theta: float,
+        parity: int,
+        group_embed: Optional[np.ndarray],
+        group_matrix: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray]:
         X, y = neat.make_spirals(n=n, noise=self.env.noise, turns=self.env.turns, seed=int(self.rng.integers(1 << 31)))
         X = rotate_2d(X, theta + self.env.rot_bias)
-        X_aug, _ = augment_with_spinor(X, theta)
-        return (X_aug, y.astype(np.int64))
+        if group_matrix is not None:
+            X = (group_matrix @ X.T).T
+        X_aug, _ = augment_with_spinor(X, theta, parity=parity, group_embed=group_embed)
+        return (X_aug.astype(np.float32), y.astype(np.int64))
 
     def update_for_generation(self, gen: int, shmem=False) -> None:
         if self.last_gen == gen:
             return
-        theta = self.spin.phase(gen)
+        bundle = self.spin.phase_bundle(gen)
+        theta, parity, group_idx, group_matrix, group_embed, group_energy = bundle
         switched = self.env.maybe_switch()
         if switched:
             self.on_regime_switch(gen)
+        evaluator_meta = None
+        if self.evaluator is not None:
+            evaluator_meta = self.evaluator.step(bundle, self.env, generation=gen)
         self.env.drift()
-        Xtr, ytr = self._dataset_core(self.n_tr, theta)
-        Xva, yva = self._dataset_core(self.n_va, theta)
+        Xtr, ytr = self._dataset_core(self.n_tr, theta, parity, group_embed, group_matrix)
+        Xva, yva = self._dataset_core(self.n_va, theta, parity, group_embed, group_matrix)
         neat._SHM_CACHE['Xtr'] = Xtr
         neat._SHM_CACHE['ytr'] = ytr
         neat._SHM_CACHE['Xva'] = Xva
         neat._SHM_CACHE['yva'] = yva
         self.last_gen = gen
         if self.telemetry is not None:
-            parity = SpinorScheduler.parity(theta)
-            self.telemetry.log_step(gen, theta, parity, self.env)
-    telemetry: Optional[Telemetry] = None
+            self.telemetry.log_step(
+                gen,
+                theta,
+                parity,
+                self.env,
+                group_idx=group_idx,
+                group_label=self.spin.describe_group(group_idx),
+                group_energy=group_energy,
+                evaluator_meta=evaluator_meta,
+            )
     on_regime_switch = lambda self, gen: self.telemetry and self.telemetry.log_regime(gen, self.env)
 
 class SpinorNomologyFitness(neat.FitnessBackpropShared):
