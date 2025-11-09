@@ -229,6 +229,53 @@ def _rl_merge_meta(meta_a: Optional[Dict[str, Any]], meta_b: Optional[Dict[str, 
     return merged
 
 
+def _rl_collective_signal(
+    genome: 'Genome',
+    meta: Dict[str, Any],
+    *,
+    rewards: Optional[Sequence[float]]=None,
+    experiences: Optional[Sequence[Dict[str, Any]]]=None,
+) -> Dict[str, float]:
+    rewards_arr = None
+    if rewards:
+        try:
+            rewards_arr = np.asarray(rewards, dtype=np.float64)
+        except Exception:
+            rewards_arr = None
+    reward_mean = float(np.mean(rewards_arr)) if (rewards_arr is not None and rewards_arr.size) else float(meta.get('reward_ema', 0.0))
+    reward_std = float(np.std(rewards_arr)) if (rewards_arr is not None and rewards_arr.size) else 0.0
+    reward_span = float(np.ptp(rewards_arr)) if (rewards_arr is not None and rewards_arr.size) else 0.0
+    stability = float(np.clip(meta.get('stability', 0.0), 0.0, 1.0))
+    novelty_raw = float(meta.get('novelty_ema', 0.0))
+    novelty_scale = float(np.tanh(novelty_raw / (1.0 + abs(reward_mean) + reward_std + 1e-6)))
+    trend = float(meta.get('trend', 0.0))
+    denom = max(1.0, abs(reward_mean) + reward_std + 1e-6)
+    trend_norm = float(np.tanh(trend / denom))
+    memory_util = float(np.clip(meta.get('memory_util', 0.0), 0.0, 1.0))
+    lazy_strength = float(np.clip(getattr(genome, 'lazy_lineage_strength', 0.0), 0.0, 4.0))
+    lazy_share_base = lazy_strength / (lazy_strength + 1.5) if lazy_strength > 0 else 0.0
+    lazy_share = float(np.clip(0.2 + 0.45 * lazy_share_base + 0.35 * memory_util, 0.0, 1.0))
+    done_ratio = 0.0
+    if experiences:
+        done_flags = [1.0 if bool(exp.get('done')) else 0.0 for exp in experiences]
+        if done_flags:
+            done_ratio = float(sum(done_flags) / len(done_flags))
+    stress_base = 0.35 + 0.45 * (1.0 - stability) + 0.2 * abs(trend_norm) + 0.15 * done_ratio
+    stress = float(np.clip(stress_base, 0.0, 1.0))
+    altruism_target = float(np.clip(0.4 + 0.4 * stability + 0.2 * (1.0 - stress) + 0.15 * novelty_scale, 0.0, 1.0))
+    solidarity = float(np.clip(0.3 + 0.4 * stability + 0.15 * lazy_share + 0.15 * (1.0 - done_ratio), 0.0, 1.0))
+    span_component = float(np.tanh((reward_span + reward_std) / denom))
+    advantage_base = 0.45 + 0.35 * trend_norm + 0.25 * span_component + 0.1 * novelty_scale
+    advantage = float(np.clip(advantage_base, 0.0, 1.0))
+    return {
+        'altruism_target': altruism_target,
+        'solidarity': solidarity,
+        'stress': stress,
+        'lazy_share': lazy_share,
+        'advantage': advantage,
+    }
+
+
 def _structure_cache_key(g: 'Genome', order: Sequence[int]) -> Optional[Tuple[Any, ...]]:
     try:
         signature = g.structural_signature()
@@ -8247,6 +8294,8 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
     buf = getattr(genome, 'rl_memory', None)
     if not isinstance(buf, deque) or buf.maxlen != limit:
         buf = deque(maxlen=limit)
+    meta = _rl_prepare_meta(genome)
+    reward_anchor = float(meta.get('reward_ema', 0.0))
     for exp in experiences:
         try:
             obs = np.asarray(exp.get('obs'), dtype=np.float64).reshape(-1)
@@ -8271,18 +8320,21 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
                 novelty = float(np.linalg.norm(next_obs - obs))
             except Exception:
                 novelty = 0.0
+        reward_val = float(exp.get('reward', 0.0))
+        ret_val = float(exp.get('return', exp.get('reward', 0.0)))
         payload = {
             'obs': obs,
             'action': action,
-            'reward': float(exp.get('reward', 0.0)),
+            'reward': reward_val,
             'next_obs': next_obs,
-            'return': float(exp.get('return', exp.get('reward', 0.0))),
+            'return': ret_val,
             'novelty': float(novelty),
+            'done': bool(exp.get('done', False)),
         }
-        payload['priority'] = float(abs(payload['return']) + 0.1 * abs(payload['reward']) + 0.5 * payload['novelty'])
+        surprise = abs(reward_val - reward_anchor)
+        payload['priority'] = float(abs(ret_val) + 0.1 * abs(reward_val) + 0.5 * payload['novelty'] + 0.3 * surprise)
         buf.append(payload)
     genome.rl_memory = buf
-    meta = _rl_prepare_meta(genome)
     try:
         util = len(buf) / float(buf.maxlen or len(buf) or 1)
     except Exception:
@@ -8349,9 +8401,30 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
     steps = max(1, int(getattr(genome, 'rl_train_steps', 18)))
     sample_floor = max(8, int(steps * (0.6 + 0.6 * (1.0 - stability))))
     sample_size = min(len(items), sample_floor)
-    replace = len(items) < sample_size
-    idxs = np.random.choice(len(items), size=sample_size, replace=replace, p=probs)
-    picked = [items[int(i)] for i in idxs]
+    if sample_size <= 0:
+        return
+    selected: List[int] = []
+    if novelty.size:
+        quota_novel = max(1, sample_size // 3)
+        top_novel = np.argsort(novelty)[-min(len(items), quota_novel):]
+        selected.extend(int(i) for i in top_novel.tolist())
+    if priority.size:
+        quota_priority = max(1, sample_size // 4)
+        top_priority = np.argsort(priority)[-min(len(items), quota_priority):]
+        for idx in top_priority.tolist():
+            if idx not in selected:
+                selected.append(int(idx))
+            if len(selected) >= sample_size:
+                break
+    while len(selected) < sample_size:
+        choice = int(np.random.choice(len(items), p=probs))
+        if choice not in selected:
+            selected.append(choice)
+        elif len(selected) >= len(items):
+            break
+    if len(selected) > sample_size:
+        selected = selected[-sample_size:]
+    picked = [items[int(i)] for i in selected]
     try:
         X = np.stack([p['obs'] for p in picked], axis=0).astype(np.float64)
     except Exception:
@@ -8362,10 +8435,46 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
         return
     steps = int(getattr(genome, 'rl_train_steps', 18))
     l2 = float(getattr(genome, 'rl_l2', 0.0001))
+    batch_returns = [float(p.get('return', p.get('reward', 0.0))) for p in picked]
+    collective_signal = _rl_collective_signal(genome, meta, rewards=batch_returns, experiences=picked)
     try:
-        train_with_backprop_numpy(genome, X, y, steps=steps, lr=float(lr), l2=l2)
+        history = train_with_backprop_numpy(
+            genome,
+            X,
+            y,
+            steps=steps,
+            lr=float(lr),
+            l2=l2,
+            collective_signal=collective_signal,
+        )
     except Exception as err:
         print('[warn] rl replay update skipped:', err)
+        return
+    meta['collective_signal'] = dict(collective_signal)
+    if picked:
+        novelty_mean = float(np.mean([p.get('novelty', 0.0) for p in picked]))
+        priority_mean = float(np.mean([p.get('priority', 0.0) for p in picked]))
+        meta['last_replay'] = {
+            'batch': len(picked),
+            'mean_return': float(np.mean(batch_returns)) if batch_returns else 0.0,
+            'novelty_mean': novelty_mean,
+            'priority_mean': priority_mean,
+        }
+        if history:
+            meta['last_replay']['final_loss'] = float(history[-1])
+    try:
+        genome.meta_reflect(
+            'rl_replay_train',
+            {
+                'batch': len(picked),
+                'lr': float(lr),
+                'entropy': float(entropy),
+                'collective_signal': dict(collective_signal),
+                'mean_return': float(np.mean(batch_returns)) if batch_returns else 0.0,
+            },
+        )
+    except Exception:
+        pass
 
 
 def _rl_update_meta_profile(
@@ -8380,13 +8489,19 @@ def _rl_update_meta_profile(
     if genome is None:
         return
     meta = _rl_prepare_meta(genome)
+    memory_buf = list(getattr(genome, 'rl_memory', []) or [])
+    limit_curr = float(getattr(genome, 'rl_memory_limit', len(memory_buf) or 1))
+    memory_util = float(np.clip(len(memory_buf) / max(1.0, limit_curr), 0.0, 1.0))
     if not rewards:
         meta['entropy_push'] = float(entropy)
         meta['lr_push'] = float(lr)
         meta['gamma_push'] = float(gamma)
+        meta['memory_util'] = memory_util
+        meta['collective_signal'] = _rl_collective_signal(genome, meta, rewards=[], experiences=experiences)
         return
     rewards_arr = np.asarray(rewards, dtype=np.float64)
     avg_reward = float(np.mean(rewards_arr))
+    reward_std = float(np.std(rewards_arr))
     prev_ema = float(meta['reward_ema']) if meta.get('episodes', 0) > 0 else avg_reward
     if meta.get('episodes', 0) <= 0:
         meta['reward_ema'] = avg_reward
@@ -8425,7 +8540,7 @@ def _rl_update_meta_profile(
             meta['novelty_ema'] = float(0.8 * meta.get('novelty_ema', 0.0) + 0.2 * mean_novelty)
     params_before = dict(getattr(genome, 'rl_params', {}) or {})
     stability = float(meta['stability'])
-    denom = max(1.0, abs(prev_ema) + float(np.std(rewards_arr)) + 1e-6)
+    denom = max(1.0, abs(prev_ema) + reward_std + 1e-6)
     norm_delta = float(np.tanh(diff / denom))
     depth_spread = 0.0
     try:
@@ -8434,7 +8549,13 @@ def _rl_update_meta_profile(
         depth_spread = 0.0
     depth_factor = 1.0 + 0.02 * float(depth_spread)
     steps_now = max(1, int(getattr(genome, 'rl_train_steps', 18)))
-    target_steps = int(np.clip(round(steps_now * (1.0 + 0.45 * norm_delta) * depth_factor), 8, 96))
+    target_steps = int(
+        np.clip(
+            round(steps_now * (1.0 + 0.45 * norm_delta) * depth_factor * (0.7 + 0.6 * memory_util)),
+            8,
+            96,
+        )
+    )
     changes: Dict[str, Any] = {}
     if target_steps != steps_now:
         changes['rl_train_steps'] = (steps_now, target_steps)
@@ -8449,21 +8570,33 @@ def _rl_update_meta_profile(
     desired = (_DEFAULT_RL_MEMORY_LIMIT * (0.6 + 0.8 * (1.0 - stability)))
     desired *= (0.7 + 0.6 * will)
     desired *= (1.0 + 0.1 * float(depth_spread))
-    desired = int(np.clip(round(desired), _RL_MEMORY_LIMIT_MIN, _RL_MEMORY_LIMIT_MAX))
-    buf_list = list(getattr(genome, 'rl_memory', []) or [])
+    novelty_metric = float(meta.get('novelty_ema', 0.0))
+    novelty_scale = float(np.tanh(novelty_metric / (abs(meta.get('reward_ema', 0.0)) + reward_std + 1e-6)))
+    novelty_gain = 1.0 + 0.25 * abs(novelty_scale)
+    desired = int(np.clip(round(desired * novelty_gain), _RL_MEMORY_LIMIT_MIN, _RL_MEMORY_LIMIT_MAX))
+    buf_list = memory_buf
     if desired != base_limit:
         trimmed = deque(buf_list[-desired:], maxlen=desired)
         genome.rl_memory_limit = desired
         genome.rl_memory = trimmed
         changes['rl_memory_limit'] = (base_limit, desired)
+        memory_buf = list(trimmed)
     params = getattr(genome, 'rl_params', {}) or {}
     if params:
         entropy_now = float(np.clip(params.get('entropy', entropy), 0.0, 0.5))
         entropy_target = float(np.clip(entropy_now * (1.0 + (1.0 - stability) * 0.4 - 0.25 * norm_delta), 1e-5, 0.5))
+        entropy_target = float(np.clip(entropy_target * (1.0 + 0.3 * (1.0 - abs(novelty_scale))), 1e-5, 0.5))
         lr_now = float(np.clip(params.get('lr', lr), 1e-5, 0.2))
-        lr_target = float(np.clip(lr_now * (1.0 + 0.55 * norm_delta), 1e-5, 0.2))
+        lr_scale = (1.0 + 0.55 * norm_delta) * (0.9 + 0.2 * (1.0 - memory_util))
+        lr_target = float(np.clip(lr_now * lr_scale, 1e-5, 0.2))
         gamma_now = float(np.clip(params.get('gamma', gamma), 0.4, 0.9995))
-        gamma_target = float(np.clip(gamma_now + 0.01 * norm_delta * (0.5 + 0.5 * stability), 0.4, 0.9995))
+        gamma_target = float(
+            np.clip(
+                gamma_now + 0.01 * norm_delta * (0.5 + 0.5 * stability) + 0.02 * novelty_scale,
+                0.4,
+                0.9995,
+            )
+        )
         params.update({'entropy': entropy_target, 'lr': lr_target, 'gamma': gamma_target})
         genome.rl_params = params
         meta['entropy_push'] = entropy_target
@@ -8473,9 +8606,10 @@ def _rl_update_meta_profile(
         meta['entropy_push'] = float(entropy)
         meta['lr_push'] = float(lr)
         meta['gamma_push'] = float(gamma)
-    memory_buf = getattr(genome, 'rl_memory', []) or []
     limit = float(getattr(genome, 'rl_memory_limit', len(memory_buf) or 1))
     meta['memory_util'] = float(np.clip(len(memory_buf) / max(1.0, limit), 0.0, 1.0))
+    signal = _rl_collective_signal(genome, meta, rewards=rewards, experiences=experiences)
+    meta['collective_signal'] = dict(signal)
     if params_before != getattr(genome, 'rl_params', {}) and 'rl_params' not in changes:
         changes['rl_params'] = dict(genome.rl_params)
     if changes:
@@ -8488,6 +8622,7 @@ def _rl_update_meta_profile(
                     'normalized_delta': norm_delta,
                     'stability': stability,
                     'changes': changes,
+                    'collective_signal': signal,
                 },
             )
         except Exception:
