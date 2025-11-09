@@ -2627,6 +2627,27 @@ class ReproPlanaNEATPlus:
         self.complexity_history_limit = 4096
         self._diversity_snapshot: Dict[str, Any] = {}
         self.refine_topk_ratio = float(os.environ.get('NEAT_REFINE_TOPK_RATIO', '0.08'))
+        self.stagnation_window = 6
+        self.stagnation_delta = 1e-3
+        self.stagnation_commission_strength = 0.35
+        self.stagnation_commission_cooldown = 6
+        self.stagnation_elite_bias = 0.65
+        self.stagnation_difficulty_bump = 0.12
+        self.stagnation_flagged_penalty = 0.08
+        self.stagnation_flagged_window = 12
+        self._stagnation_watch: Dict[str, Any] = {
+            'last_ids': tuple(),
+            'count': 0,
+            'last_best': None,
+            'last_avg': None,
+            'cooldown': 0,
+            'interventions': 0,
+            'last_gen': -1,
+        }
+        self._stagnation_elite_freeze = 0
+        self._stagnation_flagged: Dict[int, int] = {}
+        self._stagnation_pending_event: Optional[Dict[str, Any]] = None
+        self.stagnation_commission_history: List[Dict[str, Any]] = []
         nodes = {}
         for i in range(num_inputs):
             nodes[i] = NodeGene(i, 'input', 'identity')
@@ -3063,6 +3084,228 @@ class ReproPlanaNEATPlus:
         if applied:
             setattr(evaluator, 'last_advantage_penalty', True)
 
+        flagged = getattr(self, '_stagnation_flagged', None)
+        if isinstance(flagged, dict) and flagged:
+            penalty_scale = float(np.clip(getattr(self, 'stagnation_flagged_penalty', 0.08), 0.0, 1.0))
+            remove: List[int] = []
+            floor = min(baseline) if baseline else -1.0
+            for gid, expiry in list(flagged.items()):
+                if generation > int(expiry):
+                    remove.append(int(gid))
+                    continue
+                try:
+                    idx = next(i for i, g in enumerate(self.population) if g.id == gid)
+                except StopIteration:
+                    remove.append(int(gid))
+                    continue
+                drop = (abs(baseline[idx]) + abs(floor) + 1.0) * penalty_scale
+                baseline[idx] = float(baseline[idx] - drop)
+                fitnesses[idx] = float(fitnesses[idx] - drop)
+            for gid in remove:
+                flagged.pop(int(gid), None)
+            self._stagnation_flagged = flagged
+
+    def _monitor_top3_stagnation(
+        self,
+        top3_best: Sequence[Tuple['Genome', float, int]],
+        best_fit: float,
+        avg_fit: float,
+        generation: int,
+        fitnesses: List[float],
+        baseline_fitnesses: List[float],
+        context_best: float,
+    ) -> None:
+        watch = getattr(self, '_stagnation_watch', None)
+        if not isinstance(watch, dict):
+            watch = {
+                'last_ids': tuple(),
+                'count': 0,
+                'last_best': None,
+                'last_avg': None,
+                'cooldown': 0,
+                'interventions': 0,
+                'last_gen': -1,
+            }
+            self._stagnation_watch = watch
+        else:
+            try:
+                watch['cooldown'] = max(0, int(watch.get('cooldown', 0)) - 1)
+            except Exception:
+                watch['cooldown'] = 0
+        ids = tuple(int(g.id) for g, _fit, _gen in top3_best[:3])
+        if not ids:
+            watch.update({'last_ids': tuple(), 'count': 0, 'last_best': best_fit, 'last_avg': avg_fit, 'last_gen': int(generation)})
+            return
+        last_ids = tuple(watch.get('last_ids', tuple()))
+        unchanged = ids == last_ids and len(ids) == len(last_ids)
+        last_best = watch.get('last_best')
+        last_avg = watch.get('last_avg')
+        delta_best = best_fit - (last_best if last_best is not None else best_fit)
+        delta_avg = avg_fit - (last_avg if last_avg is not None else avg_fit)
+        delta_mag = max(abs(delta_best), abs(delta_avg))
+        window = max(3, int(getattr(self, 'stagnation_window', 6)))
+        delta_threshold = float(getattr(self, 'stagnation_delta', 1e-3))
+        stagnating = unchanged and delta_mag < delta_threshold
+        diversity = getattr(self, '_diversity_snapshot', {}) or {}
+        top_family_share = 0.0
+        if isinstance(diversity, dict):
+            try:
+                top_family_share = float(diversity.get('top_family_share', 0.0) or 0.0)
+            except Exception:
+                top_family_share = 0.0
+        family_ids: Set[int] = set()
+        for gid in ids:
+            try:
+                member = next(g for g in self.population if g.id == gid)
+            except StopIteration:
+                continue
+            try:
+                family_ids.add(int(getattr(member, 'family_id', gid)))
+            except Exception:
+                family_ids.add(int(gid))
+        lazy_payload = getattr(self, '_lazy_env_feedback', {}) or {}
+        try:
+            stasis_signal = float(np.clip(lazy_payload.get('stasis', 0.0), 0.0, 1.0)) if isinstance(lazy_payload, dict) else 0.0
+        except Exception:
+            stasis_signal = 0.0
+        family_lock = len(family_ids) <= 1 or top_family_share >= 0.5
+        watch['last_ids'] = ids
+        watch['last_best'] = float(best_fit)
+        watch['last_avg'] = float(avg_fit)
+        watch['last_gen'] = int(generation)
+        if stagnating:
+            watch['count'] = int(watch.get('count', 0)) + 1
+        elif unchanged:
+            watch['count'] = 1
+        else:
+            watch['count'] = 0
+        reason_parts: List[str] = []
+        if stagnating:
+            reason_parts.append('delta')
+        if family_lock:
+            reason_parts.append('family')
+        if stasis_signal > 0.35:
+            reason_parts.append('stasis')
+        cooldown = int(watch.get('cooldown', 0))
+        trigger = False
+        if cooldown <= 0:
+            if watch['count'] >= window and stagnating:
+                trigger = True
+            elif family_lock and watch['count'] >= max(2, window // 2):
+                trigger = True
+            elif stasis_signal > 0.55 and watch['count'] >= max(2, window // 2):
+                trigger = True
+        watch['last_reason'] = ','.join(reason_parts) if reason_parts else 'stagnation'
+        if trigger:
+            self._trigger_stagnation_intervention(
+                generation=generation,
+                ids=ids,
+                best_fit=best_fit,
+                avg_fit=avg_fit,
+                fitnesses=fitnesses,
+                baseline_fitnesses=baseline_fitnesses,
+                reason=watch['last_reason'],
+                context=context_best,
+                top_family_share=top_family_share,
+                stasis=stasis_signal,
+            )
+
+    def _trigger_stagnation_intervention(
+        self,
+        generation: int,
+        ids: Sequence[int],
+        best_fit: float,
+        avg_fit: float,
+        fitnesses: List[float],
+        baseline_fitnesses: List[float],
+        reason: str,
+        context: float,
+        top_family_share: float,
+        stasis: float,
+    ) -> None:
+        watch = getattr(self, '_stagnation_watch', None)
+        if isinstance(watch, dict):
+            watch['cooldown'] = int(max(1, getattr(self, 'stagnation_commission_cooldown', 6)))
+            watch['count'] = 0
+            watch['interventions'] = int(watch.get('interventions', 0)) + 1
+        penalty_scale = float(np.clip(getattr(self, 'stagnation_commission_strength', 0.35), 0.05, 2.0))
+        penalty_boost = 1.0 + (watch.get('interventions', 0) if isinstance(watch, dict) else 0) * 0.1
+        penalty_floor = min(baseline_fitnesses) if baseline_fitnesses else -1.0
+        flagged = getattr(self, '_stagnation_flagged', {})
+        expiry = int(generation + max(1, getattr(self, 'stagnation_flagged_window', 12)))
+        for gid in ids:
+            try:
+                idx = next(i for i, g in enumerate(self.population) if g.id == gid)
+            except StopIteration:
+                continue
+            drop = (abs(fitnesses[idx]) + abs(penalty_floor) + 1.0) * penalty_scale * penalty_boost
+            fitnesses[idx] = float(fitnesses[idx] - drop)
+            if idx < len(baseline_fitnesses):
+                baseline_fitnesses[idx] = float(baseline_fitnesses[idx] - drop)
+            genome = self.population[idx]
+            try:
+                strength = float(getattr(genome, 'lazy_lineage_strength', 0.0) or 0.0)
+                setattr(genome, 'lazy_lineage_strength', float(np.clip(strength * 0.35, 0.0, strength)))
+            except Exception:
+                pass
+            genome.cooperative = False
+            try:
+                genome.meta_reflect('stagnation_commission', {
+                    'generation': int(generation),
+                    'reason': reason,
+                    'penalty': float(drop),
+                })
+            except Exception:
+                pass
+            self._note_lineage(genome.id, generation, f'stagnation_commission {reason} Δ{drop:.3f}')
+            flagged[int(gid)] = expiry
+        self._stagnation_flagged = flagged
+        freeze = int(max(1, getattr(self, 'stagnation_commission_cooldown', 6)))
+        self._stagnation_elite_freeze = max(int(getattr(self, '_stagnation_elite_freeze', 0)), freeze)
+        try:
+            diff_prev = float(self.env.get('difficulty', 0.0))
+            self.env['difficulty'] = float(np.clip(diff_prev + getattr(self, 'stagnation_difficulty_bump', 0.12), 0.0, 5.0))
+            noise_prev = float(self.env.get('noise_std', 0.0))
+            self.env['noise_std'] = float(np.clip(noise_prev * (1.0 + 0.4 * penalty_scale) + 0.01, 0.0, 2.5))
+            focus_prev = float(self.env.get('noise_focus', 0.0) or 0.0)
+            entropy_prev = float(self.env.get('noise_entropy', 0.0) or 0.0)
+            self.env['noise_focus'] = float(np.clip(focus_prev * 0.6 + 0.4, 0.0, 2.0))
+            self.env['noise_entropy'] = float(np.clip(entropy_prev * 0.5 + 0.5, 0.0, 2.5))
+            self.env['stagnation_commission_gen'] = int(generation)
+            self.env['stagnation_commission_reason'] = reason
+        except Exception:
+            pass
+        controller = getattr(self, 'spinor_controller', None)
+        fft_payload = None
+        if controller is not None:
+            env_obj = getattr(controller, 'env', None)
+            if env_obj is not None and hasattr(env_obj, 'trigger_fft_spike'):
+                try:
+                    fft_payload = env_obj.trigger_fft_spike(
+                        strength=float(1.0 + penalty_scale),
+                        bands=None,
+                        reason=f'stagnation@{generation}',
+                    )
+                except Exception as fft_err:
+                    fft_payload = {'error': repr(fft_err)}
+        snapshot = getattr(self, '_diversity_snapshot', None)
+        if isinstance(snapshot, dict):
+            snapshot['stagnation_commission'] = int(generation)
+            snapshot['stagnation_reason'] = reason
+            snapshot['stagnation_top_share'] = float(top_family_share)
+        record = {
+            'gen': int(generation),
+            'ids': tuple(int(g) for g in ids),
+            'reason': reason,
+            'penalty_scale': float(penalty_scale),
+            'context': float(context),
+            'top_family_share': float(top_family_share),
+            'stasis': float(stasis),
+            'fft': fft_payload,
+        }
+        self.stagnation_commission_history.append(record)
+        self._stagnation_pending_event = {'generation': int(generation), **record}
+
     def _update_collective_signal(
         self,
         diversity_entropy: float,
@@ -3380,7 +3623,8 @@ class ReproPlanaNEATPlus:
         new_pop = []
         events = {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0, 'asexual_clone': 0}
         sp.sort()
-        elites = [g for g, _ in sp.members[:min(self.elitism, offspring_counts[sidx])]]
+        effective_elitism = max(0, int(getattr(self, '_elitism_effective', self.elitism)))
+        elites = [g for g, _ in sp.members[:min(effective_elitism, offspring_counts[sidx])]]
         for e in elites:
             child = e.copy()
             child.cooperative = True
@@ -3572,6 +3816,13 @@ class ReproPlanaNEATPlus:
         return (new_pop, events)
 
     def reproduce(self, species, fitnesses):
+        freeze = int(getattr(self, '_stagnation_elite_freeze', 0))
+        effective_elitism = int(self.elitism)
+        if freeze > 0:
+            bias = float(np.clip(getattr(self, 'stagnation_elite_bias', 0.65), 0.0, 0.95))
+            effective_elitism = max(0, int(round(self.elitism * (1.0 - bias))))
+            self._stagnation_elite_freeze = freeze - 1
+        self._elitism_effective = effective_elitism
         cleaned_species = []
         for sp in species:
             members = [(g, f) for g, f in sp.members if not getattr(g, 'selfish_culled', False)]
@@ -3661,9 +3912,17 @@ class ReproPlanaNEATPlus:
             new_pop = new_pop[:self.pop_size]
         self._assign_lazy_individuals(new_pop)
         self.population = new_pop
+        pending = getattr(self, '_stagnation_pending_event', None)
+        if isinstance(pending, dict) and int(pending.get('generation', -1)) == int(getattr(self, 'generation', -1)):
+            gen_events['stagnation_commission'] = dict(pending)
+            self._stagnation_pending_event = None
         self.event_log.append(gen_events)
         for g in new_pop:
             self.lineage_edges.append((g.parents[0], g.parents[1], g.id, g.birth_gen, 'birth'))
+        try:
+            delattr(self, '_elitism_effective')
+        except Exception:
+            pass
 
     def _assign_lazy_individuals(self, population: List[Genome]):
         frac = float(getattr(self, 'lazy_fraction', 0.02))
@@ -4875,6 +5134,26 @@ class ReproPlanaNEATPlus:
                         break
                 self._last_top3_ids = [g.id for g, _fit, _gen in top3_best]
                 self._last_top3_complexities = [genome_complexity(g) for g, _fit, _gen in top3_best]
+                self._monitor_top3_stagnation(
+                    top3_best,
+                    best_fit,
+                    avg_fit,
+                    gen,
+                    fitnesses,
+                    baseline_fitnesses,
+                    context_best,
+                )
+                if history:
+                    avg_fit = float(np.mean(fitnesses)) if fitnesses else avg_fit
+                    best_idx = int(np.argmax(fitnesses)) if fitnesses else best_idx
+                    best_fit = float(fitnesses[best_idx]) if fitnesses else best_fit
+                    context_best = self._contextual_best_axis(best_fit, avg_fit)
+                    history[-1] = (context_best, avg_fit)
+                    self.context_best_history[-1] = (context_best, avg_fit)
+                    if baseline_fitnesses:
+                        raw_best = float(np.max(baseline_fitnesses))
+                        raw_avg = float(np.mean(baseline_fitnesses))
+                        self.raw_best_history[-1] = (raw_best, raw_avg)
                 try:
                     curr_best = self.population[best_idx].copy()
                     scars = diff_scars(prev_best, curr_best, scars, birth_gen=gen, regen_mode_for_new=getattr(curr_best, 'regen_mode', 'split'))
@@ -9541,6 +9820,55 @@ class NomologyEnv:
             self.noise_harmonics = {}
         self.noise_focus = float(profile.get('mix_focus', focus_val))
         self.noise_entropy = float(profile.get('mix_entropy', entropy_val))
+
+    def trigger_fft_spike(self, strength: float=1.0, bands: Optional[int]=None, reason: str='') -> Dict[str, Any]:
+        bands = int(bands) if bands is not None else int(max(8, self.noise_stage_len * 2))
+        bands = max(4, bands)
+        sample_len = max(bands * 2, int(self.noise_stage_len) * 4)
+        sample = self._rng.normal(0.0, self.noise + 0.01 * strength, size=sample_len)
+        spectrum = np.abs(np.fft.rfft(sample))
+        spectrum = np.nan_to_num(spectrum, nan=0.0, posinf=0.0, neginf=0.0)
+        total = float(spectrum.sum())
+        if total <= 0.0:
+            spectrum = np.ones_like(spectrum, dtype=np.float64)
+            total = float(spectrum.sum())
+        spectrum /= total
+        keep = min(bands, spectrum.size)
+        harmonics = {f'h{idx}': float(spectrum[idx]) for idx in range(keep)}
+        peak = float(spectrum[:keep].max()) if keep else 0.0
+        entropy = 0.0
+        if keep > 1:
+            entropy = float(-(spectrum[:keep] * np.log(spectrum[:keep] + 1e-12)).sum() / np.log(keep))
+        self.noise_harmonics = harmonics
+        self.noise_focus = float(np.clip(0.55 * self.noise_focus + 0.45 * peak * (1.0 + 0.25 * strength), 0.0, 1.8))
+        self.noise_entropy = float(np.clip(0.6 * self.noise_entropy + 0.4 * entropy, 0.0, 2.5))
+        self.noise = float(np.clip(self.noise * (1.0 + 0.22 * strength), self.noise_min, self.noise_max))
+        try:
+            self.noise_kind = str(self._rng.choice(self.noise_palette))
+        except Exception:
+            pass
+        style = self.noise_style(self.noise_kind)
+        self.noise_kind_label = style.get('label', self.noise_kind_label)
+        self.noise_kind_symbol = style.get('symbol', self.noise_kind_symbol)
+        self.noise_kind_color = style.get('color', self.noise_kind_color)
+        self.noise_kind_code = int(style.get('index', self.noise_kind_code))
+        self.turns = float(np.clip(self.turns * (1.0 + self._rng.normal(0.0, 0.1 * strength)), 0.7, 2.8))
+        self.rot_bias = float(np.clip(self.rot_bias + self._rng.normal(0.0, 0.45 * strength), -math.pi, math.pi))
+        self.regime_id = int(self.regime_id + 1)
+        self._refresh_noise(advance=True, surge=True)
+        payload = {
+            'strength': float(strength),
+            'peak': float(peak),
+            'focus': float(self.noise_focus),
+            'entropy': float(self.noise_entropy),
+            'reason': reason,
+            'regime_id': int(self.regime_id),
+        }
+        self.noise_profile['fft_peak'] = float(peak)
+        self.noise_profile['fft_entropy'] = float(self.noise_entropy)
+        self.noise_profile['fft_reason'] = reason
+        self.noise_profile['fft_stamp'] = time.time()
+        return payload
 
     def maybe_switch(self) -> bool:
         triggered = bool(self._rng.random() < self.intensity)
