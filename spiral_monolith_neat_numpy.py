@@ -4286,21 +4286,6 @@ class ReproPlanaNEATPlus:
         ]
         templates = [tpl for tpl in templates if isinstance(tpl, str) and tpl.strip()]
         child.rl_weight_program_template = templates[0] if templates else _RL_WEIGHT_DSL_TEMPLATE
-        sig_m = _rl_sanitise_signal_coeffs(getattr(mother, 'rl_signal_coeffs', None) if mother is not None else None)
-        sig_f = _rl_sanitise_signal_coeffs(getattr(father, 'rl_signal_coeffs', None) if father is not None else None)
-        sig_mix: Dict[str, float] = {}
-        for key in _RL_SIGNAL_COEFF_DEFAULTS:
-            mv = sig_m.get(key, _RL_SIGNAL_COEFF_DEFAULTS[key])
-            fv = sig_f.get(key, _RL_SIGNAL_COEFF_DEFAULTS[key])
-            blend = float(self.rng.uniform(0.3, 0.7))
-            sig_mix[key] = float(blend * mv + (1.0 - blend) * fv)
-        child.rl_signal_coeffs = sig_mix
-        sig_templates = [
-            getattr(mother, 'rl_signal_program_template', None) if mother is not None else None,
-            getattr(father, 'rl_signal_program_template', None) if father is not None else None,
-        ]
-        sig_templates = [tpl for tpl in sig_templates if isinstance(tpl, str) and tpl.strip()]
-        child.rl_signal_program_template = sig_templates[0] if sig_templates else _RL_SIGNAL_DSL_TEMPLATE
         limit = int(getattr(child, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
         child.rl_memory_limit = limit
         merged = deque(maxlen=limit)
