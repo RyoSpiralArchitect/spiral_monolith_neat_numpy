@@ -1,7 +1,7 @@
-# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 # ┃ spiral_monolith_neat_numpy.py                                         ┃
-# ┃ Monolithic NEAT × NumPy playground with the Lazy Council ecosystem.  ┃
-# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+# ┃ Monolithic NEAT × NumPy playground with the Lazy Council ecosystem.   ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 # EN: Single-file research lab for cooperative neuroevolution, backprop refinement,
 #     and artefact-rich storytelling. Designed around the six-seat Lazy Council
 #     steering model with mandatory governance enabled by default.
