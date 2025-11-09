@@ -154,6 +154,8 @@ _MONODROMY_TOGGLE_PARAMS: Tuple[str, ...] = (
     'monodromy_family_weight',
 )
 
+_DEFAULT_RL_MEMORY_LIMIT = 1024
+
 
 def _structure_cache_key(g: 'Genome', order: Sequence[int]) -> Optional[Tuple[Any, ...]]:
     try:
@@ -852,6 +854,15 @@ class Genome:
         self.cooperative = bool(cooperative)
         self.meta_reflections: List[Dict[str, Any]] = []
         self._meta_revision = 0
+        self.rl_params: Dict[str, float] = {
+            'lr': float(np.clip(np.random.uniform(5e-4, 5e-2), 1e-5, 0.2)),
+            'gamma': float(np.clip(np.random.uniform(0.88, 0.997), 0.0, 0.9995)),
+            'entropy': float(np.clip(np.random.uniform(5e-4, 5e-2), 0.0, 0.5)),
+        }
+        self.rl_memory_limit = int(_DEFAULT_RL_MEMORY_LIMIT)
+        self.rl_memory: deque = deque(maxlen=self.rl_memory_limit)
+        self.rl_train_steps = int(18)
+        self.rl_l2 = float(0.0001)
 
     def meta_reflect(self, event: str, payload: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
         info = dict(payload or {})
@@ -906,6 +917,19 @@ class Genome:
         g.max_hidden_nodes = self.max_hidden_nodes
         g.max_edges = self.max_edges
         g._compat_cache = None
+        try:
+            g.rl_params = dict(getattr(self, 'rl_params', {}))
+        except Exception:
+            g.rl_params = dict()
+        limit = int(getattr(self, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
+        g.rl_memory_limit = limit
+        try:
+            buf = list(getattr(self, 'rl_memory', []))
+        except Exception:
+            buf = []
+        g.rl_memory = deque(buf, maxlen=limit)
+        g.rl_train_steps = int(getattr(self, 'rl_train_steps', 18))
+        g.rl_l2 = float(getattr(self, 'rl_l2', 0.0001))
         return g
 
     def invalidate_caches(self, structure: bool=False, weights: bool=False):
@@ -1233,6 +1257,37 @@ class Genome:
             'changed': len(deltas),
         }
         self.meta_reflect('mutate_weights', payload)
+
+    def mutate_parameter(
+        self,
+        key: str,
+        rng: np.random.Generator,
+        *,
+        sigma: float=0.2,
+        low: Optional[float]=None,
+        high: Optional[float]=None,
+        log_scale: bool=False,
+    ) -> bool:
+        params = getattr(self, 'rl_params', None)
+        if not params or key not in params:
+            return False
+        val = float(params[key])
+        try:
+            if log_scale:
+                baseline = math.log(max(1e-12, val))
+                perturbed = baseline + float(rng.normal(0.0, max(1e-6, sigma)))
+                new_val = math.exp(perturbed)
+            else:
+                scale = max(abs(val), 1e-3)
+                new_val = val + float(rng.normal(0.0, max(1e-6, sigma))) * scale
+        except Exception:
+            return False
+        if low is not None:
+            new_val = max(float(low), new_val)
+        if high is not None:
+            new_val = min(float(high), new_val)
+        params[key] = float(new_val)
+        return True
 
     def mutate_toggle_enable(self, rng: np.random.Generator, prob=0.01):
         changed = False
@@ -2672,6 +2727,7 @@ class ReproPlanaNEATPlus:
         self._stagnation_flagged: Dict[int, int] = {}
         self._stagnation_pending_event: Optional[Dict[str, Any]] = None
         self.stagnation_commission_history: List[Dict[str, Any]] = []
+        self.rl_param_mutation_rate = 0.35
         nodes = {}
         for i in range(num_inputs):
             nodes[i] = NodeGene(i, 'input', 'identity')
@@ -2838,6 +2894,9 @@ class ReproPlanaNEATPlus:
         self.monodromy_diversity_grace_strength = 0.3
         self.monodromy_noise_weight = 0.25
         self.monodromy_family_weight = 0.35
+        self.monodromy_envelope_floor = 0.3
+        self.monodromy_envelope_bias = 0.9
+        self.monodromy_envelope_cap = 1.25
         self.monodromy_noise_style_overrides: Dict[str, Dict[str, Any]] = {}
         self._monodromy_registry: Dict[int, Dict[str, float]] = {}
         self._monodromy_snapshot: Dict[str, float] = {
@@ -3351,7 +3410,7 @@ class ReproPlanaNEATPlus:
         lazy_share = float(np.clip(lazy.get('share', 0.0), 0.0, 1.0))
         advantage = float(getattr(evaluator, 'last_advantage_score', 0.0) or 0.0)
         altruism_hint = float(np.clip(getattr(evaluator, 'last_altruism_signal', 0.5) or 0.5, 0.0, 1.0))
-        solidarity = float(np.clip(diversity_entropy, 0.0, 1.0))
+        solidarity = float(max(0.0, diversity_entropy))
         stress = float(np.clip(diversity_scarcity + max(0.0, family_surplus_mean), 0.0, 2.5))
         target = float(np.clip(0.6 * altruism_hint + 0.4 * (1.0 - advantage), 0.0, 1.0))
         self._collective_signal = {
@@ -3573,6 +3632,13 @@ class ReproPlanaNEATPlus:
             scale = float(getattr(self, 'mutation_will_mutation_scale', 0.05))
             delta = float(self.rng.normal(0.0, scale))
             genome.mutation_will = float(np.clip(float(getattr(genome, 'mutation_will', 0.5)) + delta, 0.0, 1.0))
+        rl_rate = float(getattr(self, 'rl_param_mutation_rate', 0.35))
+        if rl_rate > 0.0 and self.rng.random() < rl_rate:
+            genome.mutate_parameter('lr', self.rng, sigma=0.35, low=1e-5, high=0.2, log_scale=True)
+        if rl_rate > 0.0 and self.rng.random() < rl_rate:
+            genome.mutate_parameter('gamma', self.rng, sigma=0.08, low=0.4, high=0.9995, log_scale=False)
+        if rl_rate > 0.0 and self.rng.random() < rl_rate:
+            genome.mutate_parameter('entropy', self.rng, sigma=0.45, low=0.0, high=0.5, log_scale=True)
 
     def _crossover_maternal_biased(self, mother: Genome, father: Genome, species_members):
         fit_dict = {g: f for g, f in species_members}
@@ -3661,6 +3727,7 @@ class ReproPlanaNEATPlus:
         child.regen = bool(self.rng.random() < p)
         child.regen_mode = self.rng.choice(['head', 'tail', 'split'])
         child.embryo_bias = mother.embryo_bias if self.rng.random() < 0.7 else father.embryo_bias
+        self._inherit_rl_parameters(child, mother, father)
         return child
 
     def _apply_reproductive_altruism(
@@ -3697,6 +3764,43 @@ class ReproPlanaNEATPlus:
             node.altruism = float(np.clip(prev_alt + alt_delta, 0.0, 1.0))
             node.altruism_memory = float(np.clip(prev_mem + mem_delta, -1.5, 1.5))
             node.altruism_span = float(np.clip(prev_span + span_delta, 0.0, 4.0))
+
+    def _inherit_rl_parameters(self, child: Genome, mother: Optional[Genome], father: Optional[Genome]) -> None:
+        try:
+            m_params = dict(getattr(mother, 'rl_params', {}) or {}) if mother is not None else {}
+        except Exception:
+            m_params = {}
+        try:
+            f_params = dict(getattr(father, 'rl_params', {}) or {}) if father is not None else {}
+        except Exception:
+            f_params = {}
+        if not m_params and not f_params:
+            return
+        keys = set(m_params.keys()).union(f_params.keys())
+        mixed: Dict[str, float] = {}
+        for key in keys:
+            mv = float(m_params.get(key, f_params.get(key, 0.0)))
+            fv = float(f_params.get(key, mv))
+            alpha = float(self.rng.uniform(0.25, 0.75))
+            mixed[key] = float(alpha * mv + (1.0 - alpha) * fv)
+        child.rl_params = mixed
+        limit = int(getattr(child, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
+        child.rl_memory_limit = limit
+        merged = deque(maxlen=limit)
+        try:
+            m_buf = list(getattr(mother, 'rl_memory', []) or []) if mother is not None else []
+        except Exception:
+            m_buf = []
+        try:
+            f_buf = list(getattr(father, 'rl_memory', []) or []) if father is not None else []
+        except Exception:
+            f_buf = []
+        tail = max(1, limit // 2)
+        if m_buf:
+            merged.extend(m_buf[-tail:])
+        if f_buf:
+            merged.extend(f_buf[-tail:])
+        child.rl_memory = merged
 
     def _make_offspring(self, species, offspring_counts, sidx, species_pool):
         sp = species[sidx]
@@ -4616,6 +4720,9 @@ class ReproPlanaNEATPlus:
         growth_weight = float(np.clip(getattr(self, 'monodromy_growth_weight', 0.0), 0.0, 1.5))
         slump_gain = float(np.clip(getattr(self, 'monodromy_slump_gain', 0.0), 0.0, 1.5))
         fast_release = float(np.clip(getattr(self, 'monodromy_fast_release', 0.0), 0.0, 1.0))
+        envelope_floor = float(np.clip(getattr(self, 'monodromy_envelope_floor', 0.0), 0.0, 1.0))
+        envelope_bias = float(max(0.0, getattr(self, 'monodromy_envelope_bias', 0.0)))
+        envelope_cap = float(max(envelope_floor, float(getattr(self, 'monodromy_envelope_cap', 1.0))))
         registry = getattr(self, '_monodromy_registry', None)
         if registry is None:
             registry = {}
@@ -4714,7 +4821,8 @@ class ReproPlanaNEATPlus:
                 grace_factor = max(0.2, 1.0 - grace_strength * min(1.0, grace_val))
                 grace_val *= grace_decay
             state['diversity_grace'] = grace_val
-            envelope = min(1.0, stasis / span)
+            raw_envelope = (stasis + envelope_bias) / max(1.0, span)
+            envelope = float(min(envelope_cap, max(envelope_floor, raw_envelope)))
             osc = 0.5 - 0.5 * math.cos(2.0 * math.pi * phase)
             target = (base + rng * osc) * envelope
             if growth_weight > 0.0:
@@ -4974,8 +5082,8 @@ class ReproPlanaNEATPlus:
                     diversity_entropy = raw_entropy / max(max_entropy, 1e-12) if max_entropy > 0 else 0.0
                 else:
                     diversity_entropy = 0.0
-                diversity_entropy = float(np.clip(diversity_entropy, 0.0, 1.0))
-                diversity_scarcity = float(np.clip(1.0 - diversity_entropy, 0.0, 1.0))
+                diversity_entropy = float(max(0.0, diversity_entropy))
+                diversity_scarcity = float(1.0 - diversity_entropy)
                 family_entropy = 0.0
                 top_family_share = 0.0
                 family_surplus_ratio_max = 0.0
@@ -4997,7 +5105,7 @@ class ReproPlanaNEATPlus:
                         if ratios:
                             family_surplus_ratio_max = float(max(ratios))
                             family_surplus_ratio_mean = float(sum(ratios) / len(ratios))
-                family_entropy = float(np.clip(family_entropy, 0.0, 1.0))
+                family_entropy = float(max(0.0, family_entropy))
                 complexity_arr = np.asarray(complexity_scores, dtype=np.float64) if complexity_scores else np.zeros(0, dtype=np.float64)
                 complexity_mean = float(complexity_arr.mean()) if complexity_arr.size else 0.0
                 complexity_std = float(complexity_arr.std()) if complexity_arr.size else 0.0
@@ -8048,35 +8156,177 @@ def setup_neat_for_env(env_id: str, population: int=48, output_activation: str='
     _set_monodromy_mode(neat, bool(monodromy_active))
     return (neat, env)
 
-def _rollout_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_norm=None):
-    """Rollout one episode with a Genome and an action mapper."""
+def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]]) -> None:
+    if not experiences:
+        return
+    try:
+        limit = int(getattr(genome, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
+    except Exception:
+        limit = _DEFAULT_RL_MEMORY_LIMIT
+    buf = getattr(genome, 'rl_memory', None)
+    if not isinstance(buf, deque) or buf.maxlen != limit:
+        buf = deque(maxlen=limit)
+    for exp in experiences:
+        try:
+            obs = np.asarray(exp.get('obs'), dtype=np.float64).reshape(-1)
+        except Exception:
+            continue
+        action = exp.get('action')
+        if isinstance(action, np.ndarray):
+            if action.size == 1:
+                action = int(action.ravel()[0])
+        elif isinstance(action, np.generic):
+            action = int(action)
+        next_obs_raw = exp.get('next_obs')
+        next_obs = None
+        if next_obs_raw is not None:
+            try:
+                next_obs = np.asarray(next_obs_raw, dtype=np.float64).reshape(-1)
+            except Exception:
+                next_obs = None
+        payload = {
+            'obs': obs,
+            'action': action,
+            'reward': float(exp.get('reward', 0.0)),
+            'next_obs': next_obs,
+            'return': float(exp.get('return', exp.get('reward', 0.0))),
+        }
+        buf.append(payload)
+    genome.rl_memory = buf
+
+
+def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> None:
+    buf = list(getattr(genome, 'rl_memory', []) or [])
+    if len(buf) < 4:
+        return
+    discrete = []
+    for item in buf:
+        act = item.get('action')
+        if isinstance(act, (int, np.integer)):
+            discrete.append(item)
+    if len(discrete) < 4:
+        return
+    returns = np.asarray([float(d.get('return', d.get('reward', 0.0))) for d in discrete], dtype=np.float64)
+    if returns.size == 0:
+        return
+    if np.allclose(returns, returns[0]):
+        weights = np.ones_like(returns)
+    else:
+        shifted = returns - np.min(returns)
+        if np.allclose(shifted, 0.0):
+            weights = np.ones_like(returns)
+        else:
+            weights = shifted
+        weights = weights + float(max(0.0, entropy)) * (np.std(returns) + 1e-6)
+    if np.sum(weights) <= 0:
+        weights = np.ones_like(weights)
+    sample_size = min(len(discrete), max(8, int(24 + max(0.0, entropy) * 64)))
+    replace = len(discrete) < sample_size
+    probs = weights / np.sum(weights)
+    idxs = np.random.choice(len(discrete), size=sample_size, replace=replace, p=probs)
+    picked = [discrete[int(i)] for i in idxs]
+    try:
+        X = np.stack([p['obs'] for p in picked], axis=0).astype(np.float64)
+    except Exception:
+        return
+    try:
+        y = np.asarray([int(p['action']) for p in picked], dtype=np.int32)
+    except Exception:
+        return
+    steps = int(getattr(genome, 'rl_train_steps', 18))
+    l2 = float(getattr(genome, 'rl_l2', 0.0001))
+    try:
+        train_with_backprop_numpy(genome, X, y, steps=steps, lr=float(lr), l2=l2)
+    except Exception as err:
+        print('[warn] rl replay update skipped:', err)
+
+
+def _rl_collect_episode(
+    genome: Genome,
+    env,
+    mapper,
+    *,
+    gamma: float,
+    entropy: float,
+    max_steps: Optional[int]=None,
+    render: bool=False,
+    obs_norm=None,
+):
     total, steps, done = (0.0, 0, False)
     reset_out = env.reset()
     obs = reset_out[0] if isinstance(reset_out, tuple) and len(reset_out) >= 1 else reset_out
+    experiences: List[Dict[str, Any]] = []
     while not done:
         if render:
             try:
                 env.render()
             except Exception:
                 pass
-        x = obs if obs_norm is None else obs_norm(obs)
-        y = genome.forward_one(np.asarray(x, dtype=np.float32).ravel())
-        mapped = mapper(y)
+        obs_vec = obs if obs_norm is None else obs_norm(obs)
+        obs_arr = np.asarray(obs_vec, dtype=np.float32).ravel()
+        logits = genome.forward_one(obs_arr)
+        mapped = mapper(logits)
         if isinstance(mapped, tuple):
-            act = mapped[0]
+            action, probs = mapped
         else:
-            act = mapped
-        step_out = env.step(act)
+            action, probs = (mapped, None)
+        step_out = env.step(action)
         if isinstance(step_out, tuple) and len(step_out) == 5:
-            obs, reward, terminated, truncated, info = step_out
+            next_obs, reward, terminated, truncated, info = step_out
             done = bool(terminated or truncated)
         else:
-            obs, reward, done, info = step_out
+            next_obs, reward, done, info = step_out
             done = bool(done)
+        next_obs_vec = np.asarray(next_obs, dtype=np.float32).ravel()
+        chosen_prob = None
+        if probs is not None:
+            try:
+                if np.isscalar(action):
+                    idx = int(action)
+                    if 0 <= idx < len(probs):
+                        chosen_prob = float(max(1e-8, probs[idx]))
+            except Exception:
+                chosen_prob = None
+        experiences.append(
+            {
+                'obs': obs_arr.copy(),
+                'action': action,
+                'reward': float(reward),
+                'next_obs': next_obs_vec.copy(),
+                'prob': chosen_prob,
+                'done': bool(done),
+            }
+        )
         total += float(reward)
+        obs = next_obs
         steps += 1
         if max_steps is not None and steps >= int(max_steps):
             break
+    G = 0.0
+    for exp in reversed(experiences):
+        G = float(exp.get('reward', 0.0)) + float(gamma) * G
+        prob = exp.get('prob')
+        if prob is not None and float(entropy) > 0.0:
+            G += float(entropy) * (-math.log(prob))
+        exp['return'] = float(G)
+    return total, experiences
+
+
+def _rollout_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_norm=None):
+    """Rollout one episode with a Genome and an action mapper."""
+    params = getattr(genome, 'rl_params', {}) or {}
+    gamma = float(np.clip(params.get('gamma', 0.99), 0.0, 0.9995))
+    entropy = float(max(0.0, params.get('entropy', 0.01)))
+    total, _ = _rl_collect_episode(
+        genome,
+        env,
+        mapper,
+        gamma=gamma,
+        entropy=entropy,
+        max_steps=max_steps,
+        render=render,
+        obs_norm=obs_norm,
+    )
     return total
 
 def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, episodes=1, obs_norm=None):
@@ -8090,9 +8340,28 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
     n_episodes = max(1, int(episodes))
 
     def _fitness(genome):
+        params = getattr(genome, 'rl_params', {}) or {}
+        gamma = float(np.clip(params.get('gamma', 0.99), 0.0, 0.9995))
+        entropy = float(max(0.0, params.get('entropy', 0.01)))
+        lr = float(np.clip(params.get('lr', 0.01), 1e-6, 1.0))
         total = 0.0
+        replay_batch: List[Dict[str, Any]] = []
         for _ in range(n_episodes):
-            total += _rollout_policy_in_env(genome, env, mapper, max_steps=max_steps, render=False, obs_norm=obs_norm)
+            reward, experiences = _rl_collect_episode(
+                genome,
+                env,
+                mapper,
+                gamma=gamma,
+                entropy=entropy,
+                max_steps=max_steps,
+                render=False,
+                obs_norm=obs_norm,
+            )
+            total += reward
+            replay_batch.extend(experiences)
+        if replay_batch:
+            _rl_store_experiences(genome, replay_batch)
+            _rl_experience_replay_update(genome, lr=lr, entropy=entropy)
         return total / float(n_episodes)
 
     def _close_env():
