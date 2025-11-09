@@ -2901,27 +2901,44 @@ class ReproPlanaNEATPlus:
         evaluator = getattr(controller, 'evaluator', None) if controller is not None else None
         if evaluator is None:
             return
+        council_ids = getattr(evaluator, 'last_leader_council', None)
+        if council_ids:
+            try:
+                ids_list = [int(x) for x in council_ids if x is not None]
+            except Exception:
+                ids_list = [x for x in council_ids if isinstance(x, int)]
+        else:
+            ids_list = []
         leader_id = getattr(evaluator, 'last_leader_id', None)
+        if leader_id is not None:
+            ids_list.append(int(leader_id))
+        ids_unique: List[int] = list(dict.fromkeys(ids_list))
         advantage = float(getattr(evaluator, 'last_advantage_score', 0.0) or 0.0)
         threshold = float(getattr(self, 'selfish_leader_threshold', 0.22))
-        if leader_id is None or advantage <= threshold:
-            return
-        try:
-            idx = next(i for i, g in enumerate(self.population) if g.id == leader_id)
-        except StopIteration:
+        if not ids_unique or advantage <= threshold:
             return
         penalty_floor = min(baseline) if baseline else -1.0
-        drop = (abs(baseline[idx]) + abs(penalty_floor) + 1.0) * (1.5 + 2.5 * advantage)
-        killer = penalty_floor - drop
-        baseline[idx] = killer
-        fitnesses[idx] = killer
-        try:
-            self.population[idx].cooperative = False
-            setattr(self.population[idx], 'selfish_culled', True)
-        except Exception:
-            pass
-        self._note_lineage(self.population[idx].id, generation, f'selfish leader culled ({advantage:.3f})')
-        setattr(evaluator, 'last_advantage_penalty', True)
+        applied = False
+        for lid in ids_unique:
+            try:
+                idx = next(i for i, g in enumerate(self.population) if g.id == lid)
+            except StopIteration:
+                continue
+            drop = (abs(baseline[idx]) + abs(penalty_floor) + 1.0) * (1.5 + 2.5 * advantage)
+            drop /= max(1, len(ids_unique))
+            killer = penalty_floor - drop
+            baseline[idx] = killer
+            fitnesses[idx] = killer
+            try:
+                self.population[idx].cooperative = False
+                setattr(self.population[idx], 'selfish_culled', True)
+            except Exception:
+                pass
+            note = 'selfish leader culled' if len(ids_unique) == 1 else 'selfish council culled'
+            self._note_lineage(self.population[idx].id, generation, f'{note} ({advantage:.3f})')
+            applied = True
+        if applied:
+            setattr(evaluator, 'last_advantage_penalty', True)
 
     def _update_collective_signal(
         self,
@@ -8157,6 +8174,9 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--complexity-bonus-span-quantile', type=float, help='upper quantile used to scale survivor complexity distance')
     ap.add_argument('--complexity-survivor-cap', type=float, help='cap applied to normalized survivor complexity bonus ratio')
     ap.add_argument('--complexity-bonus-limit', type=float, help='absolute cap for survivor complexity bonuses')
+    ap.add_argument('--no-mandatory', dest='mandatory', action='store_false', help='disable mandatory lazy council steering in the nomology environment')
+    ap.add_argument('--mandatory', dest='mandatory', action='store_true', help=argparse.SUPPRESS)
+    ap.set_defaults(mandatory=True)
     if want_help:
         ap.print_help()
         return 0
@@ -8618,6 +8638,7 @@ def run_spinor_monolith(
         n_tr=512,
         n_va=256,
         evaluator_seed=spinor_bind_seed,
+        mandatory_mode=getattr(args, 'mandatory', True),
     )
     controller.telemetry = tel
     controller.update_for_generation(0, shmem=False)
@@ -9334,6 +9355,9 @@ class SelfReproducingEvaluator:
     mutate_connection_prob: float = 0.35
     mutate_node_prob: float = 0.2
     output_scale: Tuple[float, float, float] = (0.08, 1.0, math.pi / 4.0)
+    mandatory_mode: bool = True
+    council_top_k: int = 3
+    council_random_k: int = 3
     _population: List[Genome] = field(default_factory=list, init=False, repr=False)
     _rng: np.random.Generator = field(init=False, repr=False)
     _innov: InnovationTracker = field(init=False, repr=False)
@@ -9344,6 +9368,8 @@ class SelfReproducingEvaluator:
     _leader_cache_rev: Tuple[int, int] = field(default=(-1, -1), init=False, repr=False)
     _leader_compiled: Optional[Dict[str, Any]] = field(default=None, init=False, repr=False)
     _resilience_notes: deque = field(default_factory=lambda: deque(maxlen=16), init=False, repr=False)
+    last_leader_council: Tuple[int, ...] = field(default_factory=tuple, init=False, repr=False)
+    last_council_dispersion: float = field(default=0.0, init=False, repr=False)
     lazy_feedback_smoothing: float = 0.35
     lazy_feedback_decay: float = 0.25
     _lazy_feedback: Dict[str, Any] = field(
@@ -9526,14 +9552,12 @@ class SelfReproducingEvaluator:
     def resilience_history(self) -> List[str]:
         return list(self._resilience_notes)
 
-    def step(
+    def _step_single_leader(
         self,
         bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
         env: NomologyEnv,
         generation: int,
     ) -> Dict[str, Any]:
-        if not self._population:
-            self._population.append(self._seed_genome())
         leader = self._population[0]
         feats = self._feature_vector(bundle, env, generation)
         resilience_flag = ''
@@ -9602,6 +9626,8 @@ class SelfReproducingEvaluator:
         altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0))
         self.last_advantage_score = advantage_score
         self.last_leader_id = leader.id
+        self.last_leader_council = (leader.id,)
+        self.last_council_dispersion = 0.0
         self.last_altruism_signal = altruism_signal
         self.last_selfish_drive = selfish_drive
         self.last_env_shift = env_shift
@@ -9646,6 +9672,204 @@ class SelfReproducingEvaluator:
             'selfish_drive': selfish_drive,
             'altruism_signal': altruism_signal,
         }
+
+    def _step_council(
+        self,
+        bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
+        env: NomologyEnv,
+        generation: int,
+    ) -> Dict[str, Any]:
+        feats = self._feature_vector(bundle, env, generation)
+        council_seed: List[Genome] = list(self._population[: max(1, min(self.council_top_k, len(self._population)))])
+        remaining = self._population[self.council_top_k:]
+        if remaining:
+            random_take = min(self.council_random_k, len(remaining))
+            if random_take > 0:
+                for idx in self._rng.permutation(len(remaining))[:random_take]:
+                    council_seed.append(remaining[int(idx)])
+        council: List[Genome] = []
+        seen: Set[int] = set()
+        for g in council_seed:
+            gid = getattr(g, 'id', None)
+            if gid is None or gid in seen:
+                continue
+            council.append(g)
+            seen.add(gid)
+        if not council:
+            council.append(self._population[0])
+        resilience_marks: List[str] = []
+        vectors: Dict[int, np.ndarray] = {}
+        start = time.perf_counter()
+        for genome in council:
+            try:
+                compiled = compile_genome(genome)
+                activations = forward_batch(compiled, feats.reshape(1, -1))[0][0]
+                act_arr = np.asarray(activations, dtype=np.float32)
+                out_idx = list(compiled.get('outputs', []))
+                if out_idx:
+                    vec = act_arr[out_idx[:3]]
+                else:
+                    vec = act_arr[:3]
+                vec = np.asarray(vec, dtype=np.float32)
+                if vec.size < 3:
+                    vec = np.pad(vec, (0, 3 - vec.size))
+                else:
+                    vec = vec[:3]
+                vectors[genome.id] = vec.astype(np.float32, copy=False)
+            except Exception as err:
+                resilience_marks.append(self._record_resilience(err, generation))
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        if vectors:
+            ordered_ids = list(vectors.keys())
+            stacked = np.stack([vectors[i] for i in ordered_ids], axis=0)
+            consensus = stacked.mean(axis=0).astype(np.float32)
+            dispersion = float(np.mean(np.std(stacked, axis=0)))
+        else:
+            ordered_ids = [g.id for g in council]
+            consensus = np.zeros(3, dtype=np.float32)
+            dispersion = 0.0
+        all_ids = ordered_ids + [g.id for g in council if g.id not in ordered_ids]
+        if not all_ids:
+            all_ids = [council[0].id]
+        parent = council[int(self._rng.integers(len(council)))] if council else self._population[0]
+        parent_outputs = vectors.get(parent.id, consensus)
+        lazy = getattr(self, '_lazy_feedback', {}) or {}
+        share = float(np.clip(lazy.get('share', 0.0), 0.0, 1.0))
+        stasis = float(np.clip(lazy.get('stasis', 0.0), 0.0, 1.0))
+        anchor = float(np.clip(lazy.get('anchor', 0.0), -1.0, 1.0))
+        gap = float(np.clip(lazy.get('gap', 0.0), -1.0, 1.0))
+        lazy_gen = int(lazy.get('generation', generation)) if isinstance(lazy, dict) else generation
+        age = max(0, int(generation) - lazy_gen)
+        decay = math.exp(-float(np.clip(self.lazy_feedback_decay, 0.05, 1.0)) * age)
+        share *= decay
+        stasis *= decay
+        anchor *= decay
+        gap *= decay
+        div_state = getattr(self, '_diversity_feedback', {}) or {}
+        scarcity = float(np.clip(div_state.get('scarcity', 0.0), 0.0, 1.0))
+        spread = float(np.clip(div_state.get('structural_spread', 0.0), 0.0, 4.0))
+        entropy = float(np.clip(div_state.get('entropy', 0.0), 0.0, 1.2))
+        share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
+        lazy_pressure = float(np.clip(share * (1.0 + 0.5 * stasis + 0.25 * abs(gap)), 0.0, 1.6))
+        prev_noise = float(getattr(env, 'noise', 0.05))
+        prev_turns = float(getattr(env, 'turns', 1.6))
+        prev_rot = float(getattr(env, 'rot_bias', 0.0))
+        scale_noise, scale_turns, scale_rot = self.output_scale
+        scale_noise *= float(1.0 + 0.35 * scarcity + 0.55 * lazy_pressure)
+        scale_turns *= float(1.0 + 0.2 * spread + 0.4 * lazy_pressure)
+        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy) + 0.35 * lazy_pressure)
+        anchor_pull = float(np.clip(0.35 + 0.25 * lazy_pressure, 0.0, 0.85))
+        gap_pull = float(np.clip(0.45 + 0.25 * lazy_pressure, 0.0, 0.9))
+        mod_out0 = float(consensus[0] * (1.0 - anchor_pull) + anchor * anchor_pull)
+        mod_out1 = float(consensus[1] * (1.0 - anchor_pull) + (anchor + gap * 0.5) * anchor_pull)
+        mod_out2 = float(consensus[2] * (1.0 - gap_pull) + gap * gap_pull)
+        target_noise = float(np.clip(0.05 + scale_noise * mod_out0, 0.0, 0.25))
+        target_turns = float(np.clip(1.6 + scale_turns * mod_out1, 0.6, 3.2))
+        rot_target = prev_rot + scale_rot * mod_out2
+        anchor_noise = float(np.clip(0.05 + scale_noise * (anchor + 0.2 * lazy_pressure), 0.0, 0.25))
+        anchor_turns = float(np.clip(1.6 + scale_turns * (anchor + gap * 0.25 + 0.15 * lazy_pressure), 0.6, 3.2))
+        rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6 + 0.2 * lazy_pressure)
+        inertia = float(np.clip(0.25 + 0.6 * share + 0.25 * stasis, 0.0, 0.92))
+        inertia *= float(np.clip(1.0 - 0.35 * scarcity + 0.25 * spread + 0.15 * lazy_pressure, 0.2, 1.1))
+        slip = max(0.0, 1.0 - inertia)
+        anchor_ratio = float(np.clip(0.3 + 0.4 * stasis + 0.3 * lazy_pressure, 0.0, 0.95))
+        anchor_mix = min(slip, slip * anchor_ratio)
+        leader_mix = slip - anchor_mix
+        env.noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
+        env.turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
+        rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
+        env.rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+        env.lazy_share = float(share)
+        env.lazy_anchor = float(anchor)
+        env.lazy_gap = float(gap)
+        env.lazy_stasis = float(stasis)
+        env_shift = (
+            abs(env.noise - prev_noise) * 4.0
+            + abs(env.turns - prev_turns)
+            + 0.5 * abs(rot_blend - prev_rot)
+            + dispersion
+            + 1.2 * lazy_pressure
+        )
+        selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - 0.6 * share))
+        advantage_score = float(
+            np.clip(
+                selfish_drive * (max(0.0, gap) + 0.35 * scarcity + 0.25 * lazy_pressure) * (0.5 + env_shift),
+                0.0,
+                3.0,
+            )
+        )
+        altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0))
+        resilience_flag = ''
+        if resilience_marks:
+            uniq = list(dict.fromkeys(resilience_marks))
+            resilience_flag = 'council:' + ','.join(uniq)
+        self.last_advantage_score = advantage_score
+        self.last_leader_id = parent.id
+        self.last_leader_council = tuple(all_ids)
+        self.last_council_dispersion = dispersion
+        self.last_altruism_signal = altruism_signal
+        self.last_selfish_drive = selfish_drive
+        self.last_env_shift = env_shift
+        try:
+            summary = self._mutate_child(parent, bundle, feats, parent_outputs, generation)
+        except Exception as mutate_err:
+            resilience_flag = resilience_flag or self._record_resilience(mutate_err, generation)
+            summary = f'mutate-failed {type(mutate_err).__name__}'
+        noise_kind = getattr(env, 'noise_kind', None)
+        if noise_kind:
+            label = getattr(env, 'noise_kind_label', noise_kind)
+            symbol = getattr(env, 'noise_kind_symbol', noise_kind[:1].upper())
+            summary = f"{summary} | noise {symbol}({label})"
+        focus = getattr(env, 'noise_focus', None)
+        if isinstance(focus, (int, float)) and focus > 0:
+            summary = f'{summary} | focus {float(focus):.2f}'
+        entropy = getattr(env, 'noise_entropy', None)
+        if isinstance(entropy, (int, float)) and entropy > 0:
+            summary = f'{summary} | entropy {float(entropy):.2f}'
+        if scarcity > 0.0 or spread > 0.0:
+            summary = f'{summary} | div {scarcity:.2f}/{spread:.2f}'
+        weave_err = getattr(env, '_last_weaver_error', None)
+        if weave_err:
+            summary = f'{summary} | weave {str(weave_err).split(':', 1)[0]}'
+        if resilience_flag:
+            summary = f'{summary} | resilience {resilience_flag}'
+        if share > 0.0:
+            summary = f'{summary} | lazy {share:.2f}'
+        if stasis > 0.0:
+            summary = f'{summary} | stasis {stasis:.2f}'
+        if abs(gap) > 0.01:
+            summary = f'{summary} | gap {gap:+.2f}'
+        if dispersion > 0.0:
+            summary = f'{summary} | council σ {dispersion:.2f}'
+        summary = f'{summary} | council {len(all_ids)}'
+        if lazy_pressure > 0.01:
+            summary = f'{summary} | lazyP {lazy_pressure:.2f}'
+        if advantage_score > 0.05:
+            summary = f'{summary} | adv {advantage_score:.2f}'
+        self.last_event = summary
+        return {
+            'genome_id': parent.id,
+            'note': summary,
+            'resilience': resilience_flag,
+            'latency_ms': latency_ms,
+            'advantage': advantage_score,
+            'selfish_drive': selfish_drive,
+            'altruism_signal': altruism_signal,
+            'council_size': len(all_ids),
+            'council_dispersion': dispersion,
+        }
+
+    def step(
+        self,
+        bundle: Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float],
+        env: NomologyEnv,
+        generation: int,
+    ) -> Dict[str, Any]:
+        if not self._population:
+            self._population.append(self._seed_genome())
+        if not self.mandatory_mode:
+            return self._step_single_leader(bundle, env, generation)
+        return self._step_council(bundle, env, generation)
 
     @property
     def leader(self) -> Genome:
@@ -9848,6 +10072,7 @@ class SpinorNomologyDatasetController:
         n_va: int=256,
         evaluator: Optional[SelfReproducingEvaluator]=None,
         evaluator_seed: Optional[int]=None,
+        mandatory_mode: bool=True,
     ) -> None:
         self.spin = spin
         self.env = env
@@ -9858,6 +10083,7 @@ class SpinorNomologyDatasetController:
         self.telemetry: Optional[Telemetry] = None
         self.evaluator = evaluator
         self.evaluator_seed = evaluator_seed
+        self.mandatory_mode = bool(mandatory_mode)
         embed_dim = self.spin.group.embed_dim if self.spin.group else 0
         self.feature_dim = 12 + embed_dim
         self.evaluator_feature_dim = 12 + embed_dim
@@ -9883,10 +10109,16 @@ class SpinorNomologyDatasetController:
                 self.env,
                 rng=eval_rng,
                 seed=int(evaluator_seed),
+                mandatory_mode=self.mandatory_mode,
             )
         elif self.evaluator is not None and evaluator_seed is not None:
             try:
                 self.evaluator.seed = int(evaluator_seed)
+            except Exception:
+                pass
+        if self.evaluator is not None:
+            try:
+                self.evaluator.mandatory_mode = self.mandatory_mode
             except Exception:
                 pass
 
