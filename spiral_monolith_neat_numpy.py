@@ -2858,6 +2858,7 @@ class ReproPlanaNEATPlus:
             'noise_entropy': 0.0,
             'family_factor_mean': 1.0,
             'family_factor_max': 1.0,
+            'span_scale': 0.0,
         }
         self._monodromy_noise_tag = ''
         self._auto_complexity_bonus_state = {
@@ -4433,6 +4434,7 @@ class ReproPlanaNEATPlus:
                 'noise_entropy': 0.0,
                 'family_factor_mean': 1.0,
                 'family_factor_max': 1.0,
+                'span_scale': 0.0,
             }
 
         n = len(fitnesses)
@@ -4585,6 +4587,23 @@ class ReproPlanaNEATPlus:
         else:
             best_val = float(baseline_arr[top_indices[0]]) if top_indices else median
         span_scale = abs(best_val - median)
+        baseline_std = 0.0
+        quantile_spread = 0.0
+        if baseline_arr.size:
+            try:
+                baseline_std = float(baseline_arr.std())
+            except Exception:
+                baseline_std = float(np.std(baseline_arr))
+            if baseline_arr.size >= 4:
+                try:
+                    q_hi = float(np.quantile(baseline_arr, 0.84))
+                    q_lo = float(np.quantile(baseline_arr, 0.16))
+                    quantile_spread = max(0.0, q_hi - q_lo)
+                except Exception:
+                    quantile_spread = 0.0
+        spread_candidate = max(baseline_std, 0.5 * quantile_spread)
+        if math.isfinite(spread_candidate) and spread_candidate > 0.0 and span_scale < spread_candidate:
+            span_scale = spread_candidate
         if not math.isfinite(span_scale) or span_scale < 1e-6:
             span_scale = max(1e-6, abs(best_val) if math.isfinite(best_val) else 1.0)
         phase_step = float(getattr(self, 'monodromy_phase_step', 0.38196601125))
@@ -4853,6 +4872,7 @@ class ReproPlanaNEATPlus:
             'family_spread_mean': float(family_spread_mean),
             'family_share_delta_mean': float(family_trend_mean),
             'family_target_share': float(family_target_share),
+            'span_scale': float(span_scale_safe),
         }
         return adjusted
 
@@ -5291,6 +5311,7 @@ class ReproPlanaNEATPlus:
                             f" Δ{mono.get('relief_mean', 0.0):.3f} μ{mono.get('momentum_mean', 0.0):.3f}"
                             f" div{mono.get('diversity_mean', 0.0):.2f} gr{mono.get('grace_mean', 0.0):.2f}"
                             f" nf{mono.get('noise_factor', 1.0):.2f} fam{mono.get('family_factor_mean', 1.0):.2f}@{int(mono.get('families', 0))}"
+                            f" σ{mono.get('span_scale', 0.0):.3f}"
                         )
                         nk = mono.get('noise_kind')
                         if nk:
