@@ -2858,6 +2858,7 @@ class ReproPlanaNEATPlus:
             'noise_entropy': 0.0,
             'family_factor_mean': 1.0,
             'family_factor_max': 1.0,
+            'span_scale': 0.0,
         }
         self._monodromy_noise_tag = ''
         self._auto_complexity_bonus_state = {
@@ -4433,6 +4434,7 @@ class ReproPlanaNEATPlus:
                 'noise_entropy': 0.0,
                 'family_factor_mean': 1.0,
                 'family_factor_max': 1.0,
+                'span_scale': 0.0,
             }
 
         n = len(fitnesses)
@@ -4585,6 +4587,23 @@ class ReproPlanaNEATPlus:
         else:
             best_val = float(baseline_arr[top_indices[0]]) if top_indices else median
         span_scale = abs(best_val - median)
+        baseline_std = 0.0
+        quantile_spread = 0.0
+        if baseline_arr.size:
+            try:
+                baseline_std = float(baseline_arr.std())
+            except Exception:
+                baseline_std = float(np.std(baseline_arr))
+            if baseline_arr.size >= 4:
+                try:
+                    q_hi = float(np.quantile(baseline_arr, 0.84))
+                    q_lo = float(np.quantile(baseline_arr, 0.16))
+                    quantile_spread = max(0.0, q_hi - q_lo)
+                except Exception:
+                    quantile_spread = 0.0
+        spread_candidate = max(baseline_std, 0.5 * quantile_spread)
+        if math.isfinite(spread_candidate) and spread_candidate > 0.0 and span_scale < spread_candidate:
+            span_scale = spread_candidate
         if not math.isfinite(span_scale) or span_scale < 1e-6:
             span_scale = max(1e-6, abs(best_val) if math.isfinite(best_val) else 1.0)
         phase_step = float(getattr(self, 'monodromy_phase_step', 0.38196601125))
@@ -4853,6 +4872,7 @@ class ReproPlanaNEATPlus:
             'family_spread_mean': float(family_spread_mean),
             'family_share_delta_mean': float(family_trend_mean),
             'family_target_share': float(family_target_share),
+            'span_scale': float(span_scale_safe),
         }
         return adjusted
 
@@ -5291,6 +5311,7 @@ class ReproPlanaNEATPlus:
                             f" Δ{mono.get('relief_mean', 0.0):.3f} μ{mono.get('momentum_mean', 0.0):.3f}"
                             f" div{mono.get('diversity_mean', 0.0):.2f} gr{mono.get('grace_mean', 0.0):.2f}"
                             f" nf{mono.get('noise_factor', 1.0):.2f} fam{mono.get('family_factor_mean', 1.0):.2f}@{int(mono.get('families', 0))}"
+                            f" σ{mono.get('span_scale', 0.0):.3f}"
                         )
                         nk = mono.get('noise_kind')
                         if nk:
@@ -5510,12 +5531,20 @@ def forward_batch(comp, X, w=None):
     n = len(comp['order'])
     A = np.zeros((B, n), dtype=np.float64)
     Z = np.zeros((B, n), dtype=np.float64)
-    in_idx = comp['inputs']
-    assert X.shape[1] == len(in_idx), 'X dim != number of input nodes'
-    for k, nid in enumerate(in_idx):
-        A[:, nid] = X[:, k]
-    for b in comp['biases']:
-        A[:, b] = 1.0
+    in_idx = np.asarray(comp['inputs'], dtype=np.intp)
+    expected_inputs = int(in_idx.size)
+    X_use = X
+    if X.shape[1] != expected_inputs:
+        if X.shape[1] > expected_inputs:
+            X_use = X[:, :expected_inputs]
+        else:
+            pad = expected_inputs - X.shape[1]
+            X_use = np.pad(X, ((0, 0), (0, pad)), mode='constant')
+    if expected_inputs:
+        A[:, in_idx] = X_use[:, :expected_inputs]
+    biases = np.asarray(comp['biases'], dtype=np.intp)
+    if biases.size:
+        A[:, biases] = 1.0
     matmul_clip = float(comp.get('matmul_clip', 256.0))
     if not np.isfinite(matmul_clip) or matmul_clip < 0.0:
         matmul_clip = 0.0
@@ -8221,9 +8250,7 @@ def run_policy_in_env(genome: 'Genome', env_id: str, episodes: int=1, max_steps:
             if show_bars and probs is not None:
                 _draw_prob_bars(ax_prob, probs, title='Action probabilities')
             _apply_tight_layout(fig)
-            fig.canvas.draw()
-            w, h = fig.canvas.get_width_height()
-            buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+            buf = _fig_to_rgb(fig)
             frames.append(buf)
             plt.close(fig)
             ep_obs.append(obs.copy())
@@ -9537,10 +9564,8 @@ def run_spinor_monolith(
                 title += f' ← {note}'
             fig.suptitle(title, fontsize=12)
             _apply_tight_layout(fig)
-            fig.canvas.draw()
-            w, h = fig.canvas.get_width_height()
-            frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-            frames.append(frame.reshape(h, w, 3))
+            frame = _fig_to_rgb(fig)
+            frames.append(frame)
             plt.close(fig)
 
         if frames:
@@ -9659,6 +9684,12 @@ class SpinorGroupInteraction:
             return float(self._element_norms[int(idx) % self.size])
         except Exception:
             return float(self._element_norms[0])
+
+    def max_energy(self) -> float:
+        try:
+            return float(np.max(self._element_norms))
+        except Exception:
+            return 1.0
 
     def apply_to_points(self, idx: Optional[int], points: np.ndarray) -> np.ndarray:
         if idx is None or points.size == 0:
@@ -10757,7 +10788,8 @@ class SpinorNomologyDatasetController:
         self.evaluator_seed = evaluator_seed
         self.mandatory_mode = bool(mandatory_mode)
         embed_dim = self.spin.group.embed_dim if self.spin.group else 0
-        self.feature_dim = 12 + embed_dim
+        self._context_dim = 7
+        self.feature_dim = 5 + embed_dim + self._context_dim
         self.evaluator_feature_dim = 12 + embed_dim
         self.last_bundle: Optional[Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]] = None
         self.lazy_feedback_smoothing = 0.4
@@ -10794,6 +10826,46 @@ class SpinorNomologyDatasetController:
             except Exception:
                 pass
 
+    def _context_features(
+        self,
+        theta: float,
+        group_energy: float,
+    ) -> np.ndarray:
+        """Return normalized environmental context features (length `_context_dim`)."""
+        noise_min = float(getattr(self.env, 'noise_min', 0.0))
+        noise_max = float(getattr(self.env, 'noise_max', max(self.env.noise, 1.0)))
+        noise_span = max(1e-06, noise_max - noise_min)
+        noise_norm = (float(self.env.noise) - noise_min) / noise_span
+        turns_norm = (float(self.env.turns) - 0.6) / (3.2 - 0.6 + 1e-06)
+        rot_norm = ((float(self.env.rot_bias) + math.pi) % (2.0 * math.pi)) / (2.0 * math.pi)
+        if self.spin.group is not None:
+            try:
+                energy_scale = max(1e-06, float(self.spin.group.max_energy()))
+            except Exception:
+                energy_scale = 1.0
+        else:
+            energy_scale = 1.0
+        energy_norm = float(np.clip(group_energy / energy_scale, 0.0, 1.0))
+        entropy_norm = float(np.clip(getattr(self.env, 'noise_entropy', 0.0) / 4.0, 0.0, 1.0))
+        focus_norm = float(np.clip(getattr(self.env, 'noise_focus', 0.0) / 1.5, 0.0, 1.0))
+        ctx = np.array(
+            [
+                math.cos(theta),
+                math.sin(theta),
+                float(np.clip(noise_norm, 0.0, 1.0)),
+                float(np.clip(turns_norm, 0.0, 1.0)),
+                float(np.clip(rot_norm, 0.0, 1.0)),
+                energy_norm,
+                focus_norm,
+            ],
+            dtype=np.float32,
+        )
+        if ctx.size < self._context_dim:
+            ctx = np.pad(ctx, (0, self._context_dim - ctx.size))
+        elif ctx.size > self._context_dim:
+            ctx = ctx[: self._context_dim]
+        return ctx
+
     def _dataset_core(
         self,
         n: int,
@@ -10802,6 +10874,7 @@ class SpinorNomologyDatasetController:
         group_idx: Optional[int],
         group_embed: Optional[np.ndarray],
         group_matrix: Optional[np.ndarray],
+        group_energy: float,
     ) -> Tuple[np.ndarray, np.ndarray]:
         try:
             X, y = neat.make_spirals(n=n, noise=self.env.noise, turns=self.env.turns, seed=int(self.rng.integers(1 << 31)))
@@ -10818,7 +10891,15 @@ class SpinorNomologyDatasetController:
             except Exception:
                 pass
         X_aug, _ = augment_with_spinor(X, theta, parity=parity, group_embed=group_embed)
-        return (X_aug.astype(np.float32), y.astype(np.int64))
+        ctx = self._context_features(theta, float(group_energy))
+        ctx_tile = np.tile(ctx.reshape(1, -1), (X_aug.shape[0], 1)) if ctx.size else np.zeros((X_aug.shape[0], 0), dtype=np.float32)
+        X_full = np.concatenate([X_aug, ctx_tile], axis=1) if ctx_tile.size else X_aug
+        if X_full.shape[1] < self.feature_dim:
+            pad_width = self.feature_dim - X_full.shape[1]
+            X_full = np.pad(X_full, ((0, 0), (0, pad_width)), mode='constant')
+        elif X_full.shape[1] > self.feature_dim:
+            X_full = X_full[:, : self.feature_dim]
+        return (X_full.astype(np.float32, copy=False), y.astype(np.int64, copy=False))
 
     def set_lazy_feedback(self, generation: int, feedback: Dict[str, Any]) -> None:
         if feedback is None:
@@ -10891,8 +10972,8 @@ class SpinorNomologyDatasetController:
                 pass
             evaluator_meta = self.evaluator.step(bundle, self.env, generation=gen)
         self.env.drift()
-        Xtr, ytr = self._dataset_core(self.n_tr, theta, parity, group_idx, group_embed, group_matrix)
-        Xva, yva = self._dataset_core(self.n_va, theta, parity, group_idx, group_embed, group_matrix)
+        Xtr, ytr = self._dataset_core(self.n_tr, theta, parity, group_idx, group_embed, group_matrix, group_energy)
+        Xva, yva = self._dataset_core(self.n_va, theta, parity, group_idx, group_embed, group_matrix, group_energy)
         neat._SHM_CACHE['Xtr'] = Xtr
         neat._SHM_CACHE['ytr'] = ytr
         neat._SHM_CACHE['Xva'] = Xva
