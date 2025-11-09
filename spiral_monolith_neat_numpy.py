@@ -532,6 +532,26 @@ def _savefig(fig: 'plt.Figure', path: str, **kwargs) -> None:
     fig.savefig(path, **kwargs)
 
 
+def _apply_tight_layout(fig: Optional['plt.Figure']=None, **kwargs) -> None:
+    """Run tight_layout while silencing spurious compatibility warnings."""
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message='This figure includes Axes that are not compatible with tight_layout',
+            category=UserWarning,
+        )
+        try:
+            if fig is None:
+                import matplotlib.pyplot as _plt
+
+                _plt.tight_layout(**kwargs)
+            else:
+                fig.tight_layout(**kwargs)
+        except Exception:
+            pass
+
+
 def _stamp_image_array(arr: np.ndarray) -> np.ndarray:
     """Overlay the build stamp onto a numpy image array when Pillow is available."""
 
@@ -1623,7 +1643,9 @@ def export_lcs_ribbon_png(lcs_rows: List[Dict[str, Any]], path: str, series: Opt
         axes[2].set_ylim(max(0.0, d_min - pad), d_max + pad)
     else:
         axes[2].set_ylim(0.8, 1.4)
-    axes[0].legend(loc='upper left', frameon=False)
+    handles, labels = axes[0].get_legend_handles_labels()
+    if labels:
+        axes[0].legend(loc='upper left', frameon=False)
     for ax in axes:
         ax.grid(True, color='0.85', linestyle=(0, (1, 3)), linewidth=0.6)
     last_gen = series.get('generations', [])[-1] if series.get('generations') else None
@@ -1631,7 +1653,7 @@ def export_lcs_ribbon_png(lcs_rows: List[Dict[str, Any]], path: str, series: Opt
     summary_text = _format_lcs_summary(summary)
     fig.suptitle('Local Continuity Signature overview', y=0.98, fontsize=12)
     fig.text(0.02, 0.03, summary_text, fontsize=9, family='monospace')
-    fig.tight_layout(rect=[0, 0.06, 1, 0.95])
+    _apply_tight_layout(fig, rect=[0, 0.06, 1, 0.95])
     _savefig(fig, path, dpi=dpi)
     _plt.close(fig)
     return path
@@ -1701,16 +1723,18 @@ def export_lcs_timeline_gif(lcs_rows: List[Dict[str, Any]], path: str, series: O
         axes[0].set_ylim(-0.1, max(1.0, alt_max) + 1.0)
         axes[1].set_ylim(-0.1, max(1.0, dis_max) + 1.0)
         axes[2].set_ylim(*det_ylim)
-        axes[0].legend(loc='upper left', frameon=False)
+        handles, labels = axes[0].get_legend_handles_labels()
+        if labels:
+            axes[0].legend(loc='upper left', frameon=False)
         gen_key, summary = _latest_gen_summary(series, upto)
         summary_line = _format_lcs_summary(summary)
         cumulative = [r for r in lcs_rows if r.get('gen') is not None and r['gen'] <= upto]
         cum_heals = sum((r.get('heal_flag', 0) for r in cumulative))
         cum_breaks = sum((1 for r in cumulative if r.get('R0', 0) == 1 and r.get('R1', 0) == 0))
-        fig.suptitle(f'LCS timeline ≤ Gen {upto}', y=0.97, fontsize=12)
+        fig.suptitle(f'LCS timeline $\\leq$ Gen {upto}', y=0.97, fontsize=12)
         fig.text(0.02, 0.06, summary_line, fontsize=9, family='monospace')
         fig.text(0.02, 0.03, f'cum heals {cum_heals} | cum breaks {cum_breaks}', fontsize=8, family='monospace')
-        fig.tight_layout(rect=[0, 0.08, 1, 0.95])
+        _apply_tight_layout(fig, rect=[0, 0.08, 1, 0.95])
         frame = _fig_to_rgb(fig)
         _plt.close(fig)
         frames.append(frame)
@@ -2627,6 +2651,27 @@ class ReproPlanaNEATPlus:
         self.complexity_history_limit = 4096
         self._diversity_snapshot: Dict[str, Any] = {}
         self.refine_topk_ratio = float(os.environ.get('NEAT_REFINE_TOPK_RATIO', '0.08'))
+        self.stagnation_window = 6
+        self.stagnation_delta = 1e-3
+        self.stagnation_commission_strength = 0.35
+        self.stagnation_commission_cooldown = 6
+        self.stagnation_elite_bias = 0.65
+        self.stagnation_difficulty_bump = 0.12
+        self.stagnation_flagged_penalty = 0.08
+        self.stagnation_flagged_window = 12
+        self._stagnation_watch: Dict[str, Any] = {
+            'last_ids': tuple(),
+            'count': 0,
+            'last_best': None,
+            'last_avg': None,
+            'cooldown': 0,
+            'interventions': 0,
+            'last_gen': -1,
+        }
+        self._stagnation_elite_freeze = 0
+        self._stagnation_flagged: Dict[int, int] = {}
+        self._stagnation_pending_event: Optional[Dict[str, Any]] = None
+        self.stagnation_commission_history: List[Dict[str, Any]] = []
         nodes = {}
         for i in range(num_inputs):
             nodes[i] = NodeGene(i, 'input', 'identity')
@@ -2691,6 +2736,7 @@ class ReproPlanaNEATPlus:
         self.embryo_bias_mut_rate = 0.03
         self.mutate_sex_prob = 0.005
         self.hermaphrodite_inheritance_rate = 0.05
+        self.hermaphrodite_success_prob = 0.35
         self.regen_rate = 0.15
         self.allow_selfing = True
         self.sex_fitness_scale = {'female': 1.0, 'male': 0.9, 'hermaphrodite': 1.2}
@@ -2706,6 +2752,12 @@ class ReproPlanaNEATPlus:
         self.mutation_will_similarity_noise = 0.02
         self.mutation_will_mutation_rate = 0.1
         self.mutation_will_mutation_scale = 0.05
+        self.sexual_altruism_bonus = 0.08
+        self.sexual_altruism_memory_gain = 0.05
+        self.sexual_altruism_span_relief = 0.12
+        self.hermaphrodite_altruism_penalty = 0.12
+        self.hermaphrodite_altruism_memory_drop = 0.08
+        self.hermaphrodite_altruism_span_stress = 0.18
         self.lazy_fraction = 0.02
         self.lazy_fraction_max = 0.021
         self.lazy_individual_fitness = -1.0
@@ -3063,6 +3115,228 @@ class ReproPlanaNEATPlus:
         if applied:
             setattr(evaluator, 'last_advantage_penalty', True)
 
+        flagged = getattr(self, '_stagnation_flagged', None)
+        if isinstance(flagged, dict) and flagged:
+            penalty_scale = float(np.clip(getattr(self, 'stagnation_flagged_penalty', 0.08), 0.0, 1.0))
+            remove: List[int] = []
+            floor = min(baseline) if baseline else -1.0
+            for gid, expiry in list(flagged.items()):
+                if generation > int(expiry):
+                    remove.append(int(gid))
+                    continue
+                try:
+                    idx = next(i for i, g in enumerate(self.population) if g.id == gid)
+                except StopIteration:
+                    remove.append(int(gid))
+                    continue
+                drop = (abs(baseline[idx]) + abs(floor) + 1.0) * penalty_scale
+                baseline[idx] = float(baseline[idx] - drop)
+                fitnesses[idx] = float(fitnesses[idx] - drop)
+            for gid in remove:
+                flagged.pop(int(gid), None)
+            self._stagnation_flagged = flagged
+
+    def _monitor_top3_stagnation(
+        self,
+        top3_best: Sequence[Tuple['Genome', float, int]],
+        best_fit: float,
+        avg_fit: float,
+        generation: int,
+        fitnesses: List[float],
+        baseline_fitnesses: List[float],
+        context_best: float,
+    ) -> None:
+        watch = getattr(self, '_stagnation_watch', None)
+        if not isinstance(watch, dict):
+            watch = {
+                'last_ids': tuple(),
+                'count': 0,
+                'last_best': None,
+                'last_avg': None,
+                'cooldown': 0,
+                'interventions': 0,
+                'last_gen': -1,
+            }
+            self._stagnation_watch = watch
+        else:
+            try:
+                watch['cooldown'] = max(0, int(watch.get('cooldown', 0)) - 1)
+            except Exception:
+                watch['cooldown'] = 0
+        ids = tuple(int(g.id) for g, _fit, _gen in top3_best[:3])
+        if not ids:
+            watch.update({'last_ids': tuple(), 'count': 0, 'last_best': best_fit, 'last_avg': avg_fit, 'last_gen': int(generation)})
+            return
+        last_ids = tuple(watch.get('last_ids', tuple()))
+        unchanged = ids == last_ids and len(ids) == len(last_ids)
+        last_best = watch.get('last_best')
+        last_avg = watch.get('last_avg')
+        delta_best = best_fit - (last_best if last_best is not None else best_fit)
+        delta_avg = avg_fit - (last_avg if last_avg is not None else avg_fit)
+        delta_mag = max(abs(delta_best), abs(delta_avg))
+        window = max(3, int(getattr(self, 'stagnation_window', 6)))
+        delta_threshold = float(getattr(self, 'stagnation_delta', 1e-3))
+        stagnating = unchanged and delta_mag < delta_threshold
+        diversity = getattr(self, '_diversity_snapshot', {}) or {}
+        top_family_share = 0.0
+        if isinstance(diversity, dict):
+            try:
+                top_family_share = float(diversity.get('top_family_share', 0.0) or 0.0)
+            except Exception:
+                top_family_share = 0.0
+        family_ids: Set[int] = set()
+        for gid in ids:
+            try:
+                member = next(g for g in self.population if g.id == gid)
+            except StopIteration:
+                continue
+            try:
+                family_ids.add(int(getattr(member, 'family_id', gid)))
+            except Exception:
+                family_ids.add(int(gid))
+        lazy_payload = getattr(self, '_lazy_env_feedback', {}) or {}
+        try:
+            stasis_signal = float(np.clip(lazy_payload.get('stasis', 0.0), 0.0, 1.0)) if isinstance(lazy_payload, dict) else 0.0
+        except Exception:
+            stasis_signal = 0.0
+        family_lock = len(family_ids) <= 1 or top_family_share >= 0.5
+        watch['last_ids'] = ids
+        watch['last_best'] = float(best_fit)
+        watch['last_avg'] = float(avg_fit)
+        watch['last_gen'] = int(generation)
+        if stagnating:
+            watch['count'] = int(watch.get('count', 0)) + 1
+        elif unchanged:
+            watch['count'] = 1
+        else:
+            watch['count'] = 0
+        reason_parts: List[str] = []
+        if stagnating:
+            reason_parts.append('delta')
+        if family_lock:
+            reason_parts.append('family')
+        if stasis_signal > 0.35:
+            reason_parts.append('stasis')
+        cooldown = int(watch.get('cooldown', 0))
+        trigger = False
+        if cooldown <= 0:
+            if watch['count'] >= window and stagnating:
+                trigger = True
+            elif family_lock and watch['count'] >= max(2, window // 2):
+                trigger = True
+            elif stasis_signal > 0.55 and watch['count'] >= max(2, window // 2):
+                trigger = True
+        watch['last_reason'] = ','.join(reason_parts) if reason_parts else 'stagnation'
+        if trigger:
+            self._trigger_stagnation_intervention(
+                generation=generation,
+                ids=ids,
+                best_fit=best_fit,
+                avg_fit=avg_fit,
+                fitnesses=fitnesses,
+                baseline_fitnesses=baseline_fitnesses,
+                reason=watch['last_reason'],
+                context=context_best,
+                top_family_share=top_family_share,
+                stasis=stasis_signal,
+            )
+
+    def _trigger_stagnation_intervention(
+        self,
+        generation: int,
+        ids: Sequence[int],
+        best_fit: float,
+        avg_fit: float,
+        fitnesses: List[float],
+        baseline_fitnesses: List[float],
+        reason: str,
+        context: float,
+        top_family_share: float,
+        stasis: float,
+    ) -> None:
+        watch = getattr(self, '_stagnation_watch', None)
+        if isinstance(watch, dict):
+            watch['cooldown'] = int(max(1, getattr(self, 'stagnation_commission_cooldown', 6)))
+            watch['count'] = 0
+            watch['interventions'] = int(watch.get('interventions', 0)) + 1
+        penalty_scale = float(np.clip(getattr(self, 'stagnation_commission_strength', 0.35), 0.05, 2.0))
+        penalty_boost = 1.0 + (watch.get('interventions', 0) if isinstance(watch, dict) else 0) * 0.1
+        penalty_floor = min(baseline_fitnesses) if baseline_fitnesses else -1.0
+        flagged = getattr(self, '_stagnation_flagged', {})
+        expiry = int(generation + max(1, getattr(self, 'stagnation_flagged_window', 12)))
+        for gid in ids:
+            try:
+                idx = next(i for i, g in enumerate(self.population) if g.id == gid)
+            except StopIteration:
+                continue
+            drop = (abs(fitnesses[idx]) + abs(penalty_floor) + 1.0) * penalty_scale * penalty_boost
+            fitnesses[idx] = float(fitnesses[idx] - drop)
+            if idx < len(baseline_fitnesses):
+                baseline_fitnesses[idx] = float(baseline_fitnesses[idx] - drop)
+            genome = self.population[idx]
+            try:
+                strength = float(getattr(genome, 'lazy_lineage_strength', 0.0) or 0.0)
+                setattr(genome, 'lazy_lineage_strength', float(np.clip(strength * 0.35, 0.0, strength)))
+            except Exception:
+                pass
+            genome.cooperative = False
+            try:
+                genome.meta_reflect('stagnation_commission', {
+                    'generation': int(generation),
+                    'reason': reason,
+                    'penalty': float(drop),
+                })
+            except Exception:
+                pass
+            self._note_lineage(genome.id, generation, f'stagnation_commission {reason} Δ{drop:.3f}')
+            flagged[int(gid)] = expiry
+        self._stagnation_flagged = flagged
+        freeze = int(max(1, getattr(self, 'stagnation_commission_cooldown', 6)))
+        self._stagnation_elite_freeze = max(int(getattr(self, '_stagnation_elite_freeze', 0)), freeze)
+        try:
+            diff_prev = float(self.env.get('difficulty', 0.0))
+            self.env['difficulty'] = float(np.clip(diff_prev + getattr(self, 'stagnation_difficulty_bump', 0.12), 0.0, 5.0))
+            noise_prev = float(self.env.get('noise_std', 0.0))
+            self.env['noise_std'] = float(np.clip(noise_prev * (1.0 + 0.4 * penalty_scale) + 0.01, 0.0, 2.5))
+            focus_prev = float(self.env.get('noise_focus', 0.0) or 0.0)
+            entropy_prev = float(self.env.get('noise_entropy', 0.0) or 0.0)
+            self.env['noise_focus'] = float(np.clip(focus_prev * 0.6 + 0.4, 0.0, 2.0))
+            self.env['noise_entropy'] = float(np.clip(entropy_prev * 0.5 + 0.5, 0.0, 2.5))
+            self.env['stagnation_commission_gen'] = int(generation)
+            self.env['stagnation_commission_reason'] = reason
+        except Exception:
+            pass
+        controller = getattr(self, 'spinor_controller', None)
+        fft_payload = None
+        if controller is not None:
+            env_obj = getattr(controller, 'env', None)
+            if env_obj is not None and hasattr(env_obj, 'trigger_fft_spike'):
+                try:
+                    fft_payload = env_obj.trigger_fft_spike(
+                        strength=float(1.0 + penalty_scale),
+                        bands=None,
+                        reason=f'stagnation@{generation}',
+                    )
+                except Exception as fft_err:
+                    fft_payload = {'error': repr(fft_err)}
+        snapshot = getattr(self, '_diversity_snapshot', None)
+        if isinstance(snapshot, dict):
+            snapshot['stagnation_commission'] = int(generation)
+            snapshot['stagnation_reason'] = reason
+            snapshot['stagnation_top_share'] = float(top_family_share)
+        record = {
+            'gen': int(generation),
+            'ids': tuple(int(g) for g in ids),
+            'reason': reason,
+            'penalty_scale': float(penalty_scale),
+            'context': float(context),
+            'top_family_share': float(top_family_share),
+            'stasis': float(stasis),
+            'fft': fft_payload,
+        }
+        self.stagnation_commission_history.append(record)
+        self._stagnation_pending_event = {'generation': int(generation), **record}
+
     def _update_collective_signal(
         self,
         diversity_entropy: float,
@@ -3358,18 +3632,70 @@ class ReproPlanaNEATPlus:
             noise = float(self.rng.normal(0.0, getattr(self, 'mutation_will_child_noise', 0.05)))
             child.mutation_will = float(np.clip(avg_will + noise, 0.0, 1.0))
         inherits_hemi = False
-        if mother.sex == 'hermaphrodite' or father.sex == 'hermaphrodite':
-            if self.rng.random() < self.hermaphrodite_inheritance_rate:
-                inherits_hemi = True
-        if inherits_hemi or similar_will:
+        herm_parent = mother.sex == 'hermaphrodite' or father.sex == 'hermaphrodite'
+        if herm_parent and self.rng.random() < self.hermaphrodite_inheritance_rate:
+            inherits_hemi = True
+        herm_attempt = inherits_hemi or similar_will
+        herm_success_rate = float(np.clip(getattr(self, 'hermaphrodite_success_prob', 0.35), 0.0, 1.0))
+        if herm_attempt and self.rng.random() < herm_success_rate:
             child.sex = 'hermaphrodite'
+            setattr(child, 'hermaphrodite_attempt', True)
+            setattr(child, 'hermaphrodite_success', True)
         else:
             child.sex = 'female' if self.rng.random() < 0.5 else 'male'
+            if herm_attempt:
+                setattr(child, 'hermaphrodite_attempt', True)
+                setattr(child, 'hermaphrodite_success', False)
+        if herm_attempt:
+            reflections = list(getattr(child, 'meta_reflections', []))
+            reflections.append(
+                {
+                    'event': 'hermaphrodite_attempt',
+                    'success': bool(getattr(child, 'hermaphrodite_success', False)),
+                    'delta_score': 0.0,
+                }
+            )
+            setattr(child, 'meta_reflections', reflections)
         p = 0.7 if mother.regen or father.regen else 0.2
         child.regen = bool(self.rng.random() < p)
         child.regen_mode = self.rng.choice(['head', 'tail', 'split'])
         child.embryo_bias = mother.embryo_bias if self.rng.random() < 0.7 else father.embryo_bias
         return child
+
+    def _apply_reproductive_altruism(
+        self,
+        child: Genome,
+        mother: Optional[Genome],
+        father: Optional[Genome],
+    ) -> None:
+        if child is None or not getattr(child, 'nodes', None):
+            return
+        sexes = {getattr(mother, 'sex', None), getattr(father, 'sex', None)}
+        sexes.discard(None)
+        if not sexes:
+            return
+        alt_delta = mem_delta = span_delta = 0.0
+        if sexes == {'female', 'male'}:
+            alt_delta = float(max(0.0, getattr(self, 'sexual_altruism_bonus', 0.0)))
+            mem_delta = float(getattr(self, 'sexual_altruism_memory_gain', 0.0))
+            span_delta = -float(max(0.0, getattr(self, 'sexual_altruism_span_relief', 0.0)))
+        elif 'hermaphrodite' in sexes:
+            alt_delta = -float(max(0.0, getattr(self, 'hermaphrodite_altruism_penalty', 0.0)))
+            mem_delta = -float(max(0.0, getattr(self, 'hermaphrodite_altruism_memory_drop', 0.0)))
+            span_delta = float(max(0.0, getattr(self, 'hermaphrodite_altruism_span_stress', 0.0)))
+        else:
+            return
+        if alt_delta == 0.0 and mem_delta == 0.0 and span_delta == 0.0:
+            return
+        for node in child.nodes.values():
+            if getattr(node, 'type', '') in ('input', 'bias'):
+                continue
+            prev_alt = float(np.clip(getattr(node, 'altruism', 0.5), 0.0, 1.0))
+            prev_mem = float(np.clip(getattr(node, 'altruism_memory', 0.0), -1.5, 1.5))
+            prev_span = float(np.clip(getattr(node, 'altruism_span', 0.0), 0.0, 4.0))
+            node.altruism = float(np.clip(prev_alt + alt_delta, 0.0, 1.0))
+            node.altruism_memory = float(np.clip(prev_mem + mem_delta, -1.5, 1.5))
+            node.altruism_span = float(np.clip(prev_span + span_delta, 0.0, 4.0))
 
     def _make_offspring(self, species, offspring_counts, sidx, species_pool):
         sp = species[sidx]
@@ -3380,7 +3706,8 @@ class ReproPlanaNEATPlus:
         new_pop = []
         events = {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0, 'asexual_clone': 0}
         sp.sort()
-        elites = [g for g, _ in sp.members[:min(self.elitism, offspring_counts[sidx])]]
+        effective_elitism = max(0, int(getattr(self, '_elitism_effective', self.elitism)))
+        elites = [g for g, _ in sp.members[:min(effective_elitism, offspring_counts[sidx])]]
         for e in elites:
             child = e.copy()
             child.cooperative = True
@@ -3515,6 +3842,7 @@ class ReproPlanaNEATPlus:
                     mother_id = mother.id
                     father_id = father.id
                 child.cooperative = True
+            self._apply_reproductive_altruism(child, mother, father)
             child.id = self.next_gid
             self.next_gid += 1
             child.parents = (mother_id, father_id)
@@ -3568,10 +3896,23 @@ class ReproPlanaNEATPlus:
                 mode = 'asexual_clone'
             new_pop.append(child)
             events[mode] += 1
+            if getattr(child, 'hermaphrodite_attempt', False):
+                events.setdefault('hermaphrodite_attempt', 0)
+                events['hermaphrodite_attempt'] += 1
+                if not getattr(child, 'hermaphrodite_success', False):
+                    events.setdefault('hermaphrodite_suppressed', 0)
+                    events['hermaphrodite_suppressed'] += 1
             remaining -= 1
         return (new_pop, events)
 
     def reproduce(self, species, fitnesses):
+        freeze = int(getattr(self, '_stagnation_elite_freeze', 0))
+        effective_elitism = int(self.elitism)
+        if freeze > 0:
+            bias = float(np.clip(getattr(self, 'stagnation_elite_bias', 0.65), 0.0, 0.95))
+            effective_elitism = max(0, int(round(self.elitism * (1.0 - bias))))
+            self._stagnation_elite_freeze = freeze - 1
+        self._elitism_effective = effective_elitism
         cleaned_species = []
         for sp in species:
             members = [(g, f) for g, f in sp.members if not getattr(g, 'selfish_culled', False)]
@@ -3608,7 +3949,7 @@ class ReproPlanaNEATPlus:
         for sidx, sp in enumerate(species):
             offspring, events = self._make_offspring(species, offspring_counts, sidx, species)
             for k, v in events.items():
-                gen_events[k] += v
+                gen_events[k] = gen_events.get(k, 0) + v
             new_pop.extend(offspring)
         if len(new_pop) < self.pop_size:
             bests = [g for sp in species for g, _ in sp.members]
@@ -3661,9 +4002,17 @@ class ReproPlanaNEATPlus:
             new_pop = new_pop[:self.pop_size]
         self._assign_lazy_individuals(new_pop)
         self.population = new_pop
+        pending = getattr(self, '_stagnation_pending_event', None)
+        if isinstance(pending, dict) and int(pending.get('generation', -1)) == int(getattr(self, 'generation', -1)):
+            gen_events['stagnation_commission'] = dict(pending)
+            self._stagnation_pending_event = None
         self.event_log.append(gen_events)
         for g in new_pop:
             self.lineage_edges.append((g.parents[0], g.parents[1], g.id, g.birth_gen, 'birth'))
+        try:
+            delattr(self, '_elitism_effective')
+        except Exception:
+            pass
 
     def _assign_lazy_individuals(self, population: List[Genome]):
         frac = float(getattr(self, 'lazy_fraction', 0.02))
@@ -4875,6 +5224,26 @@ class ReproPlanaNEATPlus:
                         break
                 self._last_top3_ids = [g.id for g, _fit, _gen in top3_best]
                 self._last_top3_complexities = [genome_complexity(g) for g, _fit, _gen in top3_best]
+                self._monitor_top3_stagnation(
+                    top3_best,
+                    best_fit,
+                    avg_fit,
+                    gen,
+                    fitnesses,
+                    baseline_fitnesses,
+                    context_best,
+                )
+                if history:
+                    avg_fit = float(np.mean(fitnesses)) if fitnesses else avg_fit
+                    best_idx = int(np.argmax(fitnesses)) if fitnesses else best_idx
+                    best_fit = float(fitnesses[best_idx]) if fitnesses else best_fit
+                    context_best = self._contextual_best_axis(best_fit, avg_fit)
+                    history[-1] = (context_best, avg_fit)
+                    self.context_best_history[-1] = (context_best, avg_fit)
+                    if baseline_fitnesses:
+                        raw_best = float(np.max(baseline_fitnesses))
+                        raw_avg = float(np.mean(baseline_fitnesses))
+                        self.raw_best_history[-1] = (raw_best, raw_avg)
                 try:
                     curr_best = self.population[best_idx].copy()
                     scars = diff_scars(prev_best, curr_best, scars, birth_gen=gen, regen_mode_for_new=getattr(curr_best, 'regen_mode', 'split'))
@@ -4899,7 +5268,16 @@ class ReproPlanaNEATPlus:
                     noise = float(self.env.get('noise_std', 0.0))
                     ev = self.event_log[-1] if self.event_log else {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0}
                     n_herm = sum((1 for g in self.population if g.sex == 'hermaphrodite'))
-                    herm_str = f' | herm {n_herm}' if n_herm > 0 else ''
+                    herm_attempts = int(ev.get('hermaphrodite_attempt', 0) or 0)
+                    herm_str = f' | herm {n_herm}' if (n_herm > 0 or herm_attempts > 0) else ''
+                    if herm_attempts:
+                        if herm_str:
+                            herm_str = f'{herm_str} a{herm_attempts}'
+                        else:
+                            herm_str = f' | herm a{herm_attempts}'
+                        suppressed = int(ev.get('hermaphrodite_suppressed', 0) or 0)
+                        if suppressed:
+                            herm_str = f'{herm_str} s{suppressed}'
                     top3_str = ''
                     if len(top3_best) >= 3:
                         complexities = [(sum((1 for n in g.nodes.values() if n.type == 'hidden')), sum((1 for c in g.connections.values() if c.enabled))) for g, _, _ in top3_best]
@@ -5138,6 +5516,10 @@ def forward_batch(comp, X, w=None):
         A[:, nid] = X[:, k]
     for b in comp['biases']:
         A[:, b] = 1.0
+    matmul_clip = float(comp.get('matmul_clip', 256.0))
+    if not np.isfinite(matmul_clip) or matmul_clip < 0.0:
+        matmul_clip = 0.0
+    out_clip = matmul_clip * max(1.0, float(np.sqrt(max(1, n)))) if matmul_clip > 0.0 else 0.0
     for j in range(n):
         if comp['types'][j] in ('input', 'bias'):
             continue
@@ -5149,13 +5531,32 @@ def forward_batch(comp, X, w=None):
             if end > start:
                 idx = flat[start:end]
                 src_idx = comp['src'][idx]
-                z = A[:, src_idx] @ w[idx]
+                inputs = np.nan_to_num(A[:, src_idx], nan=0.0, posinf=0.0, neginf=0.0)
+                weights = np.nan_to_num(w[idx], nan=0.0, posinf=0.0, neginf=0.0)
+                if matmul_clip > 0.0:
+                    inputs = np.clip(inputs, -matmul_clip, matmul_clip)
+                    weights = np.clip(weights, -matmul_clip, matmul_clip)
+                with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+                    z = inputs @ weights
             else:
                 z = np.zeros(B, dtype=np.float64)
         else:
             z = np.zeros(B, dtype=np.float64)
             for e in comp['in_edges'][j]:
-                z += A[:, comp['src'][e]] * w[e]
+                contrib = np.nan_to_num(A[:, comp['src'][e]], nan=0.0, posinf=0.0, neginf=0.0)
+                weight = float(np.nan_to_num(w[e], nan=0.0, posinf=0.0, neginf=0.0))
+                if matmul_clip > 0.0:
+                    contrib = np.clip(contrib, -matmul_clip, matmul_clip)
+                    weight = float(np.clip(weight, -matmul_clip, matmul_clip))
+                z += contrib * weight
+        z = np.nan_to_num(
+            z,
+            nan=0.0,
+            posinf=out_clip if matmul_clip > 0.0 else 0.0,
+            neginf=-out_clip if matmul_clip > 0.0 else 0.0,
+        )
+        if matmul_clip > 0.0:
+            np.clip(z, -out_clip, out_clip, out=z)
         Z[:, j] = z
         A[:, j] = act_forward(comp['acts'][j], z)
     return (A, Z)
@@ -5673,7 +6074,7 @@ def draw_genome_png(genome: Genome, scars: Optional[Dict[int, 'Scar']], path: st
         ax.set_title(title)
     ax.set_aspect('equal', adjustable='box')
     ax.axis('off')
-    fig.tight_layout()
+    _apply_tight_layout(fig)
     _savefig(fig, path, dpi=200)
     plt.close(fig)
 
@@ -5897,7 +6298,7 @@ def export_double_exposure(genome: Genome, lineage_edges: List[Tuple[Optional[in
         ax.add_patch(circ2)
     if title:
         ax.set_title(title)
-    fig.tight_layout()
+    _apply_tight_layout(fig)
     _savefig(fig, out_path, dpi=220)
     plt.close(fig)
 
@@ -6084,7 +6485,7 @@ def render_lineage(neat, path='lineage.png', title='Lineage', max_edges: Optiona
             if not text:
                 continue
             ax.text(x + 0.012, y - 0.05, text, fontsize=5.5, ha='left', va='top', alpha=0.85, family='monospace')
-    fig.tight_layout()
+    _apply_tight_layout(fig)
     _savefig(fig, path, dpi=dpi)
     plt.close(fig)
 
@@ -6125,7 +6526,7 @@ def plot_learning_and_complexity(history: List[Tuple[float, float]], hidden_coun
     ax2.set_ylabel('Complexity')
     if title:
         ax1.set_title(title)
-    fig.tight_layout()
+    _apply_tight_layout(fig)
     _savefig(fig, out_path, dpi=200)
     plt.close(fig)
 
@@ -6208,7 +6609,7 @@ def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: st
     ax_bottom.set_xlabel('generation')
     if title:
         fig.suptitle(title, fontsize=13)
-    fig.tight_layout(rect=[0, 0.02, 1, 0.98])
+    _apply_tight_layout(fig, rect=[0, 0.02, 1, 0.98])
     _savefig(fig, png_path, dpi=220)
     plt.close(fig)
     return (csv_path, png_path)
@@ -6239,7 +6640,7 @@ def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, c
         fig.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
     ax.set_xlabel('x')
     ax.set_ylabel('y')
-    fig.tight_layout()
+    _apply_tight_layout(fig)
     _savefig(fig, out_path, dpi=220)
     plt.close(fig)
     history_arr = np.asarray(history, dtype=np.float64) if len(history) else np.zeros(0, dtype=np.float64)
@@ -6358,7 +6759,7 @@ def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50
         ax_right.text(0.5, 0.5, 'No temperament statistics', ha='center', va='center', fontsize=10)
         ax_right.set_axis_off()
     fig.suptitle(f'Backprop Variation | steps={steps}', fontsize=12)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    _apply_tight_layout(fig, rect=(0.0, 0.0, 1.0, 0.96))
     _savefig(fig, out_path, dpi=220)
     plt.close(fig)
     return {'figure': out_path, 'history': loss, 'profile': profile}
@@ -6391,7 +6792,7 @@ def compose_gallery_from_existing(result: Dict[str, str], out_dir: str, task: st
             ax.imshow(img)
             ax.set_title(title, fontsize=11)
             ax.axis('off')
-        fig.tight_layout()
+        _apply_tight_layout(fig)
         _savefig(fig, combo, dpi=220)
         plt.close(fig)
         outputs[f'{idx:02d} {task.upper()} 学習曲線＋決定境界'] = combo
@@ -6427,7 +6828,7 @@ def export_task_gallery(tasks: Tuple[str, ...], gens: int, pop: int, steps: int,
                 ax.imshow(img)
                 ax.set_title(f'{task.upper()} | {title}')
                 ax.axis('off')
-            fig.tight_layout()
+            _apply_tight_layout(fig)
             _savefig(fig, combo, dpi=220)
             plt.close(fig)
             outputs[f'{idx:02d} {task.upper()} 学習曲線＋決定境界'] = combo
@@ -7209,7 +7610,7 @@ def export_scars_spiral_map(snapshots_genomes: List[Genome], snapshots_scars: Li
     ax.set_title(title, fontsize=12, loc='left')
     if any((xs[k] for k in xs)):
         ax.legend(loc='upper left', frameon=False, fontsize=9, handlelength=1.0)
-    fig.tight_layout()
+    _apply_tight_layout(fig)
     _savefig(fig, out_path, dpi=dpi)
     _plt.close(fig)
     return out_path
@@ -7819,7 +8220,7 @@ def run_policy_in_env(genome: 'Genome', env_id: str, episodes: int=1, max_steps:
             ax_nn.set_title('Policy network (activations)')
             if show_bars and probs is not None:
                 _draw_prob_bars(ax_prob, probs, title='Action probabilities')
-            fig.tight_layout()
+            _apply_tight_layout(fig)
             fig.canvas.draw()
             w, h = fig.canvas.get_width_height()
             buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
@@ -7886,7 +8287,7 @@ def run_gym_neat_experiment(env_id: str, gens: int=20, pop: int=24, episodes: in
     plt.ylabel('episode reward')
     plt.title(f'{env_id} | Average Episode Reward')
     plt.legend()
-    plt.tight_layout()
+    _apply_tight_layout()
     fig = plt.gcf()
     _savefig(fig, rc_png, dpi=150)
     plt.close()
@@ -8541,7 +8942,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             plt.ylabel('episode reward')
             plt.title(f'{args.rl_env} | Average Episode Reward')
             plt.legend()
-            plt.tight_layout()
+            _apply_tight_layout()
             fig = plt.gcf()
             _savefig(fig, rc_png, dpi=150)
             plt.close()
@@ -8921,7 +9322,7 @@ def run_spinor_monolith(
     plt.xlabel('generation')
     plt.ylabel('theta mod 4π')
     fig1 = f'{out_prefix}_phase.png'
-    plt.tight_layout()
+    _apply_tight_layout()
     fig = plt.gcf()
     _savefig(fig, fig1, dpi=160)
     plt.close()
@@ -8931,7 +9332,7 @@ def run_spinor_monolith(
     plt.xlabel('generation')
     plt.ylabel('parity (2π branch)')
     fig2 = f'{out_prefix}_parity.png'
-    plt.tight_layout()
+    _apply_tight_layout()
     fig = plt.gcf()
     _savefig(fig, fig2, dpi=160)
     plt.close()
@@ -8948,7 +9349,7 @@ def run_spinor_monolith(
     plt.xlabel('generation')
     plt.ylabel('theta mod 4π (regimes)')
     fig3 = f'{out_prefix}_regimes.png'
-    plt.tight_layout()
+    _apply_tight_layout()
     fig = plt.gcf()
     _savefig(fig, fig3, dpi=160)
     plt.close()
@@ -9003,7 +9404,7 @@ def run_spinor_monolith(
         if legend_handles:
             ax.legend(handles=legend_handles, loc='upper right', frameon=False, fontsize=9, title='noise kind')
         ax.grid(True, alpha=0.18, linestyle='--', linewidth=0.6)
-        fig.tight_layout()
+        _apply_tight_layout(fig)
         _savefig(fig, fig_noise, dpi=170)
         plt.close(fig)
 
@@ -9078,7 +9479,7 @@ def run_spinor_monolith(
                 ax.grid(False)
             for ax in axes_arr[len(snapshots):]:
                 ax.axis('off')
-            fig.tight_layout()
+            _apply_tight_layout(fig)
             spinor_grid_png = f'{out_prefix}_spinor_transition_grid.png'
             _savefig(fig, spinor_grid_png, dpi=170)
             plt.close(fig)
@@ -9135,7 +9536,7 @@ def run_spinor_monolith(
             if note:
                 title += f' ← {note}'
             fig.suptitle(title, fontsize=12)
-            fig.tight_layout()
+            _apply_tight_layout(fig)
             fig.canvas.draw()
             w, h = fig.canvas.get_width_height()
             frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
@@ -9541,6 +9942,55 @@ class NomologyEnv:
             self.noise_harmonics = {}
         self.noise_focus = float(profile.get('mix_focus', focus_val))
         self.noise_entropy = float(profile.get('mix_entropy', entropy_val))
+
+    def trigger_fft_spike(self, strength: float=1.0, bands: Optional[int]=None, reason: str='') -> Dict[str, Any]:
+        bands = int(bands) if bands is not None else int(max(8, self.noise_stage_len * 2))
+        bands = max(4, bands)
+        sample_len = max(bands * 2, int(self.noise_stage_len) * 4)
+        sample = self._rng.normal(0.0, self.noise + 0.01 * strength, size=sample_len)
+        spectrum = np.abs(np.fft.rfft(sample))
+        spectrum = np.nan_to_num(spectrum, nan=0.0, posinf=0.0, neginf=0.0)
+        total = float(spectrum.sum())
+        if total <= 0.0:
+            spectrum = np.ones_like(spectrum, dtype=np.float64)
+            total = float(spectrum.sum())
+        spectrum /= total
+        keep = min(bands, spectrum.size)
+        harmonics = {f'h{idx}': float(spectrum[idx]) for idx in range(keep)}
+        peak = float(spectrum[:keep].max()) if keep else 0.0
+        entropy = 0.0
+        if keep > 1:
+            entropy = float(-(spectrum[:keep] * np.log(spectrum[:keep] + 1e-12)).sum() / np.log(keep))
+        self.noise_harmonics = harmonics
+        self.noise_focus = float(np.clip(0.55 * self.noise_focus + 0.45 * peak * (1.0 + 0.25 * strength), 0.0, 1.8))
+        self.noise_entropy = float(np.clip(0.6 * self.noise_entropy + 0.4 * entropy, 0.0, 2.5))
+        self.noise = float(np.clip(self.noise * (1.0 + 0.22 * strength), self.noise_min, self.noise_max))
+        try:
+            self.noise_kind = str(self._rng.choice(self.noise_palette))
+        except Exception:
+            pass
+        style = self.noise_style(self.noise_kind)
+        self.noise_kind_label = style.get('label', self.noise_kind_label)
+        self.noise_kind_symbol = style.get('symbol', self.noise_kind_symbol)
+        self.noise_kind_color = style.get('color', self.noise_kind_color)
+        self.noise_kind_code = int(style.get('index', self.noise_kind_code))
+        self.turns = float(np.clip(self.turns * (1.0 + self._rng.normal(0.0, 0.1 * strength)), 0.7, 2.8))
+        self.rot_bias = float(np.clip(self.rot_bias + self._rng.normal(0.0, 0.45 * strength), -math.pi, math.pi))
+        self.regime_id = int(self.regime_id + 1)
+        self._refresh_noise(advance=True, surge=True)
+        payload = {
+            'strength': float(strength),
+            'peak': float(peak),
+            'focus': float(self.noise_focus),
+            'entropy': float(self.noise_entropy),
+            'reason': reason,
+            'regime_id': int(self.regime_id),
+        }
+        self.noise_profile['fft_peak'] = float(peak)
+        self.noise_profile['fft_entropy'] = float(self.noise_entropy)
+        self.noise_profile['fft_reason'] = reason
+        self.noise_profile['fft_stamp'] = time.time()
+        return payload
 
     def maybe_switch(self) -> bool:
         triggered = bool(self._rng.random() < self.intensity)
