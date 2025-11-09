@@ -16,47 +16,98 @@
 # • Tunable: tweak council weights, lazy pressure, or mandatory policies inline and re-run instantly.
 #   調整容易: 合議制ウェイトや怠惰個体圧、mandatory ポリシーをその場で書き換えすぐ検証できます。
 #
-# Quickstart / クイックスタート
-#   python spiral_monolith_neat_numpy.py --help
-# Discover CLI presets, exporters, and governance toggles—`--no-mandatory` flips the council back to
-# soft advisory mode for exploratory runs.
-# CLI でプリセットやエクスポート、ガバナンス設定を確認できます。`--no-mandatory` で mandatory を無効化し、
-# 柔軟な実験モードに切り替えられます。
+# Systems overview / システム概要
+# 1. Genome & caches / ゲノムとキャッシュ
+#    • `NodeGene` / `ConnectionGene` / `Genome` encode graph-structured policies with
+#      adjacency caching, structural signatures, and regeneration metadata. The
+#      `_structure_cache_*` helpers plus `compile_genome` memoise NumPy-ready graphs
+#      for repeated forward passes.
+#      ・`NodeGene` / `ConnectionGene` / `Genome` がグラフ型ポリシーを表現し、隣接行列キャッシュや構造シグネチャ、
+#        再生メタデータを保持します。`_structure_cache_*` 群と `compile_genome` により、繰り返し利用する NumPy グラフを
+#        メモ化します。
+#    • `InnovationTracker` and regeneration utilities (`_soft_regenerate_*`,
+#      `platyregenerate`) maintain NEAT’s structural novelty while supporting
+#      “soft” mutation modes keyed off Lazy Council feedback.
+#      ・`InnovationTracker` と `_soft_regenerate_*` / `platyregenerate` は Lazy Council からの
+#        フィードバックを受けた「ソフト再生」変異を扱いながら、NEAT 本来の構造革新を保持します。
 #
-# Pillars / コア機能
-# • Monodromy-aware curricula: environment difficulty follows topology shifts for path-dependent regimes.
-#   モノドロミー対応カリキュラム: トポロジー変化に応じた環境難度制御で軌跡依存の学習を実現。
-# • Lazy Council orchestration: top performers + stochastic delegates cast equal votes to steer dynamics,
-#   while lazy-lineage amplification prevents overfitting to any diversity axis.
-#   Lazy Council オーケストレーション: トップ個体とランダム代表が同票で舵取りし、多様性軸の過適応を怠惰系統強化で抑制。
-# • Hybrid NEAT × backprop loop: champion genomes receive NumPy-based fine-tuning without losing structural novelty.
-#   NEAT とバックプロップのハイブリッド: 勝者ゲノムに NumPy 微調整を適用し構造革新を維持。
-# • Artefact exports: lineage graphs, morph GIFs, regeneration timelines, LCS ribbons—curated via a headless-ready
-#   Matplotlib pipeline.
-#   成果物エクスポート: 系統グラフや形態 GIF、再生タイムライン、LCS リボンをヘッドレス環境対応の Matplotlib で出力。
+# 2. Council governance & evolution / 合議制ガバナンスと進化ループ
+#    • `ReproPlanaNEATPlus` drives speciation, offspring creation, lazy-lineage
+#      assignment, complexity auto-scaling, and monodromy-aware diversity bonuses.
+#      `HouseholdManager`, `LCSMonitor`, and resilience trackers feed difficulty and
+#      healing signals back into the population.
+#      ・`ReproPlanaNEATPlus` が種分化、子個体生成、怠惰系統割当、複雑度オートスケーリング、モノドロミー多様性
+#        ボーナスを統括し、`HouseholdManager`・`LCSMonitor`・レジリエンス追跡が難度や治癒シグナルを個体群へ還元します。
+#    • The six-seat Lazy Council is materialised via `SpinorGroupInteraction`,
+#      `SpinorScheduler`, `NomologyEnv`, and `SpinorNomologyFitness`. Mandatory mode
+#      (default) enforces council directives; `--no-mandatory` relaxes them.
+#      ・6 席の Lazy Council は `SpinorGroupInteraction`・`SpinorScheduler`・`NomologyEnv`・
+#        `SpinorNomologyFitness` により具体化されます。mandatory モード（既定）は議決を強制し、`--no-mandatory`
+#        で緩和できます。
+#    • The self-reproducing environment (`SelfReproducingEvaluator` and
+#      `SpinorNomologyDatasetController`) co-evolves support datasets, enabling
+#      feedback between resident genomes and the governing spinor curriculum.
+#      ・`SelfReproducingEvaluator` と `SpinorNomologyDatasetController` による自己再生環境が支援データセットを
+#        共進化させ、住民ゲノムとスピノールカリキュラムの双方向フィードバックを実現します。
 #
-# Featured recipes / 代表的レシピ
-# • Spiral benchmark explorer / スパイラル課題徹底解析
-#     python spiral_monolith_neat_numpy.py \
-#         --task spiral --gens 60 --pop 96 --steps 60 \
-#         --make-gifs --make-lineage --report --out out/spiral_bold
-# • Monodromy spotlight / モノドロミーモード詳解
-#     python spiral_monolith_neat_numpy.py \
-#         --task spiral --gens 60 --pop 96 --steps 60 \
-#         --monodromy --make-gifs --make-lineage --report --out out/spiral_monodromy
-# • Gym baseline / Gym 連携ベースライン
-#     python - <<'PY'
-#     from spiral_monolith_neat_numpy import run_gym_neat_experiment
-#     run_gym_neat_experiment(
-#         "CartPole-v1", gens=30, pop=64, episodes=3, max_steps=500,
-#         stochastic=True, temp=0.8, out_prefix="out/cartpole"
-#     )
-#     PY
+# 3. Backprop refinement & shared datasets / バックプロップ精緻化と共有データ
+#    • Supervised tasks (`make_xor`, `make_circles`, `make_spirals`) are trained via
+#      `train_with_backprop_numpy`, with evaluation orchestrated by
+#      `fitness_backprop_classifier` and optional refinement hooks.
+#      ・教師あり課題（`make_xor`・`make_circles`・`make_spirals`）は `train_with_backprop_numpy`
+#        で学習され、`fitness_backprop_classifier` と追加精緻化フックが評価を制御します。
+#    • Shared-memory helpers (`shm_register_dataset`, `get_shared_dataset`,
+#      `PerSampleSequenceStopperPro`) keep dataset copies minimal when spawning
+#      worker processes for parallel evaluation.
+#      ・共有メモリ機構（`shm_register_dataset`・`get_shared_dataset`・`PerSampleSequenceStopperPro`）により、
+#        並列評価プロセスでもデータセットの複製を抑えます。
+#
+# 4. Visualisation & artefacts / 可視化と成果物
+#    • Headless-safe Matplotlib helpers (`_ensure_matplotlib_agg`, `_stamp_figure`,
+#      `_savefig`, `_mimsave`) stamp build metadata from `_resolve_build_info` onto
+#      PNG/GIF outputs.
+#      ・ヘッドレス対応の Matplotlib ヘルパー（`_ensure_matplotlib_agg`・`_stamp_figure`・`_savefig`・`_mimsave`）が
+#        `_resolve_build_info` 由来のビルド情報を PNG/GIF に刻印します。
+#    • Exporters cover topology (`draw_genome_png`, `export_double_exposure`),
+#      regeneration timelines (`export_regen_gif`, `export_morph_gif`,
+#      `export_scars_spiral_map`), lineage graphs (`render_lineage`), and Lazy
+#      Council telemetry (`export_lcs_ribbon_png`, `export_lcs_timeline_gif`).
+#      ・トポロジ（`draw_genome_png`・`export_double_exposure`）、再生タイムライン（`export_regen_gif`・
+#        `export_morph_gif`・`export_scars_spiral_map`）、系譜グラフ（`render_lineage`）、Lazy Council テレメトリ
+#        （`export_lcs_ribbon_png`・`export_lcs_timeline_gif`）など、成果物エクスポートが充実しています。
+#
+# 5. CLI & demos / CLI とデモ
+#    • Running with no arguments executes `run_spinor_monolith`—a fractal spinor
+#      governance showcase that emits telemetry CSV/PNG/GIF artefacts under the
+#      requested output directory.
+#      ・引数なし実行で `run_spinor_monolith` によるフラクタル・スピノール統治デモが起動し、指定出力先に
+#        テレメトリ CSV / PNG / GIF を生成します。
+#    • `--task {xor,circles,spiral}` triggers supervised Lazy Council NEAT runs via
+#      `run_backprop_neat_experiment`; pass multiple flags to queue several tasks.
+#      ・`--task {xor,circles,spiral}` で Lazy Council NEAT 教師あり実験（`run_backprop_neat_experiment`）を起動し、
+#        複数指定で連続実行します。
+#    • RL support enters through `--rl-env` which drives `run_gym_neat_experiment`
+#      (wrapping `run_policy_in_env`). Optional `--rl-gameplay-gif` captures rollouts.
+#      ・`--rl-env` で `run_gym_neat_experiment`（内部で `run_policy_in_env` を利用）を呼び出し、`--rl-gameplay-gif`
+#        でロールアウトを GIF 化できます。
+#    • `--version` prints build metadata, while `--no-mandatory` downgrades council
+#      governance to advisory mode for exploratory tuning.
+#      ・`--version` はビルド情報を表示、`--no-mandatory` は合議制を助言モードに落として探索を柔軟化します。
+#
+# 6. Embeddable API / 組み込み API
+#    • Import helpers (`run_backprop_neat_experiment`, `run_gym_neat_experiment`,
+#      `run_policy_in_env`, `compile_genome`, `forward_batch`, `predict_proba`) for
+#      notebook or service integration; see `__all__` near the bottom for the full
+#      public surface.
+#      ・ノートブックやサービス統合向けに `run_backprop_neat_experiment`・`run_gym_neat_experiment`・
+#        `run_policy_in_env`・`compile_genome`・`forward_batch`・`predict_proba` などを公開しており、
+#        公開インターフェース全体は末尾の `__all__` を参照してください。
 #
 # Outputs / 成果物
-# All PNG, GIF, and optional HTML artefacts land under `--out` (or `out_prefix`) using a hardened `_savefig`
-# pipeline so fonts, transparency, and permissions stay consistent across platforms.
-# PNG / GIF / HTML 成果物は強化済み `_savefig` パイプラインを介して `--out`（または `out_prefix`）以下に整理保存され、
+# All PNG, GIF, HTML, and CSV artefacts land under `--out` (or `out_prefix`) using
+# a hardened `_savefig` pipeline so fonts, transparency, and permissions stay
+# consistent across platforms.
+# PNG / GIF / HTML / CSV 成果物は強化済み `_savefig` パイプラインを介して `--out`（または `out_prefix`）以下に整理保存され、
 # フォントや透過設定、パーミッションが環境間で揃います。
 #
 # Author: Ryo ∴ SpiralArcitect & AIs from SpiralReality
