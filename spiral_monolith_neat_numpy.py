@@ -182,6 +182,64 @@ weights = clamp(weights, 1e-8, None);
 
 _RL_WEIGHT_PROGRAM_CACHE: Dict[str, Any] = {}
 
+_RL_SIGNAL_COEFF_DEFAULTS: Dict[str, float] = {
+    'stress_bias': 0.35,
+    'stress_instability': 0.45,
+    'stress_trend': 0.2,
+    'stress_done': 0.15,
+    'altruism_base': 0.4,
+    'altruism_stability': 0.4,
+    'altruism_relief': 0.2,
+    'altruism_novelty': 0.15,
+    'solidarity_base': 0.3,
+    'solidarity_stability': 0.4,
+    'solidarity_lazy': 0.15,
+    'solidarity_done_relief': 0.15,
+    'advantage_base': 0.45,
+    'advantage_trend': 0.35,
+    'advantage_span': 0.25,
+    'advantage_novelty': 0.1,
+}
+
+_RL_SIGNAL_DSL_TEMPLATE = """
+// cpp-ish DSL for collective signal synthesis.
+stress = clamp(
+    {stress_bias}
+    + {stress_instability} * (1.0 - stability)
+    + {stress_trend} * abs(trend_norm)
+    + {stress_done} * done_ratio,
+    0.0,
+    1.0
+);
+altruism_target = clamp(
+    {altruism_base}
+    + {altruism_stability} * stability
+    + {altruism_relief} * (1.0 - stress)
+    + {altruism_novelty} * novelty_scale,
+    0.0,
+    1.0
+);
+solidarity = clamp(
+    {solidarity_base}
+    + {solidarity_stability} * stability
+    + {solidarity_lazy} * lazy_share
+    + {solidarity_done_relief} * (1.0 - done_ratio),
+    0.0,
+    1.0
+);
+span_component = np.tanh((reward_span + reward_std) / denom);
+advantage = clamp(
+    {advantage_base}
+    + {advantage_trend} * trend_norm
+    + {advantage_span} * span_component
+    + {advantage_novelty} * novelty_scale,
+    0.0,
+    1.0
+);
+"""
+
+_RL_SIGNAL_PROGRAM_CACHE: Dict[str, Any] = {}
+
 
 def _rl_default_meta() -> Dict[str, Any]:
     return {
@@ -281,6 +339,36 @@ def _ensure_rl_weight_coeffs(genome: 'Genome') -> Dict[str, float]:
     return coeffs
 
 
+def _rl_sanitise_signal_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_RL_SIGNAL_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _RL_SIGNAL_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            if key.startswith('stress_'):
+                val = float(np.clip(val, -0.5, 1.5))
+            elif key.startswith('altruism_'):
+                val = float(np.clip(val, -0.5, 1.5))
+            elif key.startswith('solidarity_'):
+                val = float(np.clip(val, -0.5, 1.5))
+            elif key.startswith('advantage_'):
+                val = float(np.clip(val, -0.5, 1.5))
+            base[key] = val
+    return base
+
+
+def _ensure_rl_signal_coeffs(genome: 'Genome') -> Dict[str, float]:
+    coeffs = getattr(genome, 'rl_signal_coeffs', None)
+    coeffs = _rl_sanitise_signal_coeffs(coeffs)
+    genome.rl_signal_coeffs = coeffs
+    return coeffs
+
+
 def _rl_weight_program_for(genome: 'Genome') -> str:
     template = getattr(genome, 'rl_weight_program_template', None)
     if not isinstance(template, str) or not template.strip():
@@ -294,6 +382,22 @@ def _rl_weight_program_for(genome: 'Genome') -> str:
         program = template.format(**formatted)
     except KeyError:
         program = _RL_WEIGHT_DSL_TEMPLATE.format(**{k: repr(v) for k, v in _RL_WEIGHT_COEFF_DEFAULTS.items()})
+    return program
+
+
+def _rl_signal_program_for(genome: 'Genome') -> str:
+    template = getattr(genome, 'rl_signal_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _RL_SIGNAL_DSL_TEMPLATE
+        genome.rl_signal_program_template = template
+    coeffs = _ensure_rl_signal_coeffs(genome)
+    formatted = {key: repr(float(value)) for key, value in coeffs.items()}
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        program = _RL_SIGNAL_DSL_TEMPLATE.format(
+            **{k: repr(v) for k, v in _RL_SIGNAL_COEFF_DEFAULTS.items()}
+        )
     return program
 
 
@@ -314,6 +418,26 @@ def _rl_compile_weight_program(program: str):
     src = '\n'.join(lines)
     compiled = compile(src, '<rl_weight_program>', 'exec')
     _RL_WEIGHT_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _rl_compile_signal_program(program: str):
+    cached = _RL_SIGNAL_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty RL signal program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<rl_signal_program>', 'exec')
+    _RL_SIGNAL_PROGRAM_CACHE[program] = compiled
     return compiled
 
 
@@ -345,6 +469,28 @@ def _rl_run_weight_program(state: Dict[str, Any], program: str) -> Optional[np.n
         return np.asarray(weights, dtype=np.float64)
     except Exception:
         return None
+
+
+def _rl_run_signal_program(state: Dict[str, Any], program: str) -> Optional[Dict[str, float]]:
+    try:
+        compiled = _rl_compile_signal_program(program)
+    except Exception:
+        return None
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    result: Dict[str, float] = {}
+    for key in ('altruism_target', 'solidarity', 'stress', 'lazy_share', 'advantage'):
+        val = locals_dict.get(key, state.get(key))
+        if val is None:
+            return None
+        try:
+            result[key] = float(val)
+        except Exception:
+            return None
+    return result
 
 
 def _stack_replay_observations(obs_list: Sequence[np.ndarray]) -> np.ndarray:
@@ -381,6 +527,20 @@ def _mutate_rl_weight_kernel(genome: 'Genome', rng: np.random.Generator) -> None
     genome.rl_weight_coeffs = coeffs
 
 
+def _mutate_rl_signal_kernel(genome: 'Genome', rng: np.random.Generator) -> None:
+    coeffs = _ensure_rl_signal_coeffs(genome)
+    key = rng.choice(list(_RL_SIGNAL_COEFF_DEFAULTS.keys()))
+    current = float(coeffs.get(key, _RL_SIGNAL_COEFF_DEFAULTS[key]))
+    if key.endswith('_base'):
+        current = float(np.clip(current + rng.normal(0.0, 0.08), -0.5, 1.5))
+    elif key.startswith('stress_'):
+        current = float(np.clip(current + rng.normal(0.0, 0.1), -0.5, 1.5))
+    else:
+        current = float(np.clip(current + rng.normal(0.0, 0.12), -0.5, 1.5))
+    coeffs[key] = current
+    genome.rl_signal_coeffs = coeffs
+
+
 def _rl_collective_signal(
     genome: 'Genome',
     meta: Dict[str, Any],
@@ -412,20 +572,46 @@ def _rl_collective_signal(
         done_flags = [1.0 if bool(exp.get('done')) else 0.0 for exp in experiences]
         if done_flags:
             done_ratio = float(sum(done_flags) / len(done_flags))
-    stress_base = 0.35 + 0.45 * (1.0 - stability) + 0.2 * abs(trend_norm) + 0.15 * done_ratio
-    stress = float(np.clip(stress_base, 0.0, 1.0))
-    altruism_target = float(np.clip(0.4 + 0.4 * stability + 0.2 * (1.0 - stress) + 0.15 * novelty_scale, 0.0, 1.0))
-    solidarity = float(np.clip(0.3 + 0.4 * stability + 0.15 * lazy_share + 0.15 * (1.0 - done_ratio), 0.0, 1.0))
-    span_component = float(np.tanh((reward_span + reward_std) / denom))
-    advantage_base = 0.45 + 0.35 * trend_norm + 0.25 * span_component + 0.1 * novelty_scale
-    advantage = float(np.clip(advantage_base, 0.0, 1.0))
-    return {
-        'altruism_target': altruism_target,
-        'solidarity': solidarity,
-        'stress': stress,
+    coeffs = _ensure_rl_signal_coeffs(genome)
+    program = _rl_signal_program_for(genome)
+    state = {
+        'stability': stability,
+        'trend_norm': trend_norm,
+        'done_ratio': done_ratio,
+        'novelty_scale': novelty_scale,
         'lazy_share': lazy_share,
-        'advantage': advantage,
+        'reward_span': reward_span,
+        'reward_std': reward_std,
+        'denom': denom,
     }
+    signal = _rl_run_signal_program(state, program)
+    if signal is None:
+        stress_base = 0.35 + 0.45 * (1.0 - stability) + 0.2 * abs(trend_norm) + 0.15 * done_ratio
+        stress = float(np.clip(stress_base, 0.0, 1.0))
+        altruism_target = float(np.clip(0.4 + 0.4 * stability + 0.2 * (1.0 - stress) + 0.15 * novelty_scale, 0.0, 1.0))
+        solidarity = float(np.clip(0.3 + 0.4 * stability + 0.15 * lazy_share + 0.15 * (1.0 - done_ratio), 0.0, 1.0))
+        span_component = float(np.tanh((reward_span + reward_std) / denom))
+        advantage_base = 0.45 + 0.35 * trend_norm + 0.25 * span_component + 0.1 * novelty_scale
+        advantage = float(np.clip(advantage_base, 0.0, 1.0))
+        signal = {
+            'altruism_target': altruism_target,
+            'solidarity': solidarity,
+            'stress': stress,
+            'lazy_share': lazy_share,
+            'advantage': advantage,
+        }
+    else:
+        signal = {
+            'altruism_target': float(np.clip(signal.get('altruism_target', 0.5), 0.0, 1.0)),
+            'solidarity': float(np.clip(signal.get('solidarity', 0.5), 0.0, 1.0)),
+            'stress': float(np.clip(signal.get('stress', 0.0), 0.0, 1.0)),
+            'lazy_share': float(np.clip(signal.get('lazy_share', lazy_share), 0.0, 1.0)),
+            'advantage': float(np.clip(signal.get('advantage', 0.0), 0.0, 1.0)),
+        }
+    if isinstance(meta, dict):
+        meta['signal_kernel'] = dict(coeffs)
+        meta['signal_program'] = program
+    return signal
 
 
 def _structure_cache_key(g: 'Genome', order: Sequence[int]) -> Optional[Tuple[Any, ...]]:
@@ -1137,6 +1323,8 @@ class Genome:
         self.rl_meta: Dict[str, Any] = _rl_default_meta()
         self.rl_weight_coeffs: Dict[str, float] = dict(_RL_WEIGHT_COEFF_DEFAULTS)
         self.rl_weight_program_template: str = _RL_WEIGHT_DSL_TEMPLATE
+        self.rl_signal_coeffs: Dict[str, float] = dict(_RL_SIGNAL_COEFF_DEFAULTS)
+        self.rl_signal_program_template: str = _RL_SIGNAL_DSL_TEMPLATE
 
     def meta_reflect(self, event: str, payload: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
         info = dict(payload or {})
@@ -1218,6 +1406,13 @@ class Genome:
         g.rl_weight_coeffs = _rl_sanitise_weight_coeffs(coeffs)
         template = getattr(self, 'rl_weight_program_template', _RL_WEIGHT_DSL_TEMPLATE)
         g.rl_weight_program_template = template if isinstance(template, str) else _RL_WEIGHT_DSL_TEMPLATE
+        try:
+            sig_coeffs = dict(getattr(self, 'rl_signal_coeffs', {}))
+        except Exception:
+            sig_coeffs = dict(_RL_SIGNAL_COEFF_DEFAULTS)
+        g.rl_signal_coeffs = _rl_sanitise_signal_coeffs(sig_coeffs)
+        sig_template = getattr(self, 'rl_signal_program_template', _RL_SIGNAL_DSL_TEMPLATE)
+        g.rl_signal_program_template = sig_template if isinstance(sig_template, str) else _RL_SIGNAL_DSL_TEMPLATE
         return g
 
     def invalidate_caches(self, structure: bool=False, weights: bool=False):
@@ -3929,6 +4124,8 @@ class ReproPlanaNEATPlus:
             genome.mutate_parameter('entropy', self.rng, sigma=0.45, low=0.0, high=0.5, log_scale=True)
         if rl_rate > 0.0 and self.rng.random() < 0.5 * rl_rate:
             _mutate_rl_weight_kernel(genome, self.rng)
+        if rl_rate > 0.0 and self.rng.random() < 0.5 * rl_rate:
+            _mutate_rl_signal_kernel(genome, self.rng)
 
     def _crossover_maternal_biased(self, mother: Genome, father: Genome, species_members):
         fit_dict = {g: f for g, f in species_members}
@@ -8519,6 +8716,7 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
         util = 0.0
     meta['memory_util'] = float(np.clip(util, 0.0, 1.0))
     meta['weight_kernel'] = dict(_ensure_rl_weight_coeffs(genome))
+    meta['signal_kernel'] = dict(_ensure_rl_signal_coeffs(genome))
 
 
 def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> None:
@@ -8704,8 +8902,11 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
     l2 = float(getattr(genome, 'rl_l2', 0.0001))
     batch_returns = [float(p.get('return', p.get('reward', 0.0))) for p in picked]
     collective_signal = _rl_collective_signal(genome, meta, rewards=batch_returns, experiences=picked)
+    signal_program = _rl_signal_program_for(genome)
     meta['weight_kernel'] = dict(coeffs)
     meta['weight_program'] = program
+    meta['signal_kernel'] = dict(_ensure_rl_signal_coeffs(genome))
+    meta['signal_program'] = signal_program
     try:
         history = train_with_backprop_numpy(
             genome,
@@ -8730,6 +8931,8 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
             'priority_mean': priority_mean,
             'weight_kernel': dict(coeffs),
             'weight_program': program,
+            'signal_kernel': dict(meta.get('signal_kernel', {})),
+            'signal_program': signal_program,
         }
         if history:
             meta['last_replay']['final_loss'] = float(history[-1])
@@ -8744,6 +8947,8 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
                 'mean_return': float(np.mean(batch_returns)) if batch_returns else 0.0,
                 'weight_kernel': dict(coeffs),
                 'weight_program': program,
+                'signal_kernel': dict(meta.get('signal_kernel', {})),
+                'signal_program': signal_program,
             },
         )
     except Exception:
@@ -8771,6 +8976,8 @@ def _rl_update_meta_profile(
         meta['gamma_push'] = float(gamma)
         meta['memory_util'] = memory_util
         meta['collective_signal'] = _rl_collective_signal(genome, meta, rewards=[], experiences=experiences)
+        meta['signal_kernel'] = dict(_ensure_rl_signal_coeffs(genome))
+        meta['signal_program'] = _rl_signal_program_for(genome)
         return
     rewards_arr = np.asarray(rewards, dtype=np.float64)
     avg_reward = float(np.mean(rewards_arr))
@@ -8885,6 +9092,8 @@ def _rl_update_meta_profile(
     meta['collective_signal'] = dict(signal)
     meta['weight_kernel'] = dict(_ensure_rl_weight_coeffs(genome))
     meta['weight_program'] = _rl_weight_program_for(genome)
+    meta['signal_kernel'] = dict(_ensure_rl_signal_coeffs(genome))
+    meta['signal_program'] = _rl_signal_program_for(genome)
     if params_before != getattr(genome, 'rl_params', {}) and 'rl_params' not in changes:
         changes['rl_params'] = dict(genome.rl_params)
     if changes:
