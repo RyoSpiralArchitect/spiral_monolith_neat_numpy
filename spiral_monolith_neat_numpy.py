@@ -1,79 +1,63 @@
-# spiral_monolith_neat_numpy.py
-# Monolithic, NumPy-only NEAT + Backprop + Visualization toolkit.
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ spiral_monolith_neat_numpy.py                                         ┃
+# ┃ Monolithic NEAT × NumPy playground with the Lazy Council ecosystem.  ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+# EN: Single-file research lab for cooperative neuroevolution, backprop refinement,
+#     and artefact-rich storytelling. Designed around the six-seat Lazy Council
+#     steering model with mandatory governance enabled by default.
+# JP: 協調的ニューロ進化とバックプロップ微調整を 1 ファイルで体験できる研究ラボ。
+#     6 名の Lazy Council 合議制とデフォルト有効の mandatory ガバナンス設計を基軸としています。
 #
-# EN: A single-file research playground blending NEAT evolution, NumPy-powered backprop fine-tuning, interactive visual analytics, and a batteries-included CLI.
-# JP: NEAT 進化と NumPy バックプロパゲーション微調整、可視化分析、充実した CLI を 1 ファイルに凝縮した研究用プレイグラウンドです。
-#
-# Overview / 概要
-# This project provides an immediately runnable environment for experimenting with neuroevolution techniques that bridge symbolic topology search and gradient-based refinement. Everything ships in a single Python script so you can read, modify, and execute the full stack without hunting through modules.
-#
-# 本プロジェクトは、トポロジー探索と勾配ベース微調整を横断するニューロ進化手法をすぐに試せる実行環境です。ソースは 1 つの Python スクリプトにまとまっており、参照・改造・実行を一気通貫で行えます。
+# Why a monolith? / なぜ単一ファイルなのか？
+# • Inspectable: read every subsystem—evolution loop, NumPy optimiser, exporters—without jumping packages.
+#   参照性: 進化ループや NumPy 最適化、エクスポート機構をパッケージ横断なしで把握可能。
+# • Portable: drop into a notebook, server, or CI job; no optional deps beyond Matplotlib and NumPy.
+#   可搬性: ノートブック／サーバー／CI に即投入でき、NumPy と Matplotlib 以外の必須依存がありません。
+# • Tunable: tweak council weights, lazy pressure, or mandatory policies inline and re-run instantly.
+#   調整容易: 合議制ウェイトや怠惰個体圧、mandatory ポリシーをその場で書き換えすぐ検証できます。
 #
 # Quickstart / クイックスタート
-# python spiral_monolith_neat_numpy.py --help
-# 
-# This command lists every experiment preset, export toggle, and advanced flag available from the CLI so you can discover features before running long jobs.
-# 上記コマンドで利用可能な実験プリセット、エクスポートオプション、詳細フラグを確認し、長時間ジョブを回す前に機能を把握できます。
+#   python spiral_monolith_neat_numpy.py --help
+# Discover CLI presets, exporters, and governance toggles—`--no-mandatory` flips the council back to
+# soft advisory mode for exploratory runs.
+# CLI でプリセットやエクスポート、ガバナンス設定を確認できます。`--no-mandatory` で mandatory を無効化し、
+# 柔軟な実験モードに切り替えられます。
 #
-# Key Innovations / 主要な革新機能
-# Monodromy-aware evolution — Environment difficulty follows population topology changes, enabling path-dependent curricula for richer dynamics. モノドロミー対応進化 — 環境難度が個体群トポロジーの変化に追随し、軌跡依存のカリキュラムで多彩なダイナミクスを実現します。
-# Hybrid NEAT × backprop loop — Winning genomes receive NumPy fine-tuning to squeeze extra accuracy without abandoning structural innovation. NEAT とバックプロップのハイブリッドループ — 優勝ゲノムに NumPy 微調整を適用し、構造的革新を保ったまま精度を引き上げます。
-# Collective cognition signals — Shared "altruism", "solidarity", and stress metrics feed back into learning, letting you prototype cooperative evolutionary dynamics. 集団認知シグナル — 「利他性」「連帯」「ストレス」などの共有メトリクスが学習へフィードバックし、協調的な進化ダイナミクスを試作できます。
-# Rich artefact exports — Built-in exporters deliver lineage graphs, morph GIFs, regeneration timelines, and LCS ribbon plots for publication-ready storytelling. 多彩な成果物エクスポート — 系統グラフ、形態 GIF、再生タイムライン、LCS リボン図など、論文レベルのビジュアルを標準機能で生成します。
-# Headless-friendly stack — Matplotlib is pre-configured for CPU-only, display-less environments so remote servers and CI can render assets without tweaks. ヘッドレス対応スタック — Matplotlib を CPU/ヘッドレス向けに事前調整し、リモートサーバーや CI でも設定不要で描画できます。
+# Pillars / コア機能
+# • Monodromy-aware curricula: environment difficulty follows topology shifts for path-dependent regimes.
+#   モノドロミー対応カリキュラム: トポロジー変化に応じた環境難度制御で軌跡依存の学習を実現。
+# • Lazy Council orchestration: top performers + stochastic delegates cast equal votes to steer dynamics,
+#   while lazy-lineage amplification prevents overfitting to any diversity axis.
+#   Lazy Council オーケストレーション: トップ個体とランダム代表が同票で舵取りし、多様性軸の過適応を怠惰系統強化で抑制。
+# • Hybrid NEAT × backprop loop: champion genomes receive NumPy-based fine-tuning without losing structural novelty.
+#   NEAT とバックプロップのハイブリッド: 勝者ゲノムに NumPy 微調整を適用し構造革新を維持。
+# • Artefact exports: lineage graphs, morph GIFs, regeneration timelines, LCS ribbons—curated via a headless-ready
+#   Matplotlib pipeline.
+#   成果物エクスポート: 系統グラフや形態 GIF、再生タイムライン、LCS リボンをヘッドレス環境対応の Matplotlib で出力。
 #
-# Signature CLI Recipes / 代表的な CLI レシピ
-# Spiral benchmark explorer / スパイラル課題の徹底解析
+# Featured recipes / 代表的レシピ
+# • Spiral benchmark explorer / スパイラル課題徹底解析
+#     python spiral_monolith_neat_numpy.py \
+#         --task spiral --gens 60 --pop 96 --steps 60 \
+#         --make-gifs --make-lineage --report --out out/spiral_bold
+# • Monodromy spotlight / モノドロミーモード詳解
+#     python spiral_monolith_neat_numpy.py \
+#         --task spiral --gens 60 --pop 96 --steps 60 \
+#         --monodromy --make-gifs --make-lineage --report --out out/spiral_monodromy
+# • Gym baseline / Gym 連携ベースライン
+#     python - <<'PY'
+#     from spiral_monolith_neat_numpy import run_gym_neat_experiment
+#     run_gym_neat_experiment(
+#         "CartPole-v1", gens=30, pop=64, episodes=3, max_steps=500,
+#         stochastic=True, temp=0.8, out_prefix="out/cartpole"
+#     )
+#     PY
 #
-# python spiral_monolith_neat_numpy.py \
-# --task spiral --gens 60 --pop 96 --steps 60 \
-# --make-gifs --make-lineage --report --out out/spiral_bold
-#
-# Get full spiral classification diagnostics with population lineage graphs, training GIFs, and a structured HTML report in `out/spiral_bold`.
-#
-# スパイラル分類の診断情報（系統グラフ、学習 GIF、HTML レポート）を一括生成し、`out/spiral_bold` に保存します。
-#
-# Monodromy mode spotlight / モノドロミーモード解説
-#
-# python spiral_monolith_neat_numpy.py \
-# --task spiral --gens 60 --pop 96 --steps 60 \
-# --monodromy --make-gifs --make-lineage --report --out out/spiral_monodromy
-#
-# Activates the topology-aware curriculum where structural shifts drive environment pressure, ideal for studying punctuated equilibria effects.
-#
-# トポロジー変化に応じて環境圧を調整するカリキュラムを有効化し、断続平衡の挙動を観察できます。
-#
-# Gym integration baseline / Gym 連携ベースライン
-#
-# python - <<'PY'
-# from spiral_monolith_neat_numpy import run_gym_neat_experiment
-# run_gym_neat_experiment(
-#  "CartPole-v1", gens=30, pop=64, episodes=3, max_steps=500,
-#   stochastic=True, temp=0.8, out_prefix="out/cartpole"
-# )
-# PY
-#
-# Launches a NEAT + backprop hybrid baseline on CartPole, recording reward curves and GIFs under `out/cartpole` for downstream analysis.
-#
-# CartPole で NEAT × バックプロップのベースライン実験を走らせ、報酬カーブや GIF を `out/cartpole` に保存します。
-#
-# Artefact Outputs / 生成される成果物
-# All PNG figures, GIF animations, and optional HTML reports are written beneath the directory passed to `--out` (or `out_prefix`). The exporters rely on the hardened `_savefig` pipeline so permissions, fonts, and transparency settings are consistent across platforms.
-#
-# PNG 図版、GIF アニメーション、HTML レポートは `--out`（または `out_prefix`）で指定したディレクトリ以下に整理されます。エクスポーターは堅牢化した `_savefig` パイプラインを使用し、権限やフォント、透過設定をプラットフォーム間で揃えます。
-#
-# Monodromy Mode / モノドロミーモード
-# The `--monodromy` flag enables a topology-aware environment scheduler that creates a feedback loop between network structure evolution and environmental difficulty. Instead of a fixed generation-based curriculum, the environment dynamically adapts based on population-wide structural metrics such as:
-#
-# `--monodromy` フラグは、ネットワーク構造の進化と環境難度が双方向に作用するスケジューラを有効化します。従来の固定カリキュラムではなく、以下のような集団トポロジー指標に基づき動的に調整されます。
-#
-# Average topology complexity / 平均トポロジー複雑度（隠れノードやエッジ数）
-# Topology change velocity / トポロジー変化速度（構造進化のテンポ）
-# Population diversity / 個体群多様性（個体間の構造分散）
-#
-# This creates a path-dependent transformation—"monodromy"—where the environment follows and responds to the population's evolutionary trajectory through topology space. Periodic oscillations triggered by cumulative structural changes help simulate biological punctuated equilibria.
-#
-# この仕組みにより、トポロジー空間での進化的軌跡に環境が追随・応答する「モノドロミー（単回帰）」的な変換が成立します。構造変化の累積に応じた周期振動が導入され、生物学的な断続平衡を想起させるダイナミクスを再現します。
+# Outputs / 成果物
+# All PNG, GIF, and optional HTML artefacts land under `--out` (or `out_prefix`) using a hardened `_savefig`
+# pipeline so fonts, transparency, and permissions stay consistent across platforms.
+# PNG / GIF / HTML 成果物は強化済み `_savefig` パイプラインを介して `--out`（または `out_prefix`）以下に整理保存され、
+# フォントや透過設定、パーミッションが環境間で揃います。
 #
 # Author: Ryo ∴ SpiralArcitect & AIs from SpiralReality
 
@@ -107,6 +91,57 @@ from datetime import datetime, timezone
 _BUILD_INFO_CACHE: Optional[Dict[str, Any]] = None
 _SPINOR_BOUND_SEED: Optional[int] = None
 _COMPILE_TICK: int = 0
+_STRUCTURE_CACHE_LIMIT: int = 512
+_STRUCT_COMPILED_CACHE: 'OrderedDict[Any, Dict[str, Any]]' = OrderedDict()
+
+
+def _structure_cache_key(g: 'Genome', order: Sequence[int]) -> Optional[Tuple[Any, ...]]:
+    try:
+        signature = g.structural_signature()
+    except Exception:
+        return None
+    try:
+        return (signature, tuple(order))
+    except Exception:
+        return None
+
+
+def _structure_cache_get(key: Optional[Tuple[Any, ...]]) -> Optional[Dict[str, Any]]:
+    if key is None:
+        return None
+    entry = _STRUCT_COMPILED_CACHE.get(key)
+    if entry is None:
+        return None
+    entry['_tick'] = _COMPILE_TICK
+    _STRUCT_COMPILED_CACHE.move_to_end(key)
+    return entry.get('payload')
+
+
+def _structure_cache_store(key: Optional[Tuple[Any, ...]], payload: Dict[str, Any]) -> None:
+    if key is None:
+        return
+    _STRUCT_COMPILED_CACHE[key] = {'payload': dict(payload), '_tick': _COMPILE_TICK}
+    _STRUCT_COMPILED_CACHE.move_to_end(key)
+    _structure_cache_trim()
+
+
+def _structure_cache_trim(max_entries: Optional[int]=None, min_tick: Optional[int]=None) -> None:
+    if min_tick is not None:
+        stale_keys = [
+            key for key, entry in list(_STRUCT_COMPILED_CACHE.items())
+            if entry.get('_tick', 0) < min_tick
+        ]
+        for key in stale_keys:
+            _STRUCT_COMPILED_CACHE.pop(key, None)
+    limit = max_entries if max_entries is not None else _STRUCTURE_CACHE_LIMIT
+    if limit <= 0:
+        limit = 1
+    while len(_STRUCT_COMPILED_CACHE) > limit:
+        _STRUCT_COMPILED_CACHE.popitem(last=False)
+
+
+def clear_compiled_structure_cache() -> None:
+    _STRUCT_COMPILED_CACHE.clear()
 
 
 _NOISE_STYLE_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -2643,6 +2678,11 @@ class ReproPlanaNEATPlus:
         self.top3_best_topologies = []
         self._compat_cache: 'OrderedDict[Tuple[Tuple[int, int, int], Tuple[int, int, int]], float]' = OrderedDict()
         self._compat_cache_limit = max(1024, population_size * 8)
+        try:
+            struct_limit_env = int(os.environ.get('SMNN_STRUCTURE_CACHE_LIMIT', '0'))
+        except Exception:
+            struct_limit_env = 0
+        self.structure_cache_limit = max(256, struct_limit_env or population_size * 6)
         self._households = HouseholdManager(max_households=max(population_size * 4, 256))
         self._last_household_adjustments: Dict[int, float] = {}
         for g in self.population:
@@ -2881,6 +2921,11 @@ class ReproPlanaNEATPlus:
         except Exception:
             current_tick = 0
         threshold = current_tick - recent_window if recent_window > 0 else None
+        struct_limit = max(64, int(getattr(self, 'structure_cache_limit', _STRUCTURE_CACHE_LIMIT)))
+        if threshold is not None:
+            _structure_cache_trim(max_entries=struct_limit, min_tick=threshold)
+        else:
+            _structure_cache_trim(max_entries=struct_limit)
         topo_stride = int(getattr(self, 'compile_cache_topo_stride', 0))
         drop_topology = topo_stride > 0 and generation % topo_stride == 0
         for idx, g in enumerate(self.population):
@@ -4900,8 +4945,83 @@ def compile_genome(g: Genome):
         return cached
     order = g.topological_order()
     idx_of = {nid: i for i, nid in enumerate(order)}
-    types = [g.nodes[n].type for n in order]
-    acts = [g.nodes[n].activation for n in order]
+    type_sig = tuple(g.nodes[n].type for n in order)
+    act_sig = tuple(g.nodes[n].activation for n in order)
+    structure_key = _structure_cache_key(g, order)
+    base = _structure_cache_get(structure_key)
+    if (
+        base is None
+        or base.get('order_ref') != tuple(order)
+        or base.get('type_sig') != type_sig
+        or base.get('act_sig') != act_sig
+    ):
+        in_ids = [nid for nid in order if g.nodes[nid].type == 'input']
+        bias_ids = [nid for nid in order if g.nodes[nid].type == 'bias']
+        out_ids = [nid for nid in order if g.nodes[nid].type == 'output']
+        edges = [c for c in g.enabled_connections()]
+        src = np.array([idx_of[c.in_node] for c in edges], dtype=np.int32)
+        dst = np.array([idx_of[c.out_node] for c in edges], dtype=np.int32)
+        eid = tuple(c.innovation for c in edges)
+        n = len(order)
+        in_edges_lists = [[] for _ in range(n)]
+        out_edges_lists = [[] for _ in range(n)]
+        for e, (s, d) in enumerate(zip(src, dst)):
+            in_edges_lists[d].append(e)
+            out_edges_lists[s].append(e)
+        if len(edges):
+            in_sort = np.argsort(dst, kind='mergesort')
+            out_sort = np.argsort(src, kind='mergesort')
+            in_edges_flat = in_sort.astype(np.int32, copy=False)
+            out_edges_flat = out_sort.astype(np.int32, copy=False)
+            in_counts = np.bincount(dst[in_sort], minlength=n)
+            out_counts = np.bincount(src[out_sort], minlength=n)
+            in_edges_ptr = np.zeros(n + 1, dtype=np.int32)
+            out_edges_ptr = np.zeros(n + 1, dtype=np.int32)
+            np.cumsum(in_counts, out=in_edges_ptr[1:])
+            np.cumsum(out_counts, out=out_edges_ptr[1:])
+        else:
+            in_edges_flat = np.zeros(0, dtype=np.int32)
+            out_edges_flat = np.zeros(0, dtype=np.int32)
+            in_edges_ptr = np.zeros(n + 1, dtype=np.int32)
+            out_edges_ptr = np.zeros(n + 1, dtype=np.int32)
+        base = {
+            'order_ref': tuple(order),
+            'type_sig': type_sig,
+            'act_sig': act_sig,
+            'inputs': tuple(idx_of[i] for i in sorted(in_ids)),
+            'biases': tuple(idx_of[i] for i in bias_ids),
+            'outputs': tuple(idx_of[i] for i in sorted(out_ids)),
+            'src': src,
+            'dst': dst,
+            'eid': eid,
+            'in_edges_flat': in_edges_flat,
+            'out_edges_flat': out_edges_flat,
+            'in_edges_ptr': in_edges_ptr,
+            'out_edges_ptr': out_edges_ptr,
+            'in_edges': tuple(tuple(row) for row in in_edges_lists),
+            'out_edges': tuple(tuple(row) for row in out_edges_lists),
+        }
+        _structure_cache_store(structure_key, base)
+    n = len(order)
+    compiled = {
+        'order': list(order),
+        'idx_of': idx_of,
+        'types': list(type_sig),
+        'acts': list(act_sig),
+        'inputs': list(base['inputs']),
+        'biases': list(base['biases']),
+        'outputs': list(base['outputs']),
+        'src': base['src'],
+        'dst': base['dst'],
+        'eid': list(base['eid']),
+        'in_edges': [list(row) for row in base['in_edges']],
+        'out_edges': [list(row) for row in base['out_edges']],
+        'in_edges_flat': base['in_edges_flat'],
+        'in_edges_ptr': base['in_edges_ptr'],
+        'out_edges_flat': base['out_edges_flat'],
+        'out_edges_ptr': base['out_edges_ptr'],
+    }
+    compiled['w'] = np.array([g.connections[inn].weight for inn in compiled['eid']], dtype=np.float64)
     node_sensitivity = _node_trait_array(g, order, 'backprop_sensitivity', 1.0)
     node_jitter = _node_trait_array(g, order, 'sensitivity_jitter', 0.0, low=-0.25, high=0.25)
     node_momentum = _node_trait_array(g, order, 'sensitivity_momentum', 0.0)
@@ -4909,62 +5029,13 @@ def compile_genome(g: Genome):
     node_altruism = _node_trait_array(g, order, 'altruism', 0.5, low=0.0, high=1.0)
     node_altruism_memory = _node_trait_array(g, order, 'altruism_memory', 0.0, low=-1.5, high=1.5)
     node_altruism_span = _node_trait_array(g, order, 'altruism_span', 0.0, low=0.0, high=4.0)
-    in_ids = [nid for nid in order if g.nodes[nid].type == 'input']
-    bias_ids = [nid for nid in order if g.nodes[nid].type == 'bias']
-    out_ids = [nid for nid in order if g.nodes[nid].type == 'output']
-    edges = [c for c in g.enabled_connections()]
-    src = np.array([idx_of[c.in_node] for c in edges], dtype=np.int32)
-    dst = np.array([idx_of[c.out_node] for c in edges], dtype=np.int32)
-    w = np.array([c.weight for c in edges], dtype=np.float64)
-    eid = [c.innovation for c in edges]
-    n = len(order)
-    in_edges = [[] for _ in range(n)]
-    out_edges = [[] for _ in range(n)]
-    for e, (s, d) in enumerate(zip(src, dst)):
-        in_edges[d].append(e)
-        out_edges[s].append(e)
-    if len(edges):
-        in_sort = np.argsort(dst, kind='mergesort')
-        out_sort = np.argsort(src, kind='mergesort')
-        in_edges_flat = in_sort.astype(np.int32, copy=False)
-        out_edges_flat = out_sort.astype(np.int32, copy=False)
-        in_counts = np.bincount(dst[in_sort], minlength=n)
-        out_counts = np.bincount(src[out_sort], minlength=n)
-        in_edges_ptr = np.zeros(n + 1, dtype=np.int32)
-        out_edges_ptr = np.zeros(n + 1, dtype=np.int32)
-        np.cumsum(in_counts, out=in_edges_ptr[1:])
-        np.cumsum(out_counts, out=out_edges_ptr[1:])
-    else:
-        in_edges_flat = np.zeros(0, dtype=np.int32)
-        out_edges_flat = np.zeros(0, dtype=np.int32)
-        in_edges_ptr = np.zeros(n + 1, dtype=np.int32)
-        out_edges_ptr = np.zeros(n + 1, dtype=np.int32)
-    compiled = {
-        'order': order,
-        'idx_of': idx_of,
-        'types': types,
-        'acts': acts,
-        'inputs': [idx_of[i] for i in sorted(in_ids)],
-        'biases': [idx_of[i] for i in bias_ids],
-        'outputs': [idx_of[i] for i in sorted(out_ids)],
-        'src': src,
-        'dst': dst,
-        'w': w,
-        'eid': eid,
-        'in_edges': in_edges,
-        'out_edges': out_edges,
-        'in_edges_flat': in_edges_flat,
-        'in_edges_ptr': in_edges_ptr,
-        'out_edges_flat': out_edges_flat,
-        'out_edges_ptr': out_edges_ptr,
-        'node_sensitivity': node_sensitivity,
-        'node_jitter': node_jitter,
-        'node_momentum': node_momentum,
-        'node_variance': node_variance,
-        'node_altruism': node_altruism,
-        'node_altruism_memory': node_altruism_memory,
-        'node_altruism_span': node_altruism_span,
-    }
+    compiled['node_sensitivity'] = node_sensitivity
+    compiled['node_jitter'] = node_jitter
+    compiled['node_momentum'] = node_momentum
+    compiled['node_variance'] = node_variance
+    compiled['node_altruism'] = node_altruism
+    compiled['node_altruism_memory'] = node_altruism_memory
+    compiled['node_altruism_span'] = node_altruism_span
     try:
         g._compiled_cache = compiled
         g._compiled_cache_rev = rev
@@ -5136,29 +5207,43 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
                 src_jitter = 1.0 + 0.05 * node_jitter[src_idx] + 0.03 * _np.tanh(src_var)
                 src_mix = src_scale * src_jitter
                 edge_scale = 0.5 * (dest_mix + src_mix)
-                contrib = A[:, src_idx].T @ dz
+                with _np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                    contrib = A[:, src_idx].T @ dz
+                contrib = _np.nan_to_num(contrib, nan=0.0, posinf=0.0, neginf=0.0)
                 grad_w[idx] += edge_scale * contrib
                 altruism_delta = altruism_level - node_altruism[src_idx]
                 flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom) + 0.1 * altruism_delta
                 mem_gain = 1.0 + 0.08 * node_altruism_memory[src_idx]
-                node_push[src_idx] += _np.mean(_np.abs(dz[:, None] * weights_local), axis=0) * edge_scale * flow_bias * mem_gain
-                delta_a[:, src_idx] += dz[:, None] * (weights_local * src_mix * mem_gain)
-        else:
-            for e in comp['in_edges'][j]:
-                s = comp['src'][e]
-                src_mom = float(node_momentum[s])
-                src_var = float(node_variance[s])
-                src_scale = float(node_scale[s]) * (1.0 + 0.04 * _np.tanh(src_mom))
-                src_jitter = 1.0 + 0.05 * float(node_jitter[s]) + 0.03 * _np.tanh(src_var)
-                src_mix = src_scale * src_jitter
-                edge_scale = 0.5 * (dest_mix + src_mix)
-                contrib = _np.dot(A[:, s], dz)
-                grad_w[e] += edge_scale * contrib
-                altruism_delta = altruism_level - float(node_altruism[s])
-                flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom) + 0.1 * altruism_delta
-                mem_gain = 1.0 + 0.08 * float(node_altruism_memory[s])
-                node_push[s] += float(_np.mean(_np.abs(dz * w[e]))) * edge_scale * flow_bias * mem_gain
-                delta_a[:, s] += dz * w[e] * src_mix * mem_gain
+                with _np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                    push_term = dz[:, None] * weights_local
+                push_term = _np.nan_to_num(push_term, nan=0.0, posinf=0.0, neginf=0.0)
+                node_push[src_idx] += _np.mean(_np.abs(push_term), axis=0) * edge_scale * flow_bias * mem_gain
+                delta_update = push_term * (src_mix * mem_gain)
+                delta_update = _np.nan_to_num(delta_update, nan=0.0, posinf=0.0, neginf=0.0)
+                delta_a[:, src_idx] += delta_update
+            else:
+                for e in comp['in_edges'][j]:
+                    s = comp['src'][e]
+                    src_mom = float(node_momentum[s])
+                    src_var = float(node_variance[s])
+                    src_scale = float(node_scale[s]) * (1.0 + 0.04 * _np.tanh(src_mom))
+                    src_jitter = 1.0 + 0.05 * float(node_jitter[s]) + 0.03 * _np.tanh(src_var)
+                    src_mix = src_scale * src_jitter
+                    edge_scale = 0.5 * (dest_mix + src_mix)
+                    with _np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                        contrib = _np.dot(A[:, s], dz)
+                    contrib = float(_np.nan_to_num(contrib, nan=0.0, posinf=0.0, neginf=0.0))
+                    grad_w[e] += edge_scale * contrib
+                    altruism_delta = altruism_level - float(node_altruism[s])
+                    flow_bias = 1.0 + 0.15 * _np.tanh(dest_mom - src_mom) + 0.1 * altruism_delta
+                    mem_gain = 1.0 + 0.08 * float(node_altruism_memory[s])
+                    with _np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                        push_term = dz * w[e]
+                    push_term = _np.nan_to_num(push_term, nan=0.0, posinf=0.0, neginf=0.0)
+                    node_push[s] += float(_np.mean(_np.abs(push_term))) * edge_scale * flow_bias * mem_gain
+                    delta_update = push_term * (src_mix * mem_gain)
+                    delta_update = _np.nan_to_num(delta_update, nan=0.0, posinf=0.0, neginf=0.0)
+                    delta_a[:, s] += delta_update
     grad_w = grad_w / max(1, B) + l2 * w
     if not _np.all(_np.isfinite(grad_w)):
         grad_w = _np.nan_to_num(grad_w, nan=0.0, posinf=0.0, neginf=0.0)
@@ -6049,8 +6134,12 @@ def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: st
 
 def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, contour_cmap: str='coolwarm', point_cmap: Optional[str]=None, point_size: float=12.0, point_alpha: float=0.85, add_colorbar: bool=False):
     gg = genome.copy()
+    profile: Dict[str, Any] = {}
+    history: Sequence[float] = []
     try:
-        train_with_backprop_numpy(gg, X, y, steps=steps, lr=0.005, l2=0.0001)
+        profile_buffer: Dict[str, Any] = {}
+        history = train_with_backprop_numpy(gg, X, y, steps=steps, lr=0.005, l2=0.0001, profile_out=profile_buffer)
+        profile = profile_buffer
     except Exception:
         pass
     x_min, x_max = (X[:, 0].min() - 0.2, X[:, 0].max() + 0.2)
@@ -6072,7 +6161,17 @@ def plot_decision_boundary(genome: Genome, X, y, out_path: str, steps: int=50, c
     fig.tight_layout()
     _savefig(fig, out_path, dpi=220)
     plt.close(fig)
-    return {'figure': out_path, 'history': loss, 'profile': profile}
+    history_arr = np.asarray(history, dtype=np.float64) if len(history) else np.zeros(0, dtype=np.float64)
+    if profile:
+        profile_payload: Dict[str, Any] = {}
+        for key, value in profile.items():
+            if isinstance(value, np.ndarray):
+                profile_payload[key] = np.asarray(value).copy()
+            else:
+                profile_payload[key] = value
+    else:
+        profile_payload = {}
+    return {'figure': out_path, 'history': history_arr, 'profile': profile_payload}
 
 def export_backprop_variation(genome: Genome, X, y, out_path: str, steps: int=50, lr: float=0.005, l2: float=0.0001):
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
