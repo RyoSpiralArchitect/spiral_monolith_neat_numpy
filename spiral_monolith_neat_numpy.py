@@ -42,7 +42,7 @@
 # Activates the topology-aware curriculum where structural shifts drive environment pressure, ideal for studying punctuated equilibria effects.
 #
 # トポロジー変化に応じて環境圧を調整するカリキュラムを有効化し、断続平衡の挙動を観察できます。
-
+#
 # Gym integration baseline / Gym 連携ベースライン
 #
 # python - <<'PY'
