@@ -155,6 +155,78 @@ _MONODROMY_TOGGLE_PARAMS: Tuple[str, ...] = (
 )
 
 _DEFAULT_RL_MEMORY_LIMIT = 1024
+_RL_MEMORY_LIMIT_MIN = 128
+_RL_MEMORY_LIMIT_MAX = 8192
+_RL_META_ALPHA = 0.3
+_RL_META_VAR_ALPHA = 0.18
+
+
+def _rl_default_meta() -> Dict[str, Any]:
+    return {
+        'reward_ema': 0.0,
+        'reward_var': 0.0,
+        'episodes': 0,
+        'best_reward': float('-inf'),
+        'last_reward': 0.0,
+        'trend': 0.0,
+        'stability': 0.0,
+        'novelty_ema': 0.0,
+        'memory_util': 0.0,
+        'entropy_push': 0.0,
+        'lr_push': 0.0,
+        'gamma_push': 0.0,
+    }
+
+
+def _rl_prepare_meta(genome: 'Genome') -> Dict[str, Any]:
+    base = _rl_default_meta()
+    meta = getattr(genome, 'rl_meta', None)
+    if isinstance(meta, dict):
+        merged = dict(base)
+        merged.update(meta)
+        meta = merged
+    else:
+        meta = dict(base)
+    genome.rl_meta = meta
+    return meta
+
+
+def _rl_merge_meta(meta_a: Optional[Dict[str, Any]], meta_b: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    metas = []
+    if isinstance(meta_a, dict):
+        metas.append(meta_a)
+    if isinstance(meta_b, dict):
+        metas.append(meta_b)
+    if not metas:
+        return _rl_default_meta()
+    merged = _rl_default_meta()
+
+    def _avg(key: str, default: float=0.0) -> float:
+        vals = [float(m.get(key, default)) for m in metas if key in m]
+        if not vals:
+            return float(default)
+        return float(sum(vals) / len(vals))
+
+    merged['reward_ema'] = _avg('reward_ema', merged['reward_ema'])
+    merged['reward_var'] = _avg('reward_var', merged['reward_var'])
+    merged['episodes'] = int(round(_avg('episodes', merged['episodes'])))
+    merged['last_reward'] = _avg('last_reward', merged['last_reward'])
+    merged['trend'] = _avg('trend', merged['trend'])
+    merged['stability'] = _avg('stability', merged['stability'])
+    merged['novelty_ema'] = _avg('novelty_ema', merged['novelty_ema'])
+    merged['memory_util'] = _avg('memory_util', merged['memory_util'])
+    merged['entropy_push'] = _avg('entropy_push', merged['entropy_push'])
+    best_vals = [float(m.get('best_reward', float('-inf'))) for m in metas]
+    if best_vals:
+        merged['best_reward'] = float(max(best_vals))
+    extras: Dict[str, Any] = {}
+    for meta in metas:
+        for key, value in meta.items():
+            if key not in merged:
+                extras[key] = value
+    if extras:
+        merged.update(extras)
+    return merged
 
 
 def _structure_cache_key(g: 'Genome', order: Sequence[int]) -> Optional[Tuple[Any, ...]]:
@@ -863,6 +935,7 @@ class Genome:
         self.rl_memory: deque = deque(maxlen=self.rl_memory_limit)
         self.rl_train_steps = int(18)
         self.rl_l2 = float(0.0001)
+        self.rl_meta: Dict[str, Any] = _rl_default_meta()
 
     def meta_reflect(self, event: str, payload: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
         info = dict(payload or {})
@@ -930,6 +1003,13 @@ class Genome:
         g.rl_memory = deque(buf, maxlen=limit)
         g.rl_train_steps = int(getattr(self, 'rl_train_steps', 18))
         g.rl_l2 = float(getattr(self, 'rl_l2', 0.0001))
+        try:
+            meta = dict(getattr(self, 'rl_meta', {}))
+        except Exception:
+            meta = {}
+        merged_meta = _rl_default_meta()
+        merged_meta.update(meta)
+        g.rl_meta = merged_meta
         return g
 
     def invalidate_caches(self, structure: bool=False, weights: bool=False):
@@ -3801,6 +3881,7 @@ class ReproPlanaNEATPlus:
         if f_buf:
             merged.extend(f_buf[-tail:])
         child.rl_memory = merged
+        child.rl_meta = _rl_merge_meta(getattr(mother, 'rl_meta', None), getattr(father, 'rl_meta', None))
 
     def _make_offspring(self, species, offspring_counts, sidx, species_pool):
         sp = species[sidx]
@@ -8184,47 +8265,93 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
                 next_obs = np.asarray(next_obs_raw, dtype=np.float64).reshape(-1)
             except Exception:
                 next_obs = None
+        novelty = 0.0
+        if next_obs is not None and next_obs.shape == obs.shape:
+            try:
+                novelty = float(np.linalg.norm(next_obs - obs))
+            except Exception:
+                novelty = 0.0
         payload = {
             'obs': obs,
             'action': action,
             'reward': float(exp.get('reward', 0.0)),
             'next_obs': next_obs,
             'return': float(exp.get('return', exp.get('reward', 0.0))),
+            'novelty': float(novelty),
         }
+        payload['priority'] = float(abs(payload['return']) + 0.1 * abs(payload['reward']) + 0.5 * payload['novelty'])
         buf.append(payload)
     genome.rl_memory = buf
+    meta = _rl_prepare_meta(genome)
+    try:
+        util = len(buf) / float(buf.maxlen or len(buf) or 1)
+    except Exception:
+        util = 0.0
+    meta['memory_util'] = float(np.clip(util, 0.0, 1.0))
 
 
 def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> None:
     buf = list(getattr(genome, 'rl_memory', []) or [])
     if len(buf) < 4:
         return
-    discrete = []
-    for item in buf:
+    meta = _rl_prepare_meta(genome)
+    discrete: List[Tuple[int, Dict[str, Any]]] = []
+    for idx, item in enumerate(buf):
         act = item.get('action')
         if isinstance(act, (int, np.integer)):
-            discrete.append(item)
+            discrete.append((idx, item))
     if len(discrete) < 4:
         return
-    returns = np.asarray([float(d.get('return', d.get('reward', 0.0))) for d in discrete], dtype=np.float64)
+    indices = np.asarray([idx for idx, _ in discrete], dtype=np.float64)
+    items = [item for _, item in discrete]
+    returns = np.asarray([float(d.get('return', d.get('reward', 0.0))) for d in items], dtype=np.float64)
     if returns.size == 0:
         return
     if np.allclose(returns, returns[0]):
-        weights = np.ones_like(returns)
+        ret_weights = np.ones_like(returns)
     else:
         shifted = returns - np.min(returns)
         if np.allclose(shifted, 0.0):
-            weights = np.ones_like(returns)
+            ret_weights = np.ones_like(returns)
         else:
-            weights = shifted
-        weights = weights + float(max(0.0, entropy)) * (np.std(returns) + 1e-6)
-    if np.sum(weights) <= 0:
+            ret_weights = shifted
+    ret_weights = ret_weights + float(max(0.0, entropy)) * (np.std(returns) + 1e-6)
+    novelty = np.asarray([float(d.get('novelty', 0.0)) for d in items], dtype=np.float64)
+    if novelty.size:
+        novelty = novelty - float(np.min(novelty))
+        if np.max(novelty) > 0:
+            novelty = novelty / float(np.max(novelty))
+    priority = np.asarray([float(d.get('priority', 1.0)) for d in items], dtype=np.float64)
+    if priority.size and np.max(priority) > 0:
+        priority = priority / float(np.max(priority))
+    else:
+        priority = np.ones_like(ret_weights)
+    if indices.size:
+        recency = indices - float(np.min(indices)) + 1.0
+        recency = recency / float(np.max(recency)) if np.max(recency) > 0 else np.ones_like(indices)
+    else:
+        recency = np.ones_like(ret_weights)
+    stability = float(np.clip(meta.get('stability', 0.0), 0.0, 1.0))
+    trend = float(meta.get('trend', 0.0))
+    denom = max(1.0, abs(meta.get('last_reward', 0.0)) + 1e-6)
+    trend_norm = float(np.tanh(trend / denom))
+    novelty_gain = 0.25 + 0.55 * (1.0 - stability)
+    recency_gain = 0.2 + 0.5 * max(0.0, -trend_norm)
+    weights = ret_weights + novelty_gain * (0.5 + novelty)
+    weights += 0.35 * priority
+    weights += recency_gain * recency
+    weights = np.clip(weights, 1e-8, None)
+    total_w = float(np.sum(weights))
+    if not np.isfinite(total_w) or total_w <= 0:
         weights = np.ones_like(weights)
-    sample_size = min(len(discrete), max(8, int(24 + max(0.0, entropy) * 64)))
-    replace = len(discrete) < sample_size
-    probs = weights / np.sum(weights)
-    idxs = np.random.choice(len(discrete), size=sample_size, replace=replace, p=probs)
-    picked = [discrete[int(i)] for i in idxs]
+        total_w = float(len(weights))
+    probs = weights / total_w
+    steps = max(1, int(getattr(genome, 'rl_train_steps', 18)))
+    sample_floor = max(8, int(steps * (0.6 + 0.6 * (1.0 - stability))))
+    sample_size = min(len(items), sample_floor)
+    replace = len(items) < sample_size
+    idxs = np.random.choice(len(items), size=sample_size, replace=replace, p=probs)
+    picked = [items[int(i)] for i in idxs]
     try:
         X = np.stack([p['obs'] for p in picked], axis=0).astype(np.float64)
     except Exception:
@@ -8241,6 +8368,130 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
         print('[warn] rl replay update skipped:', err)
 
 
+def _rl_update_meta_profile(
+    genome: Genome,
+    rewards: Sequence[float],
+    *,
+    lr: float,
+    entropy: float,
+    gamma: float,
+    experiences: Sequence[Dict[str, Any]],
+) -> None:
+    if genome is None:
+        return
+    meta = _rl_prepare_meta(genome)
+    if not rewards:
+        meta['entropy_push'] = float(entropy)
+        meta['lr_push'] = float(lr)
+        meta['gamma_push'] = float(gamma)
+        return
+    rewards_arr = np.asarray(rewards, dtype=np.float64)
+    avg_reward = float(np.mean(rewards_arr))
+    prev_ema = float(meta['reward_ema']) if meta.get('episodes', 0) > 0 else avg_reward
+    if meta.get('episodes', 0) <= 0:
+        meta['reward_ema'] = avg_reward
+    else:
+        meta['reward_ema'] = (1.0 - _RL_META_ALPHA) * meta['reward_ema'] + _RL_META_ALPHA * avg_reward
+    diff = avg_reward - prev_ema
+    meta['reward_var'] = (1.0 - _RL_META_VAR_ALPHA) * meta.get('reward_var', 0.0) + _RL_META_VAR_ALPHA * (diff ** 2)
+    meta['episodes'] = int(meta.get('episodes', 0)) + len(rewards)
+    meta['last_reward'] = avg_reward
+    meta['trend'] = float(0.6 * meta.get('trend', 0.0) + 0.4 * diff)
+    meta['stability'] = float(1.0 / (1.0 + max(1e-9, meta['reward_var'])))
+    meta['best_reward'] = float(max(meta.get('best_reward', float('-inf')), float(np.max(rewards_arr))))
+    if experiences:
+        novelty_vals: List[float] = []
+        for exp in experiences:
+            obs = exp.get('obs')
+            next_obs = exp.get('next_obs')
+            try:
+                obs_arr = np.asarray(obs, dtype=np.float64).ravel()
+            except Exception:
+                continue
+            if next_obs is None:
+                continue
+            try:
+                next_arr = np.asarray(next_obs, dtype=np.float64).ravel()
+            except Exception:
+                continue
+            if obs_arr.shape != next_arr.shape:
+                continue
+            try:
+                novelty_vals.append(float(np.linalg.norm(next_arr - obs_arr)))
+            except Exception:
+                continue
+        if novelty_vals:
+            mean_novelty = float(sum(novelty_vals) / len(novelty_vals))
+            meta['novelty_ema'] = float(0.8 * meta.get('novelty_ema', 0.0) + 0.2 * mean_novelty)
+    params_before = dict(getattr(genome, 'rl_params', {}) or {})
+    stability = float(meta['stability'])
+    denom = max(1.0, abs(prev_ema) + float(np.std(rewards_arr)) + 1e-6)
+    norm_delta = float(np.tanh(diff / denom))
+    depth_spread = 0.0
+    try:
+        _hidden, _edges, _branch, depth_spread, _score = genome.structural_complexity_stats()
+    except Exception:
+        depth_spread = 0.0
+    depth_factor = 1.0 + 0.02 * float(depth_spread)
+    steps_now = max(1, int(getattr(genome, 'rl_train_steps', 18)))
+    target_steps = int(np.clip(round(steps_now * (1.0 + 0.45 * norm_delta) * depth_factor), 8, 96))
+    changes: Dict[str, Any] = {}
+    if target_steps != steps_now:
+        changes['rl_train_steps'] = (steps_now, target_steps)
+        genome.rl_train_steps = target_steps
+    l2_now = float(getattr(genome, 'rl_l2', 0.0001))
+    target_l2 = float(np.clip(l2_now * (1.0 - 0.35 * norm_delta), 1e-6, 0.01))
+    if not math.isclose(target_l2, l2_now, rel_tol=1e-3, abs_tol=1e-6):
+        changes['rl_l2'] = (l2_now, target_l2)
+        genome.rl_l2 = target_l2
+    will = float(np.clip(getattr(genome, 'mutation_will', 0.5), 0.0, 1.0))
+    base_limit = int(getattr(genome, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
+    desired = (_DEFAULT_RL_MEMORY_LIMIT * (0.6 + 0.8 * (1.0 - stability)))
+    desired *= (0.7 + 0.6 * will)
+    desired *= (1.0 + 0.1 * float(depth_spread))
+    desired = int(np.clip(round(desired), _RL_MEMORY_LIMIT_MIN, _RL_MEMORY_LIMIT_MAX))
+    buf_list = list(getattr(genome, 'rl_memory', []) or [])
+    if desired != base_limit:
+        trimmed = deque(buf_list[-desired:], maxlen=desired)
+        genome.rl_memory_limit = desired
+        genome.rl_memory = trimmed
+        changes['rl_memory_limit'] = (base_limit, desired)
+    params = getattr(genome, 'rl_params', {}) or {}
+    if params:
+        entropy_now = float(np.clip(params.get('entropy', entropy), 0.0, 0.5))
+        entropy_target = float(np.clip(entropy_now * (1.0 + (1.0 - stability) * 0.4 - 0.25 * norm_delta), 1e-5, 0.5))
+        lr_now = float(np.clip(params.get('lr', lr), 1e-5, 0.2))
+        lr_target = float(np.clip(lr_now * (1.0 + 0.55 * norm_delta), 1e-5, 0.2))
+        gamma_now = float(np.clip(params.get('gamma', gamma), 0.4, 0.9995))
+        gamma_target = float(np.clip(gamma_now + 0.01 * norm_delta * (0.5 + 0.5 * stability), 0.4, 0.9995))
+        params.update({'entropy': entropy_target, 'lr': lr_target, 'gamma': gamma_target})
+        genome.rl_params = params
+        meta['entropy_push'] = entropy_target
+        meta['lr_push'] = lr_target
+        meta['gamma_push'] = gamma_target
+    else:
+        meta['entropy_push'] = float(entropy)
+        meta['lr_push'] = float(lr)
+        meta['gamma_push'] = float(gamma)
+    memory_buf = getattr(genome, 'rl_memory', []) or []
+    limit = float(getattr(genome, 'rl_memory_limit', len(memory_buf) or 1))
+    meta['memory_util'] = float(np.clip(len(memory_buf) / max(1.0, limit), 0.0, 1.0))
+    if params_before != getattr(genome, 'rl_params', {}) and 'rl_params' not in changes:
+        changes['rl_params'] = dict(genome.rl_params)
+    if changes:
+        try:
+            genome.meta_reflect(
+                'rl_meta_adjust',
+                {
+                    'avg_reward': avg_reward,
+                    'ema_reward': meta['reward_ema'],
+                    'normalized_delta': norm_delta,
+                    'stability': stability,
+                    'changes': changes,
+                },
+            )
+        except Exception:
+            pass
 def _rl_collect_episode(
     genome: Genome,
     env,
@@ -8345,6 +8596,7 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
         entropy = float(max(0.0, params.get('entropy', 0.01)))
         lr = float(np.clip(params.get('lr', 0.01), 1e-6, 1.0))
         total = 0.0
+        reward_list: List[float] = []
         replay_batch: List[Dict[str, Any]] = []
         for _ in range(n_episodes):
             reward, experiences = _rl_collect_episode(
@@ -8358,10 +8610,19 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
                 obs_norm=obs_norm,
             )
             total += reward
+            reward_list.append(float(reward))
             replay_batch.extend(experiences)
         if replay_batch:
             _rl_store_experiences(genome, replay_batch)
             _rl_experience_replay_update(genome, lr=lr, entropy=entropy)
+        _rl_update_meta_profile(
+            genome,
+            reward_list,
+            lr=lr,
+            entropy=entropy,
+            gamma=gamma,
+            experiences=replay_batch,
+        )
         return total / float(n_episodes)
 
     def _close_env():
