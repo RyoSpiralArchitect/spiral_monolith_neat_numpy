@@ -2653,9 +2653,9 @@ class ReproPlanaNEATPlus:
         self.refine_topk_ratio = float(os.environ.get('NEAT_REFINE_TOPK_RATIO', '0.08'))
         self.stagnation_window = 6
         self.stagnation_delta = 1e-3
-        self.stagnation_commission_strength = 0.35
-        self.stagnation_commission_cooldown = 6
-        self.stagnation_elite_bias = 0.65
+        self.stagnation_commission_strength = 0.45
+        self.stagnation_commission_cooldown = 5
+        self.stagnation_elite_bias = 0.78
         self.stagnation_difficulty_bump = 0.12
         self.stagnation_flagged_penalty = 0.08
         self.stagnation_flagged_window = 12
@@ -2742,7 +2742,7 @@ class ReproPlanaNEATPlus:
         self.sex_fitness_scale = {'female': 1.0, 'male': 0.9, 'hermaphrodite': 1.2}
         self.regen_bonus = 0.2
         self.regen_mut_rate_boost = 1.8
-        self.non_elite_mating_rate = 0.5
+        self.non_elite_mating_rate = 0.6
         self.lcs_reward_weight = 0.02
         self.diversity_weight = 0.02
         self.hermaphrodite_mate_bias = 2.5
@@ -2758,8 +2758,8 @@ class ReproPlanaNEATPlus:
         self.hermaphrodite_altruism_penalty = 0.12
         self.hermaphrodite_altruism_memory_drop = 0.08
         self.hermaphrodite_altruism_span_stress = 0.18
-        self.lazy_fraction = 0.02
-        self.lazy_fraction_max = 0.021
+        self.lazy_fraction = 0.028
+        self.lazy_fraction_max = 0.035
         self.lazy_individual_fitness = -1.0
         self.auto_complexity_controls = True
         self.auto_complexity_bonus_fraction = 0.18
@@ -2768,11 +2768,11 @@ class ReproPlanaNEATPlus:
         self.lazy_complexity_target_scale = 1.18
         self.lazy_complexity_duplicate_bias = 0.45
         self.lazy_complexity_min_growth = 0.0
-        self.lazy_lineage_decay = 0.82
-        self.lazy_lineage_strength_cap = 3.0
-        self.lazy_lineage_inheritance_gain = 0.32
-        self.lazy_lineage_inheritance_decay = 0.24
-        self.lazy_lineage_persistence = 0.7
+        self.lazy_lineage_decay = 0.88
+        self.lazy_lineage_strength_cap = 3.4
+        self.lazy_lineage_inheritance_gain = 0.38
+        self.lazy_lineage_inheritance_decay = 0.22
+        self.lazy_lineage_persistence = 0.76
         self.env = {
             'difficulty': 0.0,
             'noise_std': 0.0,
@@ -9341,7 +9341,45 @@ def run_spinor_monolith(
     group_idx_seq = _int_col(tele_rows, 'group_idx') if tele_rows else np.array([], dtype=np.int32)
     group_energy_seq = _float_col(tele_rows, 'group_energy') if tele_rows else np.array([], dtype=np.float64)
     group_label_seq = np.array(_str_col(tele_rows, 'group_label')) if tele_rows else np.array([], dtype=object)
+    fft_peak_seq = _float_col(tele_rows, 'fft_peak') if tele_rows else np.array([], dtype=np.float64)
+    fft_entropy_seq = _float_col(tele_rows, 'fft_entropy') if tele_rows else np.array([], dtype=np.float64)
+    fft_reason_seq = np.array(_str_col(tele_rows, 'fft_reason')) if tele_rows else np.array([], dtype=object)
     evaluator_notes = _str_col(tele_rows, 'evaluator_note') if tele_rows else []
+
+    harmonic_maps: List[Dict[int, float]] = []
+    max_harm = 0
+    if tele_rows:
+        for row in tele_rows:
+            payload = row.get('noise_harmonics', '{}') if isinstance(row, dict) else '{}'
+            try:
+                parsed = _json.loads(payload) if isinstance(payload, str) else {}
+            except Exception:
+                parsed = {}
+            clean: Dict[int, float] = {}
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    try:
+                        val = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if not np.isfinite(val):
+                        continue
+                    idx: Optional[int] = None
+                    if isinstance(key, str) and key.startswith('h'):
+                        try:
+                            idx = int(key[1:])
+                        except ValueError:
+                            idx = None
+                    if idx is None:
+                        try:
+                            idx = int(key)
+                        except (TypeError, ValueError):
+                            continue
+                    if idx < 0:
+                        continue
+                    clean[idx] = float(val)
+                    max_harm = max(max_harm, idx + 1)
+            harmonic_maps.append(clean)
 
     plt.figure()
     if g.size:
@@ -9382,6 +9420,7 @@ def run_spinor_monolith(
     plt.close()
 
     fig_noise: Optional[str] = None
+    fig_fft: Optional[str] = None
     if g.size:
         fig_noise = f'{out_prefix}_noise_timeline.png'
         fig, ax = plt.subplots(figsize=(8.2, 3.8))
@@ -9433,6 +9472,84 @@ def run_spinor_monolith(
         ax.grid(True, alpha=0.18, linestyle='--', linewidth=0.6)
         _apply_tight_layout(fig)
         _savefig(fig, fig_noise, dpi=170)
+        plt.close(fig)
+
+    if g.size and (np.isfinite(fft_peak_seq).any() or max_harm > 0):
+        rows = 2 if max_harm > 0 else 1
+        fig, axes = plt.subplots(rows, 1, figsize=(8.4, 3.0 * rows), sharex=False)
+        axes_arr = np.atleast_1d(axes)
+        ax_top = axes_arr[0]
+        if np.isfinite(fft_peak_seq).any():
+            ax_top.plot(g, fft_peak_seq, color='#1f77b4', lw=1.4, label='FFT peak')
+        if np.isfinite(fft_entropy_seq).any():
+            ax_top.plot(g, fft_entropy_seq, color='#d62728', lw=1.15, label='FFT entropy')
+        if fft_reason_seq.size:
+            spike_idx = [idx for idx, reason in enumerate(fft_reason_seq) if str(reason)]
+            if spike_idx:
+                peak_vals = np.clip(fft_peak_seq[spike_idx], 0.0, 1.2)
+                ax_top.scatter(g[spike_idx], peak_vals, color='#ff7f0e', s=26, alpha=0.85, label='disturbance')
+                for idx in spike_idx[:12]:
+                    ax_top.annotate(
+                        str(fft_reason_seq[idx])[:18],
+                        (g[idx], np.clip(fft_peak_seq[idx], 0.0, 1.2)),
+                        textcoords='offset points',
+                        xytext=(0, 7),
+                        ha='center',
+                        fontsize=8,
+                        rotation=28,
+                    )
+        ax_top.set_ylabel('normalized value')
+        ax_top.set_title('FFT disturbance telemetry')
+        ax_top.grid(alpha=0.25, linestyle='--', linewidth=0.6)
+        handles, labels = ax_top.get_legend_handles_labels()
+        if handles:
+            ax_top.legend(loc='upper right', fontsize=8, frameon=False)
+        if rows == 1:
+            ax_top.set_xlabel('generation')
+        if max_harm > 0:
+            ax_spec = axes_arr[1]
+            spec_mat = np.zeros((len(g), max_harm), dtype=np.float64)
+            for col, spec in enumerate(harmonic_maps):
+                if col >= spec_mat.shape[0] or not spec:
+                    continue
+                row = spec_mat[col]
+                for idx_h, val in spec.items():
+                    if 0 <= idx_h < max_harm:
+                        row[idx_h] = max(0.0, float(val))
+                total = float(row.sum())
+                if total > 0.0:
+                    row /= total
+            heat = spec_mat.T
+            if heat.size:
+                if g.size:
+                    x0 = float(g[0]) - 0.5
+                    x1 = float(g[-1]) + 0.5
+                else:
+                    x0, x1 = -0.5, float(len(g)) - 0.5
+                vmax = float(np.nanmax(heat)) if np.isfinite(heat).any() else 0.0
+                im = ax_spec.imshow(
+                    heat,
+                    aspect='auto',
+                    origin='lower',
+                    cmap='magma',
+                    extent=(x0, x1, -0.5, max_harm - 0.5),
+                    vmin=0.0,
+                    vmax=max(0.35, vmax if vmax > 0.0 else 0.35),
+                )
+                tick_count = min(6, len(g)) if len(g) else 0
+                if tick_count:
+                    tick_positions = np.linspace(float(g[0]), float(g[-1]), tick_count)
+                    ax_spec.set_xticks(tick_positions)
+                    ax_spec.set_xticklabels([f'{tp:.0f}' for tp in tick_positions], rotation=25)
+                ax_spec.set_ylabel('harmonic index')
+                ax_spec.set_yticks(range(max_harm))
+                ax_spec.set_yticklabels([f'h{i}' for i in range(max_harm)])
+                ax_spec.set_xlabel('generation')
+                ax_spec.set_title('Spectral energy distribution')
+                fig.colorbar(im, ax=ax_spec, orientation='vertical', fraction=0.046, pad=0.02, label='weight')
+        _apply_tight_layout(fig)
+        fig_fft = f'{out_prefix}_fft_disturbances.png'
+        _savefig(fig, fig_fft, dpi=170)
         plt.close(fig)
 
     spinor_grid_png: Optional[str] = None
@@ -9586,6 +9703,8 @@ def run_spinor_monolith(
     }
     if fig_noise:
         artifacts['noise_timeline_png'] = fig_noise
+    if fig_fft:
+        artifacts['fft_disturbance_png'] = fig_fft
     if resilience_log:
         artifacts['resilience_log'] = resilience_log
     if spinor_grid_png:
@@ -9802,7 +9921,7 @@ class NomologyEnv:
     seed: Optional[int] = None
     noise_weaver_seed: Optional[int] = None
     _rng: np.random.Generator = field(init=False, repr=False)
-    noise: float = 0.06
+    noise: float = 0.075
     turns: float = 1.6
     rot_bias: float = 0.0
     lazy_share: float = 0.0
@@ -9826,17 +9945,17 @@ class NomologyEnv:
     noise_kind_code: int = 0
     noise_palette: Tuple[str, ...] = ('white', 'alpha', 'beta', 'black')
     noise_stage_len: int = 6
-    noise_jitter: float = 0.006
+    noise_jitter: float = 0.009
     noise_levels: Dict[str, Tuple[float, float]] = field(
         default_factory=lambda: {
-            'white': (0.045, 0.012),
-            'alpha': (0.052, 0.014),
-            'beta': (0.058, 0.018),
-            'black': (0.068, 0.022),
+            'white': (0.052, 0.015),
+            'alpha': (0.059, 0.018),
+            'beta': (0.067, 0.022),
+            'black': (0.081, 0.028),
         }
     )
-    noise_min: float = 0.02
-    noise_max: float = 0.14
+    noise_min: float = 0.03
+    noise_max: float = 0.22
     noise_weaver: Optional[SpectralNoiseWeaver] = None
     noise_focus: float = 0.0
     noise_entropy: float = 0.0
@@ -9899,12 +10018,12 @@ class NomologyEnv:
             return
         payload = {k: float(v) for k, v in snapshot.items() if isinstance(v, (int, float))}
         self.diversity_signal = payload
-        scarcity = float(np.clip(payload.get('scarcity', 0.0), 0.0, 1.0))
+        scarcity = float(max(payload.get('scarcity', 0.0), 0.0))
         spread = float(np.clip(payload.get('structural_spread', 0.0), 0.0, 4.0))
-        self.intensity = float(np.clip(self.intensity * (0.92 + 0.28 * scarcity), 0.05, 0.8))
-        self.noise_jitter = float(np.clip(self.noise_jitter * (1.0 + 0.2 * spread), 0.001, 0.05))
+        self.intensity = float(np.clip(self.intensity * (0.94 + 0.32 * scarcity), 0.05, 1.1))
+        self.noise_jitter = float(np.clip(self.noise_jitter * (1.0 + 0.2 * spread), 0.001, 0.065))
 
-    def _refresh_noise(self, advance: bool=False, surge: bool=False) -> None:
+    def _refresh_noise(self, advance: bool=False, surge: bool=False, allow_fft: bool=True) -> None:
         if advance:
             self._noise_counter += 1.0
         std, kind, profile = _cyclic_noise_profile(self._noise_counter, self._noise_ctx(surge))
@@ -9936,6 +10055,15 @@ class NomologyEnv:
         self.noise = std
         self.noise_kind = kind
         self.noise_profile = profile
+        if allow_fft:
+            base_chance = 0.06 + 0.18 * float(self.intensity)
+            base_chance += 0.1 * float(np.clip(getattr(self, 'noise_focus', 0.0), 0.0, 2.5))
+            if surge:
+                base_chance += 0.12
+            if self._rng.random() < min(0.9, base_chance):
+                ambient_strength = float(np.clip(0.6 + 0.8 * float(self.intensity) + 0.4 * float(self.noise_focus), 0.45, 2.6))
+                reason = 'ambient_fft_surge' if surge else 'ambient_fft'
+                self.trigger_fft_spike(strength=ambient_strength, reason=reason)
         style = self.noise_style(kind)
         self.noise_kind_label = style.get('label', kind)
         self.noise_kind_symbol = style.get('symbol', kind[:1].upper() if kind else '?')
@@ -9975,10 +10103,10 @@ class NomologyEnv:
         self.noise_entropy = float(profile.get('mix_entropy', entropy_val))
 
     def trigger_fft_spike(self, strength: float=1.0, bands: Optional[int]=None, reason: str='') -> Dict[str, Any]:
-        bands = int(bands) if bands is not None else int(max(8, self.noise_stage_len * 2))
+        bands = int(bands) if bands is not None else int(max(12, self.noise_stage_len * 3))
         bands = max(4, bands)
-        sample_len = max(bands * 2, int(self.noise_stage_len) * 4)
-        sample = self._rng.normal(0.0, self.noise + 0.01 * strength, size=sample_len)
+        sample_len = max(bands * 2, int(self.noise_stage_len) * 6)
+        sample = self._rng.normal(0.0, self.noise + 0.02 * strength, size=sample_len)
         spectrum = np.abs(np.fft.rfft(sample))
         spectrum = np.nan_to_num(spectrum, nan=0.0, posinf=0.0, neginf=0.0)
         total = float(spectrum.sum())
@@ -9993,9 +10121,9 @@ class NomologyEnv:
         if keep > 1:
             entropy = float(-(spectrum[:keep] * np.log(spectrum[:keep] + 1e-12)).sum() / np.log(keep))
         self.noise_harmonics = harmonics
-        self.noise_focus = float(np.clip(0.55 * self.noise_focus + 0.45 * peak * (1.0 + 0.25 * strength), 0.0, 1.8))
-        self.noise_entropy = float(np.clip(0.6 * self.noise_entropy + 0.4 * entropy, 0.0, 2.5))
-        self.noise = float(np.clip(self.noise * (1.0 + 0.22 * strength), self.noise_min, self.noise_max))
+        self.noise_focus = float(np.clip(0.45 * self.noise_focus + 0.55 * peak * (1.0 + 0.35 * strength), 0.0, 2.2))
+        self.noise_entropy = float(np.clip(0.5 * self.noise_entropy + 0.5 * entropy * (1.0 + 0.25 * strength), 0.0, 3.2))
+        self.noise = float(np.clip(self.noise * (1.0 + 0.34 * strength) + 0.01 * strength, self.noise_min, self.noise_max))
         try:
             self.noise_kind = str(self._rng.choice(self.noise_palette))
         except Exception:
@@ -10005,10 +10133,12 @@ class NomologyEnv:
         self.noise_kind_symbol = style.get('symbol', self.noise_kind_symbol)
         self.noise_kind_color = style.get('color', self.noise_kind_color)
         self.noise_kind_code = int(style.get('index', self.noise_kind_code))
-        self.turns = float(np.clip(self.turns * (1.0 + self._rng.normal(0.0, 0.1 * strength)), 0.7, 2.8))
-        self.rot_bias = float(np.clip(self.rot_bias + self._rng.normal(0.0, 0.45 * strength), -math.pi, math.pi))
+        self.turns = float(np.clip(self.turns * (1.0 + self._rng.normal(0.0, 0.12 * strength)), 0.6, 3.1))
+        self.rot_bias = float(np.clip(self.rot_bias + self._rng.normal(0.0, 0.55 * strength), -math.pi, math.pi))
+        self.noise_stage_len = int(np.clip(float(self.noise_stage_len) * (1.0 - 0.08 * strength) + 1.0, 4.0, 32.0))
+        self.intensity = float(np.clip(self.intensity * (1.08 + 0.2 * strength) + 0.02, 0.05, 1.05))
         self.regime_id = int(self.regime_id + 1)
-        self._refresh_noise(advance=True, surge=True)
+        self._refresh_noise(advance=True, surge=True, allow_fft=False)
         payload = {
             'strength': float(strength),
             'peak': float(peak),
@@ -10585,7 +10715,7 @@ class Telemetry:
     def __init__(self, tel_csv: str, regime_csv: str) -> None:
         self.tel_csv = tel_csv
         self.reg_csv = regime_csv
-        expected_cols = 31
+        expected_cols = 34
         if os.path.exists(self.tel_csv):
             try:
                 with open(self.tel_csv, 'r', newline='') as f:
@@ -10621,6 +10751,9 @@ class Telemetry:
                     'noise_focus',
                     'noise_entropy',
                     'noise_harmonics',
+                    'fft_peak',
+                    'fft_entropy',
+                    'fft_reason',
                     'turns',
                     'rot_bias',
                     'group_idx',
@@ -10698,6 +10831,11 @@ class Telemetry:
             harm_payload = _json.dumps({k: float(v) for k, v in harmonics.items()})
         else:
             harm_payload = '{}'
+        fft_peak = float(profile.get('fft_peak', float('nan')) if profile else float('nan'))
+        fft_entropy = float(profile.get('fft_entropy', float('nan')) if profile else float('nan'))
+        fft_reason = ''
+        if isinstance(profile, dict):
+            fft_reason = str(profile.get('fft_reason', ''))
         lazy_share = float(getattr(env, 'lazy_share', 0.0))
         lazy_anchor = float(getattr(env, 'lazy_anchor', 0.0))
         lazy_gap = float(getattr(env, 'lazy_gap', 0.0))
@@ -10723,6 +10861,9 @@ class Telemetry:
                 noise_focus,
                 noise_entropy,
                 harm_payload,
+                fft_peak,
+                fft_entropy,
+                fft_reason,
                 env.turns,
                 env.rot_bias,
                 '' if group_idx is None else int(group_idx),
