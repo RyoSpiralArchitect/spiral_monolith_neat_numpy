@@ -1388,6 +1388,7 @@ def _format_lcs_summary(summary: Optional[Dict[str, Any]]) -> str:
     return f"altμ {avg_paths:.2f} | disjointμ {avg_disjoint:.2f} | Δpaths {mean_delta:+.2f} | {detour_str} | {tth_str} | conn {connected_ratio:.2f} | H:{summary.get('heals', 0)} B:{summary.get('breaks', 0)} | Δedges {summary.get('changed_edges', 0)}"
 
 def export_lcs_ribbon_png(lcs_rows: List[Dict[str, Any]], path: str, series: Optional[Dict[str, Any]]=None, outputs: Optional[Iterable[int]]=None, dpi: int=200) -> Optional[str]:
+    """Render the canonical LCS ribbon PNG using the hardened _savefig helper."""
     if not lcs_rows:
         return None
     if series is None:
@@ -1800,12 +1801,6 @@ def _connectivity_guard(g, innov, rng, min_frac=0.6, max_new_edges=16, eps=0.0):
     unreachable = [o for o in outputs if o not in seen]
     attempts = 0
     rng_local = rng or np.random.default_rng()
-    collective = dict(collective_signal or {})
-    altruism_target = float(np.clip(collective.get('altruism_target', 0.5), 0.0, 1.0))
-    solidarity = float(np.clip(collective.get('solidarity', 0.5), 0.0, 1.0))
-    stress = float(np.clip(collective.get('stress', 0.0), 0.0, 2.5))
-    lazy_share = float(np.clip(collective.get('lazy_share', 0.0), 0.0, 1.0))
-    advantage = float(np.clip(collective.get('advantage', 0.0), 0.0, 2.0))
     while unreachable and attempts < int(max_new_edges):
         if not sources:
             break
@@ -5112,6 +5107,12 @@ def train_with_backprop_numpy(
     y = np.asarray(y, dtype=np.float32)
     np.nan_to_num(X, copy=False)
     np.nan_to_num(y, copy=False)
+    collective_signal = dict(collective_signal or {})
+    altruism_target = float(collective_signal.get('altruism_target', 0.5))
+    solidarity = float(collective_signal.get('solidarity', 0.5))
+    stress = float(collective_signal.get('stress', 0.0))
+    lazy_share = float(collective_signal.get('lazy_share', 0.0))
+    advantage = float(collective_signal.get('advantage', 0.0))
     comp = compile_genome(genome)
     w = comp['w'].copy()
     history = []
@@ -5136,7 +5137,7 @@ def train_with_backprop_numpy(
         profile_out['initial_altruism'] = init_alt.copy()
         profile_out['initial_altruism_memory'] = init_alt_mem.copy()
         profile_out['initial_altruism_span'] = init_alt_span.copy()
-        profile_out['collective_signal'] = collective
+        profile_out['collective_signal'] = dict(collective_signal)
     rng_local = rng or np.random.default_rng()
     if w.size == 0:
         return history
@@ -5481,7 +5482,7 @@ def _normalize_scar_snapshot(entry: Optional[Dict[Any, Any]]) -> Tuple[Dict[int,
     return (node_scars, edge_scars)
 
 def _export_morph_gif_with_scars(snapshots_genomes, snapshots_scars, path, *, fps=12, morph_frames=12, decay_horizon=10.0, fixed_layout=True, dpi=130, pulse_period_frames=16):
-    """Scar-aware morph GIF helper shared by export_morph_gif."""
+    """Scar-aware morph GIF helper shared by export_morph_gif; canonical deduped variant."""
     import numpy as _np
     import matplotlib.pyplot as _plt
     if not snapshots_genomes or len(snapshots_genomes) < 2:
@@ -6222,6 +6223,7 @@ class FitnessBackpropShared:
         self.alpha_nodes = float(alpha_nodes)
         self.alpha_edges = float(alpha_edges)
         self.noise_std = 0.0
+        self.collective_signal: Optional[Dict[str, float]] = None
 
     def set_noise_std(self, s: float):
         self.noise_std = float(max(0.0, s))
@@ -6241,8 +6243,9 @@ class FitnessBackpropShared:
         return X + rng.normal(0.0, s, size=X.shape)
 
     def __call__(self, g: 'Genome') -> float:
-        Xtr, ytr, Xva, yva = self._load()
         signal = getattr(self, 'collective_signal', None)
+        signal = dict(signal) if signal else None
+        Xtr, ytr, Xva, yva = self._load()
         return fitness_backprop_classifier(
             g,
             self._aug(Xtr),
@@ -6258,9 +6261,10 @@ class FitnessBackpropShared:
         )
 
     def refine_raw(self, g: 'Genome', factor: float=2.0) -> float:
-        Xtr, ytr, Xva, yva = self._load()
         steps = int(max(1, round(self.steps * float(factor))))
         signal = getattr(self, 'collective_signal', None)
+        signal = dict(signal) if signal else None
+        Xtr, ytr, Xva, yva = self._load()
         return fitness_backprop_classifier(
             g,
             self._aug(Xtr),
@@ -6541,8 +6545,10 @@ def _fig_to_rgb(fig):
 def export_regen_gif(snapshots_genomes, snapshots_scars, path, fps=12, pulse_period_frames=16, decay_horizon=10.0, fixed_layout=True, dpi=130, lcs_series: Optional[Dict[str, Any]]=None):
     """
     Render a regeneration digest GIF from per-generation snapshots.
-    Encodes differences without color semantics: linestyle/linewidth/alpha only.
-    When lcs_series is provided, overlays per-generation LCS summary text.
+    This is the retained canonical implementation; duplicates were removed to ensure
+    consistent behaviour across exports. Encodes differences without color semantics:
+    linestyle/linewidth/alpha only. When lcs_series is provided, overlays
+    per-generation LCS summary text.
     """
     import numpy as _np
     import matplotlib.pyplot as _plt
@@ -6664,8 +6670,8 @@ def export_regen_gif(snapshots_genomes, snapshots_scars, path, fps=12, pulse_per
 def export_morph_gif(snapshots_genomes, snapshots_scars=None, path=None, *, fps=12, morph_frames=8, fixed_layout=True, dpi=130, decay_horizon=8.0):
     """
     Inter-generational morphological transition GIF.
-    Supports legacy calls with scar metadata as well as lightweight
-    visualisations that only rely on genomes.
+    This canonical export supports legacy calls with scar metadata as well as
+    lightweight visualisations that only rely on genomes.
     """
     import os as _os
     import numpy as _np
