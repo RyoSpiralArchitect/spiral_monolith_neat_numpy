@@ -160,6 +160,28 @@ _RL_MEMORY_LIMIT_MAX = 8192
 _RL_META_ALPHA = 0.3
 _RL_META_VAR_ALPHA = 0.18
 
+_RL_WEIGHT_COEFF_DEFAULTS: Dict[str, float] = {
+    'novel_bias': 0.5,
+    'novel_scale': 1.0,
+    'priority_gain': 0.35,
+    'recency_scale': 1.0,
+    'entropy_gain': 0.05,
+    'stability_gain': 0.1,
+}
+
+_RL_WEIGHT_DSL_TEMPLATE = """
+// cpp-ish DSL: statements end with ';', clamp(x, lo, hi) is available.
+weights = ret_weights.copy();
+weights += novelty_gain * ({novel_bias} + novelty * {novel_scale});
+weights += priority * {priority_gain};
+weights += recency_gain * recency * {recency_scale};
+weights += entropy * {entropy_gain};
+weights += (1.0 - stability) * {stability_gain};
+weights = clamp(weights, 1e-8, None);
+"""
+
+_RL_WEIGHT_PROGRAM_CACHE: Dict[str, Any] = {}
+
 
 def _rl_default_meta() -> Dict[str, Any]:
     return {
@@ -227,6 +249,136 @@ def _rl_merge_meta(meta_a: Optional[Dict[str, Any]], meta_b: Optional[Dict[str, 
     if extras:
         merged.update(extras)
     return merged
+
+
+def _rl_sanitise_weight_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_RL_WEIGHT_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _RL_WEIGHT_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            if key in ('novel_bias',):
+                val = float(np.clip(val, -2.0, 4.0))
+            elif key in ('novel_scale', 'priority_gain', 'recency_scale'):
+                val = float(np.clip(val, 0.0, 6.0))
+            elif key == 'entropy_gain':
+                val = float(np.clip(val, -2.0, 2.0))
+            elif key == 'stability_gain':
+                val = float(np.clip(val, -2.0, 3.0))
+            base[key] = val
+    return base
+
+
+def _ensure_rl_weight_coeffs(genome: 'Genome') -> Dict[str, float]:
+    coeffs = getattr(genome, 'rl_weight_coeffs', None)
+    coeffs = _rl_sanitise_weight_coeffs(coeffs)
+    genome.rl_weight_coeffs = coeffs
+    return coeffs
+
+
+def _rl_weight_program_for(genome: 'Genome') -> str:
+    template = getattr(genome, 'rl_weight_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _RL_WEIGHT_DSL_TEMPLATE
+        genome.rl_weight_program_template = template
+    coeffs = _ensure_rl_weight_coeffs(genome)
+    formatted = {}
+    for key, value in coeffs.items():
+        formatted[key] = repr(float(value))
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        program = _RL_WEIGHT_DSL_TEMPLATE.format(**{k: repr(v) for k, v in _RL_WEIGHT_COEFF_DEFAULTS.items()})
+    return program
+
+
+def _rl_compile_weight_program(program: str):
+    cached = _RL_WEIGHT_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty RL weight program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<rl_weight_program>', 'exec')
+    _RL_WEIGHT_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _dsl_clamp(arr: Any, low: Optional[float], high: Optional[float]):
+    data = np.asarray(arr, dtype=np.float64)
+    if low is None and high is None:
+        return data
+    if low is None:
+        return np.minimum(data, high)
+    if high is None:
+        return np.maximum(data, low)
+    return np.clip(data, low, high)
+
+
+def _rl_run_weight_program(state: Dict[str, Any], program: str) -> Optional[np.ndarray]:
+    try:
+        compiled = _rl_compile_weight_program(program)
+    except Exception:
+        return None
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    weights = locals_dict.get('weights')
+    if weights is None:
+        return None
+    try:
+        return np.asarray(weights, dtype=np.float64)
+    except Exception:
+        return None
+
+
+def _stack_replay_observations(obs_list: Sequence[np.ndarray]) -> np.ndarray:
+    if not obs_list:
+        raise ValueError('empty observation list')
+    shapes = [tuple(obs.shape) for obs in obs_list]
+    first_shape = shapes[0]
+    if all(shape == first_shape for shape in shapes):
+        return np.stack(obs_list, axis=0).astype(np.float64, copy=False)
+    widths = [obs.size for obs in obs_list]
+    width = max(widths)
+    mat = np.zeros((len(obs_list), width), dtype=np.float64)
+    for idx, obs in enumerate(obs_list):
+        flat = np.asarray(obs, dtype=np.float64).ravel()
+        limit = min(flat.size, width)
+        if limit:
+            mat[idx, :limit] = flat[:limit]
+    return mat
+
+
+def _mutate_rl_weight_kernel(genome: 'Genome', rng: np.random.Generator) -> None:
+    coeffs = _ensure_rl_weight_coeffs(genome)
+    key = rng.choice(list(_RL_WEIGHT_COEFF_DEFAULTS.keys()))
+    current = float(coeffs.get(key, _RL_WEIGHT_COEFF_DEFAULTS[key]))
+    if key in ('novel_bias',):
+        current = float(np.clip(current + rng.normal(0.0, 0.25), -2.0, 4.0))
+    elif key in ('novel_scale', 'priority_gain', 'recency_scale'):
+        current = float(np.clip(current * math.exp(rng.normal(0.0, 0.3)), 0.0, 6.0))
+    elif key == 'entropy_gain':
+        current = float(np.clip(current + rng.normal(0.0, 0.12), -2.0, 2.0))
+    elif key == 'stability_gain':
+        current = float(np.clip(current + rng.normal(0.0, 0.18), -2.0, 3.0))
+    coeffs[key] = current
+    genome.rl_weight_coeffs = coeffs
 
 
 def _rl_collective_signal(
@@ -983,6 +1135,8 @@ class Genome:
         self.rl_train_steps = int(18)
         self.rl_l2 = float(0.0001)
         self.rl_meta: Dict[str, Any] = _rl_default_meta()
+        self.rl_weight_coeffs: Dict[str, float] = dict(_RL_WEIGHT_COEFF_DEFAULTS)
+        self.rl_weight_program_template: str = _RL_WEIGHT_DSL_TEMPLATE
 
     def meta_reflect(self, event: str, payload: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
         info = dict(payload or {})
@@ -1057,6 +1211,13 @@ class Genome:
         merged_meta = _rl_default_meta()
         merged_meta.update(meta)
         g.rl_meta = merged_meta
+        try:
+            coeffs = dict(getattr(self, 'rl_weight_coeffs', {}))
+        except Exception:
+            coeffs = dict(_RL_WEIGHT_COEFF_DEFAULTS)
+        g.rl_weight_coeffs = _rl_sanitise_weight_coeffs(coeffs)
+        template = getattr(self, 'rl_weight_program_template', _RL_WEIGHT_DSL_TEMPLATE)
+        g.rl_weight_program_template = template if isinstance(template, str) else _RL_WEIGHT_DSL_TEMPLATE
         return g
 
     def invalidate_caches(self, structure: bool=False, weights: bool=False):
@@ -3766,6 +3927,8 @@ class ReproPlanaNEATPlus:
             genome.mutate_parameter('gamma', self.rng, sigma=0.08, low=0.4, high=0.9995, log_scale=False)
         if rl_rate > 0.0 and self.rng.random() < rl_rate:
             genome.mutate_parameter('entropy', self.rng, sigma=0.45, low=0.0, high=0.5, log_scale=True)
+        if rl_rate > 0.0 and self.rng.random() < 0.5 * rl_rate:
+            _mutate_rl_weight_kernel(genome, self.rng)
 
     def _crossover_maternal_biased(self, mother: Genome, father: Genome, species_members):
         fit_dict = {g: f for g, f in species_members}
@@ -3911,6 +4074,21 @@ class ReproPlanaNEATPlus:
             alpha = float(self.rng.uniform(0.25, 0.75))
             mixed[key] = float(alpha * mv + (1.0 - alpha) * fv)
         child.rl_params = mixed
+        coeff_m = _rl_sanitise_weight_coeffs(getattr(mother, 'rl_weight_coeffs', None) if mother is not None else None)
+        coeff_f = _rl_sanitise_weight_coeffs(getattr(father, 'rl_weight_coeffs', None) if father is not None else None)
+        coeff_mix: Dict[str, float] = {}
+        for key in _RL_WEIGHT_COEFF_DEFAULTS:
+            mv = coeff_m.get(key, _RL_WEIGHT_COEFF_DEFAULTS[key])
+            fv = coeff_f.get(key, _RL_WEIGHT_COEFF_DEFAULTS[key])
+            blend = float(self.rng.uniform(0.3, 0.7))
+            coeff_mix[key] = float(blend * mv + (1.0 - blend) * fv)
+        child.rl_weight_coeffs = coeff_mix
+        templates = [
+            getattr(mother, 'rl_weight_program_template', None) if mother is not None else None,
+            getattr(father, 'rl_weight_program_template', None) if father is not None else None,
+        ]
+        templates = [tpl for tpl in templates if isinstance(tpl, str) and tpl.strip()]
+        child.rl_weight_program_template = templates[0] if templates else _RL_WEIGHT_DSL_TEMPLATE
         limit = int(getattr(child, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
         child.rl_memory_limit = limit
         merged = deque(maxlen=limit)
@@ -8340,6 +8518,7 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
     except Exception:
         util = 0.0
     meta['memory_util'] = float(np.clip(util, 0.0, 1.0))
+    meta['weight_kernel'] = dict(_ensure_rl_weight_coeffs(genome))
 
 
 def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> None:
@@ -8370,17 +8549,31 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
     ret_weights = ret_weights + float(max(0.0, entropy)) * (np.std(returns) + 1e-6)
     novelty = np.asarray([float(d.get('novelty', 0.0)) for d in items], dtype=np.float64)
     if novelty.size:
-        novelty = novelty - float(np.min(novelty))
-        if np.max(novelty) > 0:
-            novelty = novelty / float(np.max(novelty))
+        min_novel = float(np.min(novelty))
+        novelty = novelty - min_novel
+        max_novel = float(np.max(novelty))
+        if max_novel > 0:
+            novelty = novelty / max_novel
+        else:
+            novelty = np.zeros_like(ret_weights)
+    else:
+        novelty = np.zeros_like(ret_weights)
     priority = np.asarray([float(d.get('priority', 1.0)) for d in items], dtype=np.float64)
-    if priority.size and np.max(priority) > 0:
-        priority = priority / float(np.max(priority))
+    if priority.size:
+        max_priority = float(np.max(priority))
+        if max_priority > 0:
+            priority = priority / max_priority
+        else:
+            priority = np.ones_like(ret_weights)
     else:
         priority = np.ones_like(ret_weights)
     if indices.size:
         recency = indices - float(np.min(indices)) + 1.0
-        recency = recency / float(np.max(recency)) if np.max(recency) > 0 else np.ones_like(indices)
+        max_recency = float(np.max(recency))
+        if max_recency > 0:
+            recency = recency / max_recency
+        else:
+            recency = np.ones_like(indices)
     else:
         recency = np.ones_like(ret_weights)
     stability = float(np.clip(meta.get('stability', 0.0), 0.0, 1.0))
@@ -8389,13 +8582,34 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
     trend_norm = float(np.tanh(trend / denom))
     novelty_gain = 0.25 + 0.55 * (1.0 - stability)
     recency_gain = 0.2 + 0.5 * max(0.0, -trend_norm)
-    weights = ret_weights + novelty_gain * (0.5 + novelty)
-    weights += 0.35 * priority
-    weights += recency_gain * recency
+    coeffs = _ensure_rl_weight_coeffs(genome)
+    program = _rl_weight_program_for(genome)
+    weight_state = {
+        'weights': ret_weights.copy(),
+        'ret_weights': ret_weights,
+        'novelty_gain': novelty_gain,
+        'recency_gain': recency_gain,
+        'novelty': novelty,
+        'priority': priority,
+        'recency': recency,
+        'returns': returns,
+        'stability': stability,
+        'trend_norm': trend_norm,
+        'entropy': float(max(0.0, entropy)),
+        'memory_util': float(np.clip(meta.get('memory_util', 0.0), 0.0, 1.0)),
+        'lazy_strength': float(np.clip(getattr(genome, 'lazy_lineage_strength', 0.0), 0.0, 4.0)),
+        'size': float(len(items)),
+    }
+    weights = _rl_run_weight_program(weight_state, program)
+    if weights is None or weights.shape != ret_weights.shape:
+        weights = ret_weights + novelty_gain * (0.5 + novelty)
+        weights += coeffs.get('priority_gain', 0.35) * priority
+        weights += recency_gain * recency * coeffs.get('recency_scale', 1.0)
+    weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1e-8)
     weights = np.clip(weights, 1e-8, None)
     total_w = float(np.sum(weights))
     if not np.isfinite(total_w) or total_w <= 0:
-        weights = np.ones_like(weights)
+        weights = np.ones_like(ret_weights)
         total_w = float(len(weights))
     probs = weights / total_w
     steps = max(1, int(getattr(genome, 'rl_train_steps', 18)))
@@ -8404,39 +8618,94 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
     if sample_size <= 0:
         return
     selected: List[int] = []
-    if novelty.size:
-        quota_novel = max(1, sample_size // 3)
-        top_novel = np.argsort(novelty)[-min(len(items), quota_novel):]
-        selected.extend(int(i) for i in top_novel.tolist())
-    if priority.size:
-        quota_priority = max(1, sample_size // 4)
-        top_priority = np.argsort(priority)[-min(len(items), quota_priority):]
-        for idx in top_priority.tolist():
-            if idx not in selected:
-                selected.append(int(idx))
+    selected_set: Set[int] = set()
+    if novelty.size and np.any(novelty):
+        quota_novel = min(len(items), max(1, sample_size // 3))
+        kth = max(0, len(items) - quota_novel)
+        top_idx = np.argpartition(novelty, kth)[-quota_novel:]
+        order = np.argsort(novelty[top_idx])[::-1]
+        for idx in top_idx[order]:
+            idx_int = int(idx)
+            if idx_int in selected_set:
+                continue
+            selected.append(idx_int)
+            selected_set.add(idx_int)
             if len(selected) >= sample_size:
                 break
-    while len(selected) < sample_size:
-        choice = int(np.random.choice(len(items), p=probs))
-        if choice not in selected:
-            selected.append(choice)
-        elif len(selected) >= len(items):
-            break
-    if len(selected) > sample_size:
-        selected = selected[-sample_size:]
+    if priority.size and len(selected) < sample_size:
+        quota_priority = min(len(items), max(1, sample_size // 4))
+        kth = max(0, len(items) - quota_priority)
+        top_idx = np.argpartition(priority, kth)[-quota_priority:]
+        order = np.argsort(priority[top_idx])[::-1]
+        for idx in top_idx[order]:
+            idx_int = int(idx)
+            if idx_int in selected_set:
+                continue
+            selected.append(idx_int)
+            selected_set.add(idx_int)
+            if len(selected) >= sample_size:
+                break
+    remaining = sample_size - len(selected)
+    if remaining > 0:
+        weight_copy = np.array(weights, copy=True)
+        if selected_set:
+            sel_idx = np.fromiter(selected_set, dtype=np.int64)
+            weight_copy[sel_idx] = 0.0
+        total = float(np.sum(weight_copy))
+        if not np.isfinite(total) or total <= 0:
+            weight_copy.fill(1.0)
+            total = float(len(weight_copy))
+        probs_sample = weight_copy / total
+        max_extra = max(0, len(items) - len(selected_set))
+        remaining = min(remaining, max_extra)
+        if remaining > 0:
+            try:
+                extra = np.random.choice(len(items), size=remaining, replace=False, p=probs_sample)
+            except ValueError:
+                extra = np.random.choice(len(items), size=remaining, replace=False)
+            for idx in extra:
+                idx_int = int(idx)
+                if idx_int in selected_set:
+                    continue
+                selected.append(idx_int)
+                selected_set.add(idx_int)
+                if len(selected) >= sample_size:
+                    break
+    if len(selected) < sample_size:
+        order = np.argsort(weights)[::-1]
+        for idx in order:
+            idx_int = int(idx)
+            if idx_int in selected_set:
+                continue
+            selected.append(idx_int)
+            selected_set.add(idx_int)
+            if len(selected) >= sample_size:
+                break
+    if not selected:
+        return
+    selected = selected[:sample_size]
     picked = [items[int(i)] for i in selected]
     try:
-        X = np.stack([p['obs'] for p in picked], axis=0).astype(np.float64)
+        obs_stack = [np.asarray(p['obs'], dtype=np.float64).ravel() for p in picked]
+        X = _stack_replay_observations(obs_stack)
     except Exception:
         return
+    if X.ndim != 2:
+        X = X.reshape(X.shape[0], -1)
+    X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=-1.0, copy=False)
     try:
-        y = np.asarray([int(p['action']) for p in picked], dtype=np.int32)
+        y = np.asarray([int(p['action']) for p in picked], dtype=np.int64)
     except Exception:
         return
+    if y.ndim != 1 or y.size != X.shape[0]:
+        return
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int32)
     steps = int(getattr(genome, 'rl_train_steps', 18))
     l2 = float(getattr(genome, 'rl_l2', 0.0001))
     batch_returns = [float(p.get('return', p.get('reward', 0.0))) for p in picked]
     collective_signal = _rl_collective_signal(genome, meta, rewards=batch_returns, experiences=picked)
+    meta['weight_kernel'] = dict(coeffs)
+    meta['weight_program'] = program
     try:
         history = train_with_backprop_numpy(
             genome,
@@ -8459,6 +8728,8 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
             'mean_return': float(np.mean(batch_returns)) if batch_returns else 0.0,
             'novelty_mean': novelty_mean,
             'priority_mean': priority_mean,
+            'weight_kernel': dict(coeffs),
+            'weight_program': program,
         }
         if history:
             meta['last_replay']['final_loss'] = float(history[-1])
@@ -8471,6 +8742,8 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
                 'entropy': float(entropy),
                 'collective_signal': dict(collective_signal),
                 'mean_return': float(np.mean(batch_returns)) if batch_returns else 0.0,
+                'weight_kernel': dict(coeffs),
+                'weight_program': program,
             },
         )
     except Exception:
@@ -8610,6 +8883,8 @@ def _rl_update_meta_profile(
     meta['memory_util'] = float(np.clip(len(memory_buf) / max(1.0, limit), 0.0, 1.0))
     signal = _rl_collective_signal(genome, meta, rewards=rewards, experiences=experiences)
     meta['collective_signal'] = dict(signal)
+    meta['weight_kernel'] = dict(_ensure_rl_weight_coeffs(genome))
+    meta['weight_program'] = _rl_weight_program_for(genome)
     if params_before != getattr(genome, 'rl_params', {}) and 'rl_params' not in changes:
         changes['rl_params'] = dict(genome.rl_params)
     if changes:
