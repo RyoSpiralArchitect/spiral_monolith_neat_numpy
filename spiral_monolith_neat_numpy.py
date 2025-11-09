@@ -16,48 +16,107 @@
 # • Tunable: tweak council weights, lazy pressure, or mandatory policies inline and re-run instantly.
 #   調整容易: 合議制ウェイトや怠惰個体圧、mandatory ポリシーをその場で書き換えすぐ検証できます。
 #
-# Quickstart / クイックスタート
-#   python spiral_monolith_neat_numpy.py --help
-# Discover CLI presets, exporters, and governance toggles—`--no-mandatory` flips the council back to
-# soft advisory mode for exploratory runs.
-# CLI でプリセットやエクスポート、ガバナンス設定を確認できます。`--no-mandatory` で mandatory を無効化し、
-# 柔軟な実験モードに切り替えられます。
+# Systems overview / システム概要
+# 1. Genome & caches / ゲノムとキャッシュ
+#    • `NodeGene` / `ConnectionGene` / `Genome` encode graph-structured policies with
+#      adjacency caching, structural signatures, and regeneration metadata. The
+#      `_structure_cache_*` helpers plus `compile_genome` memoise NumPy-ready graphs
+#      for repeated forward passes.
+#      ・`NodeGene` / `ConnectionGene` / `Genome` がグラフ型ポリシーを表現し、隣接行列キャッシュや構造シグネチャ、
+#        再生メタデータを保持します。`_structure_cache_*` 群と `compile_genome` により、繰り返し利用する NumPy グラフを
+#        メモ化します。
+#    • `InnovationTracker` and regeneration utilities (`_soft_regenerate_*`,
+#      `platyregenerate`) maintain NEAT’s structural novelty while supporting
+#      “soft” mutation modes keyed off Lazy Council feedback.
+#      ・`InnovationTracker` と `_soft_regenerate_*` / `platyregenerate` は Lazy Council からの
+#        フィードバックを受けた「ソフト再生」変異を扱いながら、NEAT 本来の構造革新を保持します。
 #
-# Pillars / コア機能
-# • Monodromy-aware curricula: environment difficulty follows topology shifts for path-dependent regimes.
-#   モノドロミー対応カリキュラム: トポロジー変化に応じた環境難度制御で軌跡依存の学習を実現。
-# • Lazy Council orchestration: top performers + stochastic delegates cast equal votes to steer dynamics,
-#   while lazy-lineage amplification prevents overfitting to any diversity axis.
-#   Lazy Council オーケストレーション: トップ個体とランダム代表が同票で舵取りし、多様性軸の過適応を怠惰系統強化で抑制。
-# • Hybrid NEAT × backprop loop: champion genomes receive NumPy-based fine-tuning without losing structural novelty.
-#   NEAT とバックプロップのハイブリッド: 勝者ゲノムに NumPy 微調整を適用し構造革新を維持。
-# • Artefact exports: lineage graphs, morph GIFs, regeneration timelines, LCS ribbons—curated via a headless-ready
-#   Matplotlib pipeline.
-#   成果物エクスポート: 系統グラフや形態 GIF、再生タイムライン、LCS リボンをヘッドレス環境対応の Matplotlib で出力。
+# 2. Council governance & evolution / 合議制ガバナンスと進化ループ
+#    • `ReproPlanaNEATPlus` drives speciation, offspring creation, lazy-lineage
+#      assignment, complexity auto-scaling, and monodromy-aware diversity bonuses.
+#      `HouseholdManager`, `LCSMonitor`, and resilience trackers feed difficulty and
+#      healing signals back into the population.
+#      ・`ReproPlanaNEATPlus` が種分化、子個体生成、怠惰系統割当、複雑度オートスケーリング、モノドロミー多様性
+#        ボーナスを統括し、`HouseholdManager`・`LCSMonitor`・レジリエンス追跡が難度や治癒シグナルを個体群へ還元します。
+#    • The six-seat Lazy Council is materialised via `SpinorGroupInteraction`,
+#      `SpinorScheduler`, `NomologyEnv`, and `SpinorNomologyFitness`. Mandatory mode
+#      (default) enforces council directives; `--no-mandatory` relaxes them.
+#      ・6 席の Lazy Council は `SpinorGroupInteraction`・`SpinorScheduler`・`NomologyEnv`・
+#        `SpinorNomologyFitness` により具体化されます。mandatory モード（既定）は議決を強制し、`--no-mandatory`
+#        で緩和できます。
+#    • The self-reproducing environment (`SelfReproducingEvaluator` and
+#      `SpinorNomologyDatasetController`) co-evolves support datasets, enabling
+#      feedback between resident genomes and the governing spinor curriculum.
+#      ・`SelfReproducingEvaluator` と `SpinorNomologyDatasetController` による自己再生環境が支援データセットを
+#        共進化させ、住民ゲノムとスピノールカリキュラムの双方向フィードバックを実現します。
 #
-# Featured recipes / 代表的レシピ
-# • Spiral benchmark explorer / スパイラル課題徹底解析
-#     python spiral_monolith_neat_numpy.py \
-#         --task spiral --gens 60 --pop 96 --steps 60 \
-#         --make-gifs --make-lineage --report --out out/spiral_bold
-# • Monodromy spotlight / モノドロミーモード詳解
-#     python spiral_monolith_neat_numpy.py \
-#         --task spiral --gens 60 --pop 96 --steps 60 \
-#         --monodromy --make-gifs --make-lineage --report --out out/spiral_monodromy
-# • Gym baseline / Gym 連携ベースライン
-#     python - <<'PY'
-#     from spiral_monolith_neat_numpy import run_gym_neat_experiment
-#     run_gym_neat_experiment(
-#         "CartPole-v1", gens=30, pop=64, episodes=3, max_steps=500,
-#         stochastic=True, temp=0.8, out_prefix="out/cartpole"
-#     )
-#     PY
+# 3. Backprop refinement & shared datasets / バックプロップ精緻化と共有データ
+#    • Supervised tasks (`make_xor`, `make_circles`, `make_spirals`) are trained via
+#      `train_with_backprop_numpy`, with evaluation orchestrated by
+#      `fitness_backprop_classifier` and optional refinement hooks.
+#      ・教師あり課題（`make_xor`・`make_circles`・`make_spirals`）は `train_with_backprop_numpy`
+#        で学習され、`fitness_backprop_classifier` と追加精緻化フックが評価を制御します。
+#    • Shared-memory helpers (`shm_register_dataset`, `get_shared_dataset`,
+#      `PerSampleSequenceStopperPro`) keep dataset copies minimal when spawning
+#      worker processes for parallel evaluation.
+#      ・共有メモリ機構（`shm_register_dataset`・`get_shared_dataset`・`PerSampleSequenceStopperPro`）により、
+#        並列評価プロセスでもデータセットの複製を抑えます。
+#
+# 4. Visualisation & artefacts / 可視化と成果物
+#    • Headless-safe Matplotlib helpers (`_ensure_matplotlib_agg`, `_stamp_figure`,
+#      `_savefig`, `_mimsave`) stamp build metadata from `_resolve_build_info`—now
+#      SHA-256 fingerprint + UTC timestamp without git—onto PNG/GIF outputs.
+#      ・ヘッドレス対応の Matplotlib ヘルパー（`_ensure_matplotlib_agg`・`_stamp_figure`・`_savefig`・`_mimsave`）が、
+#        git に依存しない SHA-256 指紋と UTC タイムスタンプからなる `_resolve_build_info` を用いて PNG/GIF に刻印します。
+#    • Exporters cover topology (`draw_genome_png`, `export_double_exposure`),
+#      regeneration timelines (`export_regen_gif`, `export_morph_gif`,
+#      `export_scars_spiral_map`), lineage graphs (`render_lineage`), and Lazy
+#      Council telemetry (`export_lcs_ribbon_png`, `export_lcs_timeline_gif`).
+#      ・トポロジ（`draw_genome_png`・`export_double_exposure`）、再生タイムライン（`export_regen_gif`・
+#        `export_morph_gif`・`export_scars_spiral_map`）、系譜グラフ（`render_lineage`）、Lazy Council テレメトリ
+#        （`export_lcs_ribbon_png`・`export_lcs_timeline_gif`）など、成果物エクスポートが充実しています。
+#    • `run_policy_in_env` snapshots gameplay into GIF + preview PNG per episode,
+#      overlaying policy activations and action bars for quick forensic review.
+#      ・`run_policy_in_env` は各エピソードを GIF と静止画プレビューに焼き込み、ポリシー活性やアクションバーを
+#        重ねて即座に挙動を振り返れるようにします。
+#
+# 5. CLI & demos / CLI とデモ
+#    • Running with no arguments executes `run_spinor_monolith`—a fractal spinor
+#      governance showcase that emits telemetry CSV/PNG/GIF artefacts under the
+#      requested output directory.
+#      ・引数なし実行で `run_spinor_monolith` によるフラクタル・スピノール統治デモが起動し、指定出力先に
+#        テレメトリ CSV / PNG / GIF を生成します。
+#    • `--task {xor,circles,spiral}` triggers supervised Lazy Council NEAT runs via
+#      `run_backprop_neat_experiment`; pass multiple flags to queue several tasks.
+#      ・`--task {xor,circles,spiral}` で Lazy Council NEAT 教師あり実験（`run_backprop_neat_experiment`）を起動し、
+#        複数指定で連続実行します。
+#    • RL support enters through `--rl-env` which drives `run_gym_neat_experiment`
+#      (wrapping `run_policy_in_env`). Gameplay GIF/PNG capture is automatic; use
+#      `--no-rl-gameplay` to skip recording.
+#      ・`--rl-env` で `run_gym_neat_experiment`（内部で `run_policy_in_env` を利用）を呼び出し、ゲームプレイ
+#        GIF/PNG は自動生成されます（`--no-rl-gameplay` で録画を省略可能）。
+#    • `--version` prints build metadata, while `--no-mandatory` downgrades council
+#      governance to advisory mode for exploratory tuning.
+#      ・`--version` はビルド情報を表示、`--no-mandatory` は合議制を助言モードに落として探索を柔軟化します。
+#
+# 6. Embeddable API / 組み込み API
+#    • Import helpers (`run_backprop_neat_experiment`, `run_gym_neat_experiment`,
+#      `run_policy_in_env`, `compile_genome`, `forward_batch`, `predict_proba`) for
+#      notebook or service integration; see `__all__` near the bottom for the full
+#      public surface.
+#      ・ノートブックやサービス統合向けに `run_backprop_neat_experiment`・`run_gym_neat_experiment`・
+#        `run_policy_in_env`・`compile_genome`・`forward_batch`・`predict_proba` などを公開しており、
+#        公開インターフェース全体は末尾の `__all__` を参照してください。
 #
 # Outputs / 成果物
-# All PNG, GIF, and optional HTML artefacts land under `--out` (or `out_prefix`) using a hardened `_savefig`
-# pipeline so fonts, transparency, and permissions stay consistent across platforms.
-# PNG / GIF / HTML 成果物は強化済み `_savefig` パイプラインを介して `--out`（または `out_prefix`）以下に整理保存され、
-# フォントや透過設定、パーミッションが環境間で揃います。
+# All PNG, GIF, HTML, and CSV artefacts land under `--out` (or `out_prefix`) using
+# a hardened `_savefig` pipeline so fonts, transparency, and permissions stay
+# consistent across platforms. RL gameplay always emits paired GIF/PNG captures
+# without extra flags, making LunarLander / Acrobot / BipedalWalker / MountainCar
+# reviews effortless.
+# PNG / GIF / HTML / CSV 成果物は強化済み `_savefig` パイプラインを介して `--out`（または `out_prefix`）以下に整理保存され、
+# フォントや透過設定、パーミッションが環境間で揃います。RL 実験は追加フラグなしで GIF/PNG を同梱するため、
+# LunarLander・Acrobot・BipedalWalker・MountainCar などのレビューも即座に行えます。
 #
 # Author: Ryo ∴ SpiralArcitect & AIs from SpiralReality
 
@@ -68,7 +127,7 @@ from collections import deque, defaultdict, OrderedDict, Counter
 import math, argparse, os, mimetypes, csv
 import sys
 import time
-import subprocess
+import hashlib
 import matplotlib
 import warnings
 import pickle as _pickle
@@ -87,12 +146,21 @@ import os
 from typing import Dict, Optional, Tuple
 import importlib.util
 from datetime import datetime, timezone
+from types import MappingProxyType
 
 _BUILD_INFO_CACHE: Optional[Dict[str, Any]] = None
 _SPINOR_BOUND_SEED: Optional[int] = None
 _COMPILE_TICK: int = 0
 _STRUCTURE_CACHE_LIMIT: int = 512
 _STRUCT_COMPILED_CACHE: 'OrderedDict[Any, Dict[str, Any]]' = OrderedDict()
+
+_MONODROMY_TOGGLE_PARAMS: Tuple[str, ...] = (
+    'monodromy_pressure_base',
+    'monodromy_pressure_range',
+    'monodromy_diversity_weight',
+    'monodromy_noise_weight',
+    'monodromy_family_weight',
+)
 
 
 def _structure_cache_key(g: 'Genome', order: Sequence[int]) -> Optional[Tuple[Any, ...]]:
@@ -144,6 +212,24 @@ def clear_compiled_structure_cache() -> None:
     _STRUCT_COMPILED_CACHE.clear()
 
 
+def _set_monodromy_mode(neat_inst: 'ReproPlanaNEATPlus', enabled: bool) -> None:
+    """Toggle monodromy pressure while preserving calibrated defaults."""
+    defaults = getattr(neat_inst, '_monodromy_toggle_defaults', None)
+    if defaults is None:
+        defaults = {
+            name: float(getattr(neat_inst, name, 0.0))
+            for name in _MONODROMY_TOGGLE_PARAMS
+        }
+        setattr(neat_inst, '_monodromy_toggle_defaults', defaults)
+    if enabled:
+        for name, value in defaults.items():
+            setattr(neat_inst, name, value)
+    else:
+        for name in defaults:
+            setattr(neat_inst, name, 0.0)
+    setattr(neat_inst, 'monodromy_enabled', bool(enabled))
+
+
 _NOISE_STYLE_DEFAULTS: Dict[str, Dict[str, Any]] = {
     'white': {'label': 'White', 'symbol': 'W', 'color': '#f6f7fb', 'index': 0, 'bias': 0.0},
     'alpha': {'label': 'Alpha', 'symbol': 'α', 'color': '#8ecae6', 'index': 1, 'bias': -0.06},
@@ -173,40 +259,31 @@ def _resolve_noise_style(kind: Optional[str], overrides: Optional[Dict[str, Dict
 
 
 def _resolve_build_info() -> Dict[str, Any]:
-    """Return cached build metadata including git short hash and UTC timestamp."""
+    """Return cached build metadata derived from source fingerprint + UTC timestamp."""
 
     global _BUILD_INFO_CACHE
     if _BUILD_INFO_CACHE is not None:
         return _BUILD_INFO_CACHE
     now_utc = datetime.now(timezone.utc).replace(microsecond=0)
     stamp_ts = now_utc.strftime('%Y%m%dT%H%M%SZ')
-    short_hash = 'nogit'
-    repo_root = None
-    try:
-        here = os.path.abspath(__file__)
-        repo_root = os.path.dirname(here)
-    except Exception:
-        repo_root = os.getcwd()
-    probe = repo_root
-    while probe and not os.path.isdir(os.path.join(probe, '.git')):
-        parent = os.path.dirname(probe)
-        if parent == probe:
-            probe = None
-            break
-        probe = parent
-    if probe:
+    fingerprint = os.environ.get('SPIRAL_MONOLITH_BUILD_HASH')
+    if not fingerprint:
         try:
-            raw = subprocess.check_output(
-                ['git', 'rev-parse', '--short', 'HEAD'],
-                cwd=probe,
-                stderr=subprocess.DEVNULL,
-            )
-            short_hash = raw.decode('ascii', errors='ignore').strip() or 'nogit'
+            here = os.path.abspath(__file__)
         except Exception:
-            short_hash = 'nogit'
-    build_id = f'{short_hash}-{stamp_ts}'
+            here = None
+        digest = 'nogit'
+        if here and os.path.exists(here):
+            try:
+                with open(here, 'rb') as fh:
+                    raw = fh.read()
+                digest = hashlib.sha256(raw).hexdigest()[:10]
+            except Exception:
+                digest = 'nogit'
+        fingerprint = digest
+    build_id = f'{fingerprint}-{stamp_ts}'
     _BUILD_INFO_CACHE = {
-        'hash': short_hash,
+        'hash': fingerprint,
         'timestamp': stamp_ts,
         'datetime': now_utc,
         'id': build_id,
@@ -4943,7 +5020,7 @@ def compile_genome(g: Genome):
         except Exception:
             pass
         return cached
-    order = g.topological_order()
+    order = tuple(g.topological_order())
     idx_of = {nid: i for i, nid in enumerate(order)}
     type_sig = tuple(g.nodes[n].type for n in order)
     act_sig = tuple(g.nodes[n].activation for n in order)
@@ -4951,9 +5028,10 @@ def compile_genome(g: Genome):
     base = _structure_cache_get(structure_key)
     if (
         base is None
-        or base.get('order_ref') != tuple(order)
+        or base.get('order_ref') != order
         or base.get('type_sig') != type_sig
         or base.get('act_sig') != act_sig
+        or 'idx_of' not in base
     ):
         in_ids = [nid for nid in order if g.nodes[nid].type == 'input']
         bias_ids = [nid for nid in order if g.nodes[nid].type == 'bias']
@@ -4985,9 +5063,10 @@ def compile_genome(g: Genome):
             in_edges_ptr = np.zeros(n + 1, dtype=np.int32)
             out_edges_ptr = np.zeros(n + 1, dtype=np.int32)
         base = {
-            'order_ref': tuple(order),
+            'order_ref': order,
             'type_sig': type_sig,
             'act_sig': act_sig,
+            'idx_of': MappingProxyType(dict(idx_of)),
             'inputs': tuple(idx_of[i] for i in sorted(in_ids)),
             'biases': tuple(idx_of[i] for i in bias_ids),
             'outputs': tuple(idx_of[i] for i in sorted(out_ids)),
@@ -5003,32 +5082,33 @@ def compile_genome(g: Genome):
         }
         _structure_cache_store(structure_key, base)
     n = len(order)
+    idx_cached = base.get('idx_of', MappingProxyType(dict(idx_of)))
     compiled = {
-        'order': list(order),
-        'idx_of': idx_of,
-        'types': list(type_sig),
-        'acts': list(act_sig),
-        'inputs': list(base['inputs']),
-        'biases': list(base['biases']),
-        'outputs': list(base['outputs']),
+        'order': base.get('order_ref', order),
+        'idx_of': idx_cached,
+        'types': base['type_sig'],
+        'acts': base['act_sig'],
+        'inputs': base['inputs'],
+        'biases': base['biases'],
+        'outputs': base['outputs'],
         'src': base['src'],
         'dst': base['dst'],
-        'eid': list(base['eid']),
-        'in_edges': [list(row) for row in base['in_edges']],
-        'out_edges': [list(row) for row in base['out_edges']],
+        'eid': base['eid'],
+        'in_edges': base['in_edges'],
+        'out_edges': base['out_edges'],
         'in_edges_flat': base['in_edges_flat'],
         'in_edges_ptr': base['in_edges_ptr'],
         'out_edges_flat': base['out_edges_flat'],
         'out_edges_ptr': base['out_edges_ptr'],
     }
-    compiled['w'] = np.array([g.connections[inn].weight for inn in compiled['eid']], dtype=np.float64)
-    node_sensitivity = _node_trait_array(g, order, 'backprop_sensitivity', 1.0)
-    node_jitter = _node_trait_array(g, order, 'sensitivity_jitter', 0.0, low=-0.25, high=0.25)
-    node_momentum = _node_trait_array(g, order, 'sensitivity_momentum', 0.0)
-    node_variance = _node_trait_array(g, order, 'sensitivity_variance', 0.0, low=0.0)
-    node_altruism = _node_trait_array(g, order, 'altruism', 0.5, low=0.0, high=1.0)
-    node_altruism_memory = _node_trait_array(g, order, 'altruism_memory', 0.0, low=-1.5, high=1.5)
-    node_altruism_span = _node_trait_array(g, order, 'altruism_span', 0.0, low=0.0, high=4.0)
+    compiled['w'] = np.array([g.connections[inn].weight for inn in base['eid']], dtype=np.float64)
+    node_sensitivity = _node_trait_array(g, compiled['order'], 'backprop_sensitivity', 1.0)
+    node_jitter = _node_trait_array(g, compiled['order'], 'sensitivity_jitter', 0.0, low=-0.25, high=0.25)
+    node_momentum = _node_trait_array(g, compiled['order'], 'sensitivity_momentum', 0.0)
+    node_variance = _node_trait_array(g, compiled['order'], 'sensitivity_variance', 0.0, low=0.0)
+    node_altruism = _node_trait_array(g, compiled['order'], 'altruism', 0.5, low=0.0, high=1.0)
+    node_altruism_memory = _node_trait_array(g, compiled['order'], 'altruism_memory', 0.0, low=-1.5, high=1.5)
+    node_altruism_span = _node_trait_array(g, compiled['order'], 'altruism_span', 0.0, low=0.0, high=4.0)
     compiled['node_sensitivity'] = node_sensitivity
     compiled['node_jitter'] = node_jitter
     compiled['node_momentum'] = node_momentum
@@ -6526,6 +6606,7 @@ def run_backprop_neat_experiment(
     complexity_survivor_cap: Optional[float]=None,
     complexity_bonus_limit: Optional[float]=None,
     complexity_bonus_span_quantile: Optional[float]=None,
+    monodromy_active: bool=True,
 ):
     if task == 'xor':
         Xtr, ytr = make_xor(512, noise=0.05, seed=0)
@@ -6541,6 +6622,7 @@ def run_backprop_neat_experiment(
     neat_module = sys.modules[__name__]
     neat = neat_module.ReproPlanaNEATPlus(num_inputs=Xtr.shape[1], num_outputs=out_dim, population_size=pop, output_activation='identity', rng=rng)
     _apply_stable_neat_defaults(neat)
+    _set_monodromy_mode(neat, bool(monodromy_active))
     if complexity_baseline_quantile is not None:
         neat.complexity_bonus_baseline_quantile = float(complexity_baseline_quantile)
     if complexity_survivor_cap is not None:
@@ -6694,6 +6776,7 @@ def run_backprop_neat_experiment(
         'diversity_csv': diversity_csv,
         'diversity_plot': diversity_plot,
         'complexity_distribution': list(getattr(neat, 'complexity_distribution_history', [])),
+        'monodromy_enabled': bool(getattr(neat, 'monodromy_enabled', monodromy_active)),
     }
 
 def _fig_to_rgb(fig):
@@ -7523,7 +7606,7 @@ def _apply_stable_neat_defaults(neat: ReproPlanaNEATPlus):
     neat.max_hidden_nodes = 256
     neat.max_edges = 2048
 
-def setup_neat_for_env(env_id: str, population: int=48, output_activation: str='identity'):
+def setup_neat_for_env(env_id: str, population: int=48, output_activation: str='identity', monodromy_active: bool=True):
     gym = _import_gym()
     env = gym.make(env_id)
     obs_dim = obs_dim_from_space(env.observation_space)
@@ -7531,6 +7614,7 @@ def setup_neat_for_env(env_id: str, population: int=48, output_activation: str='
     neat_module = sys.modules[__name__]
     neat = neat_module.ReproPlanaNEATPlus(num_inputs=obs_dim, num_outputs=out_dim, population_size=population, output_activation=output_activation, rng=np.random.default_rng())
     _apply_stable_neat_defaults(neat)
+    _set_monodromy_mode(neat, bool(monodromy_active))
     return (neat, env)
 
 def _rollout_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_norm=None):
@@ -7680,7 +7764,7 @@ def _episode_bc_update(genome: 'Genome', obs_list, act_list, ret_list, steps=20,
     except Exception as e:
         print('[warn] online update skipped:', e)
 
-def run_policy_in_env(genome: 'Genome', env_id: str, episodes: int=1, max_steps: int=1000, stochastic: bool=True, temp: float=1.0, out_gif: str='out/rl_rollout.gif', fps: int=20, panel_ratio: float=0.58, show_values: bool=True, show_bars: bool=True, rl_update: bool=False, gamma: float=0.99, rl_steps: int=20, rl_lr: float=0.01, rl_l2: float=0.0001, top_frac: float=0.3):
+def run_policy_in_env(genome: 'Genome', env_id: str, episodes: int=1, max_steps: int=1000, stochastic: bool=True, temp: float=1.0, out_gif: str='out/rl_rollout.gif', fps: int=20, panel_ratio: float=0.58, show_values: bool=True, show_bars: bool=True, rl_update: bool=False, gamma: float=0.99, rl_steps: int=20, rl_lr: float=0.01, rl_l2: float=0.0001, top_frac: float=0.3, preview_png: Optional[str]=None):
     try:
         import gymnasium as gym
     except Exception:
@@ -7763,16 +7847,26 @@ def run_policy_in_env(genome: 'Genome', env_id: str, episodes: int=1, max_steps:
                         _episode_bc_update(genome, ep_obs, [int(a) for a in ep_act], rets_np, steps=rl_steps, lr=rl_lr, l2=rl_l2, top_frac=top_frac)
                 break
     os.makedirs(os.path.dirname(out_gif) or '.', exist_ok=True)
-    _mimsave(out_gif, frames, fps=fps)
+    if frames:
+        _mimsave(out_gif, frames, fps=fps)
+        if preview_png:
+            os.makedirs(os.path.dirname(preview_png) or '.', exist_ok=True)
+            try:
+                frame = frames[min(len(frames) - 1, max(0, int(len(frames) * 0.6)))]
+            except Exception:
+                frame = frames[0]
+            plt.imsave(preview_png, frame)
+    else:
+        raise RuntimeError(f'No frames captured while running {env_id}; cannot create gameplay GIF.')
     try:
         env.close()
     except Exception:
         pass
     return out_gif
 
-def run_gym_neat_experiment(env_id: str, gens: int=20, pop: int=24, episodes: int=1, max_steps: int=500, stochastic: bool=False, temp: float=1.0, out_prefix: str='out/rl') -> Dict[str, Any]:
-    """Convenience wrapper that evolves NEAT agents on a Gym environment."""
-    neat, env = setup_neat_for_env(env_id, population=pop, output_activation='identity')
+def run_gym_neat_experiment(env_id: str, gens: int=20, pop: int=24, episodes: int=1, max_steps: int=500, stochastic: bool=False, temp: float=1.0, out_prefix: str='out/rl', monodromy_active: bool=True, capture_gameplay: Optional[bool]=None) -> Dict[str, Any]:
+    """Convenience wrapper that evolves NEAT agents on a Gym environment and auto-captures gameplay."""
+    neat, env = setup_neat_for_env(env_id, population=pop, output_activation='identity', monodromy_active=monodromy_active)
     regen_log_path = f'{out_prefix}_regen_log.csv'
     if hasattr(neat, 'lcs_monitor') and neat.lcs_monitor is not None:
         neat.lcs_monitor.csv_path = regen_log_path
@@ -7807,6 +7901,8 @@ def run_gym_neat_experiment(env_id: str, gens: int=20, pop: int=24, episodes: in
     plt.close()
     lcs_ribbon = None
     lcs_timeline = None
+    gameplay_gif = None
+    gameplay_preview = None
     if lcs_rows:
         ribbon_path = f'{out_prefix}_lcs_ribbon.png'
         try:
@@ -7820,7 +7916,36 @@ def run_gym_neat_experiment(env_id: str, gens: int=20, pop: int=24, episodes: in
             lcs_timeline = timeline_path
         except Exception as timeline_err:
             print('[WARN] LCS timeline export failed:', timeline_err)
-    return {'best': best, 'history': hist, 'reward_curve': rc_png, 'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None, 'lcs_ribbon': lcs_ribbon, 'lcs_timeline': lcs_timeline}
+    auto_capture = capture_gameplay if capture_gameplay is not None else True
+    if auto_capture and best is not None:
+        gameplay_gif = f'{out_prefix}_gameplay.gif'
+        gameplay_preview = f'{out_prefix}_gameplay_preview.png'
+        try:
+            run_policy_in_env(
+                best,
+                env_id,
+                episodes=max(1, episodes),
+                max_steps=max_steps,
+                stochastic=stochastic,
+                temp=temp,
+                out_gif=gameplay_gif,
+                preview_png=gameplay_preview,
+            )
+        except Exception as gameplay_err:
+            print('[WARN] Gameplay capture failed:', gameplay_err)
+            gameplay_gif = None
+            gameplay_preview = None
+    return {
+        'best': best,
+        'history': hist,
+        'reward_curve': rc_png,
+        'lcs_log': regen_log_path if os.path.exists(regen_log_path) else None,
+        'lcs_ribbon': lcs_ribbon,
+        'lcs_timeline': lcs_timeline,
+        'gameplay_gif': gameplay_gif if gameplay_gif and os.path.exists(gameplay_gif) else None,
+        'gameplay_preview': gameplay_preview if gameplay_preview and os.path.exists(gameplay_preview) else None,
+        'monodromy_enabled': bool(getattr(neat, 'monodromy_enabled', monodromy_active)),
+    }
 
 def _genome_to_cyto(genome: Genome) -> dict:
     """
@@ -8266,7 +8391,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--rl-max-steps', type=int, default=500)
     ap.add_argument('--rl-stochastic', action='store_true')
     ap.add_argument('--rl-temp', type=float, default=1.0)
-    ap.add_argument('--rl-gameplay-gif', action='store_true')
+    ap.add_argument('--no-rl-gameplay', action='store_true', help='Skip automatic gameplay capture for RL runs.')
     ap.add_argument('--out', default='out_monolith_cli')
     ap.add_argument('--version', action='store_true', help='print build information and exit')
     ap.add_argument('--complexity-baseline-quantile', type=float, help='quantile (0-1) for survivor complexity bonus baseline')
@@ -8275,7 +8400,9 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     ap.add_argument('--complexity-bonus-limit', type=float, help='absolute cap for survivor complexity bonuses')
     ap.add_argument('--no-mandatory', dest='mandatory', action='store_false', help='disable mandatory lazy council steering in the nomology environment')
     ap.add_argument('--mandatory', dest='mandatory', action='store_true', help=argparse.SUPPRESS)
-    ap.set_defaults(mandatory=True)
+    ap.add_argument('--no-monodromy', dest='monodromy', action='store_false', help='disable monodromy pressure overlays')
+    ap.add_argument('--monodromy', dest='monodromy', action='store_true', help=argparse.SUPPRESS)
+    ap.set_defaults(mandatory=True, monodromy=True)
     if want_help:
         ap.print_help()
         return 0
@@ -8291,7 +8418,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
     if args.version:
         info = _resolve_build_info()
         print(_build_stamp_text())
-        print(f"git hash : {info['hash']}")
+        print(f"build hash: {info['hash']}")
         print(f"timestamp: {info['timestamp']}")
         return 0
     print(f"[INFO] {_build_stamp_text()}")
@@ -8330,6 +8457,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                 complexity_survivor_cap=args.complexity_survivor_cap,
                 complexity_bonus_limit=args.complexity_bonus_limit,
                 complexity_bonus_span_quantile=args.complexity_bonus_span_quantile,
+                monodromy_active=args.monodromy,
             )
             supervised_results[task] = res
             label_base = task.upper()
@@ -8393,6 +8521,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                 'has_spiral': bool(scars_spiral_path and os.path.exists(scars_spiral_path)),
                 'has_resilience': bool(resilience_log and os.path.exists(resilience_log)),
                 'has_diversity': bool(res.get('diversity_plot') and os.path.exists(res.get('diversity_plot'))),
+                'monodromy_enabled': bool(res.get('monodromy_enabled', args.monodromy)),
             }
             report_meta['supervised'].append(sup_summary)
     rl_history: List[Tuple[float, float]] = []
@@ -8411,6 +8540,7 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
             neat_module = sys.modules[__name__]
             neat = neat_module.ReproPlanaNEATPlus(num_inputs=obs_dim, num_outputs=out_dim, population_size=args.rl_pop, output_activation='identity', rng=np.random.default_rng(args.seed))
             _apply_stable_neat_defaults(neat)
+            _set_monodromy_mode(neat, bool(args.monodromy))
             regen_log_path = os.path.join(args.out, f"{args.rl_env.replace(':', '_')}_regen_log.csv")
             if hasattr(neat, 'lcs_monitor') and neat.lcs_monitor is not None:
                 neat.lcs_monitor.csv_path = regen_log_path
@@ -8468,18 +8598,47 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                 except Exception as timeline_err:
                     print('[WARN] LCS timeline export failed:', timeline_err)
             gif = None
-            if args.rl_gameplay_gif:
+            preview_png = None
+            if not args.no_rl_gameplay:
                 gif = os.path.join(args.out, f"{args.rl_env.replace(':', '_')}_gameplay.gif")
+                preview_png = os.path.join(args.out, f"{args.rl_env.replace(':', '_')}_gameplay_preview.png")
                 try:
-                    out_path = run_policy_in_env(best, args.rl_env, episodes=max(1, args.rl_episodes), max_steps=args.rl_max_steps, stochastic=args.rl_stochastic, temp=args.rl_temp, out_gif=gif)
+                    out_path = run_policy_in_env(
+                        best,
+                        args.rl_env,
+                        episodes=max(1, args.rl_episodes),
+                        max_steps=args.rl_max_steps,
+                        stochastic=args.rl_stochastic,
+                        temp=args.rl_temp,
+                        out_gif=gif,
+                        preview_png=preview_png,
+                    )
                     if out_path and os.path.exists(out_path):
-                        figs['RL ゲームプレイ'] = out_path
+                        figs['RL ゲームプレイ (GIF)'] = out_path
+                    if preview_png and os.path.exists(preview_png):
+                        figs['RL ゲームプレイ (静止画)'] = preview_png
                 except Exception as gif_err:
-                    print('[WARN] gameplay gif failed:', gif_err)
+                    print('[WARN] gameplay capture failed:', gif_err)
+                    gif = None
+                    preview_png = None
             rl_best = max((b for b, _a in hist), default=None)
             rl_final_best = hist[-1][0] if hist else None
             rl_final_avg = hist[-1][1] if hist else None
-            report_meta['rl'] = {'env': args.rl_env, 'gens': args.rl_gens, 'pop': args.rl_pop, 'episodes': args.rl_episodes, 'best_reward': rl_best, 'final_best': rl_final_best, 'final_avg': rl_final_avg, 'has_lcs_log': bool(os.path.exists(regen_log_path)), 'has_lcs_viz': bool(lcs_rows), 'has_gameplay': bool(gif and os.path.exists(gif)), 'has_resilience': bool(rl_resilience_log and os.path.exists(rl_resilience_log))}
+            report_meta['rl'] = {
+                'env': args.rl_env,
+                'gens': args.rl_gens,
+                'pop': args.rl_pop,
+                'episodes': args.rl_episodes,
+                'best_reward': rl_best,
+                'final_best': rl_final_best,
+                'final_avg': rl_final_avg,
+                'has_lcs_log': bool(os.path.exists(regen_log_path)),
+                'has_lcs_viz': bool(lcs_rows),
+                'has_gameplay': bool(gif and os.path.exists(gif)),
+                'has_gameplay_preview': bool(preview_png and os.path.exists(preview_png)),
+                'has_resilience': bool(rl_resilience_log and os.path.exists(rl_resilience_log)),
+                'monodromy_enabled': bool(getattr(neat, 'monodromy_enabled', args.monodromy)),
+            }
         except Exception as e:
             print('[WARN] RL branch skipped:', e)
     if report_enabled:
@@ -8561,6 +8720,8 @@ def main(argv: Optional[Iterable[str]]=None) -> int:
                         extras.append('LCS visuals')
                     if rl_meta.get('has_gameplay'):
                         extras.append('gameplay gif')
+                    if rl_meta.get('has_gameplay_preview'):
+                        extras.append('gameplay still')
                     if rl_meta.get('has_resilience'):
                         extras.append('resilience log')
                     extra_txt = f" [{', '.join(extras)}]" if extras else ''
@@ -8715,6 +8876,8 @@ def run_spinor_monolith(
     seed: int=0,
     out_prefix: str='/mnt/data/spinor_neat',
     spinor_bind_seed: Optional[int]=None,
+    monodromy_active: bool=True,
+    mandatory_mode: Optional[bool]=None,
 ) -> Dict[str, str]:
     os.environ['NEAT_EVAL_BACKEND'] = 'thread'
     global _SPINOR_BOUND_SEED
@@ -8730,6 +8893,8 @@ def run_spinor_monolith(
         noise_weaver_seed=spinor_bind_seed if spinor_bind_seed is not None else None,
     )
     tel = Telemetry(f'{out_prefix}_telemetry.csv', f'{out_prefix}_regimes.csv')
+    if mandatory_mode is None:
+        mandatory_mode = True
     controller = SpinorNomologyDatasetController(
         spin,
         env,
@@ -8737,13 +8902,14 @@ def run_spinor_monolith(
         n_tr=512,
         n_va=256,
         evaluator_seed=spinor_bind_seed,
-        mandatory_mode=getattr(args, 'mandatory', True),
+        mandatory_mode=bool(mandatory_mode),
     )
     controller.telemetry = tel
     controller.update_for_generation(0, shmem=False)
     out_dim = 2
     neat_inst = neat.ReproPlanaNEATPlus(num_inputs=controller.feature_dim, num_outputs=out_dim, population_size=pop, output_activation='identity', rng=rng)
     neat._apply_stable_neat_defaults(neat_inst)
+    _set_monodromy_mode(neat_inst, bool(monodromy_active))
     neat_inst.spinor_controller = controller
     neat_inst.max_hidden_nodes = max(getattr(neat_inst, 'max_hidden_nodes', 128), 192)
     neat_inst.max_edges = max(getattr(neat_inst, 'max_edges', 1024), 2048)
@@ -9034,7 +9200,14 @@ def run_spinor_monolith(
                 print('[WARN] Unable to write spinor transition GIF:', gif_err)
                 spinor_transition_gif = None
 
-    artifacts: Dict[str, Optional[str]] = {'telemetry_csv': tel.tel_csv, 'regimes_csv': tel.reg_csv, 'phase_png': fig1, 'parity_png': fig2, 'regimes_png': fig3}
+    artifacts: Dict[str, Any] = {
+        'telemetry_csv': tel.tel_csv,
+        'regimes_csv': tel.reg_csv,
+        'phase_png': fig1,
+        'parity_png': fig2,
+        'regimes_png': fig3,
+        'monodromy_enabled': bool(getattr(neat_inst, 'monodromy_enabled', monodromy_active)),
+    }
     if fig_noise:
         artifacts['noise_timeline_png'] = fig_noise
     if resilience_log:
@@ -9750,7 +9923,7 @@ class SelfReproducingEvaluator:
             summary = f'{summary} | div {scarcity:.2f}/{spread:.2f}'
         weave_err = getattr(env, '_last_weaver_error', None)
         if weave_err:
-            summary = f'{summary} | weave {str(weave_err).split(':', 1)[0]}'
+            summary = f"{summary} | weave {str(weave_err).split(':', 1)[0]}"
         if resilience_flag:
             summary = f'{summary} | resilience {resilience_flag}'
         if share > 0.0:
@@ -9929,7 +10102,7 @@ class SelfReproducingEvaluator:
             summary = f'{summary} | div {scarcity:.2f}/{spread:.2f}'
         weave_err = getattr(env, '_last_weaver_error', None)
         if weave_err:
-            summary = f'{summary} | weave {str(weave_err).split(':', 1)[0]}'
+            summary = f"{summary} | weave {str(weave_err).split(':', 1)[0]}"
         if resilience_flag:
             summary = f'{summary} | resilience {resilience_flag}'
         if share > 0.0:
