@@ -7655,6 +7655,8 @@ class ReproPlanaNEATPlus:
                 scarcity_push = 1.0 + 1.5 * diversity_scarcity + 0.4 * max(0.0, env_entropy)
                 focus_push = 1.0 + 0.6 * max(0.0, env_focus)
                 div_bonus_scale = float(base_div_bonus * adaptive_multiplier * scarcity_push * focus_push)
+                entropy_bonus_boost = float(np.clip(1.0 + 0.22 * max(0.0, diversity_entropy_raw - 1.0), 1.0, 2.8))
+                div_bonus_scale = float(div_bonus_scale * entropy_bonus_boost)
                 if base_div_bonus > 0.0:
                     upper_cap = float(max(base_div_bonus * 8.0, base_div_bonus + 0.5))
                     div_bonus_scale = float(np.clip(div_bonus_scale, base_div_bonus * 0.2, upper_cap))
@@ -7676,6 +7678,7 @@ class ReproPlanaNEATPlus:
                     'diversity_bonus': float(div_bonus_scale),
                     'diversity_bonus_scale': float(div_bonus_scale),
                     'diversity_power': float(div_power),
+                    'diversity_entropy_boost': float(entropy_bonus_boost),
                     'env_noise': float(env_noise),
                     'env_focus': float(env_focus),
                     'env_entropy': float(env_entropy),
@@ -8000,6 +8003,13 @@ class ReproPlanaNEATPlus:
                             fam_count = int(div_snap.get('family_count', 0) or 0)
                             if fam_count:
                                 div_str += f" fam{float(div_snap.get('top_family_share', 0.0)):.2f}@{fam_count}"
+                            bonus_mean = float(div_snap.get('diversity_bonus_mean', 0.0) or 0.0)
+                            bonus_total = float(div_snap.get('diversity_bonus_total', 0.0) or 0.0)
+                            if bonus_mean or bonus_total:
+                                div_str += f" b{bonus_mean:.3f}Σ{bonus_total:.3f}"
+                            boost_val = float(div_snap.get('diversity_entropy_boost', 0.0) or 0.0)
+                            if boost_val and abs(boost_val - 1.0) > 1e-3:
+                                div_str += f" ζ{boost_val:.2f}"
                             div_str += f" hh{float(div_snap.get('household_pressure', 0.0)):.2f}"
                         except Exception:
                             div_str = ''
@@ -8020,7 +8030,106 @@ class ReproPlanaNEATPlus:
                                 retire_str += f" f[{fallback_bits}]"
                         except Exception:
                             retire_str = ''
-                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}{div_str}{retire_str}")
+                    fft_str = ''
+                    try:
+                        controller = getattr(self, 'spinor_controller', None)
+                        env_obj = getattr(controller, 'env', None) if controller is not None else None
+                    except Exception:
+                        env_obj = None
+                    fft_stats = {
+                        'peak': float('nan'),
+                        'entropy': float('nan'),
+                        'strength': float('nan'),
+                        'reason': '',
+                        'events': 0,
+                        'idle': 0,
+                        'active': False,
+                    }
+
+                    def _extract_fft(source: Optional[Dict[str, Any]]) -> None:
+                        if not isinstance(source, dict):
+                            return
+                        if 'fft_peak' in source or 'peak' in source:
+                            try:
+                                fft_stats['peak'] = float(source.get('fft_peak', source.get('peak', fft_stats['peak'])))
+                            except Exception:
+                                pass
+                        if 'fft_entropy' in source or 'entropy' in source:
+                            try:
+                                fft_stats['entropy'] = float(source.get('fft_entropy', source.get('entropy', fft_stats['entropy'])))
+                            except Exception:
+                                pass
+                        if 'fft_strength' in source or 'strength' in source:
+                            try:
+                                fft_stats['strength'] = float(source.get('fft_strength', source.get('strength', fft_stats['strength'])))
+                            except Exception:
+                                pass
+                        if 'fft_reason' in source or 'reason' in source:
+                            reason_val = source.get('fft_reason', source.get('reason', fft_stats['reason']))
+                            if isinstance(reason_val, str) and reason_val:
+                                fft_stats['reason'] = reason_val
+                        events_val = source.get('events_total', source.get('fft_events_total'))
+                        if events_val is not None:
+                            try:
+                                fft_stats['events'] = max(fft_stats['events'], int(events_val))
+                            except Exception:
+                                pass
+                        idle_val = source.get('fft_idle_steps', source.get('idle_steps'))
+                        if idle_val is not None:
+                            try:
+                                fft_stats['idle'] = max(fft_stats['idle'], int(idle_val))
+                            except Exception:
+                                pass
+                        if source.get('fft_active') or source.get('steps_left', 0):
+                            fft_stats['active'] = True
+
+                    if env_obj is not None:
+                        try:
+                            fft_stats['events'] = max(fft_stats['events'], int(getattr(env_obj, 'fft_events_total', 0)))
+                        except Exception:
+                            pass
+                        try:
+                            fft_stats['idle'] = max(fft_stats['idle'], int(getattr(env_obj, 'fft_idle_steps', 0)))
+                        except Exception:
+                            pass
+                        if getattr(env_obj, '_fft_decay', 0):
+                            fft_stats['active'] = True
+                        last_reason = getattr(env_obj, 'last_fft_reason', '')
+                        if isinstance(last_reason, str) and last_reason and not fft_stats['reason']:
+                            fft_stats['reason'] = last_reason
+                        _extract_fft(getattr(env_obj, 'noise_profile', None))
+                        _extract_fft(getattr(env_obj, 'last_fft_payload', None))
+                    else:
+                        env_payload = self.env if isinstance(self.env, dict) else {}
+                        _extract_fft(env_payload.get('noise_profile'))
+                        _extract_fft(env_payload)
+                    if (
+                        fft_stats['events']
+                        or (isinstance(fft_stats['reason'], str) and fft_stats['reason'])
+                        or (np.isfinite(fft_stats['peak']))
+                        or (np.isfinite(fft_stats['strength']) and fft_stats['strength'] > 0.0)
+                        or fft_stats['active']
+                    ):
+                        fft_bits: List[str] = []
+                        if np.isfinite(fft_stats['peak']):
+                            fft_bits.append(f"pk{fft_stats['peak']:.2f}")
+                        if np.isfinite(fft_stats['entropy']):
+                            fft_bits.append(f"η{fft_stats['entropy']:.2f}")
+                        if np.isfinite(fft_stats['strength']):
+                            fft_bits.append(f"s{fft_stats['strength']:.2f}")
+                        if fft_stats['reason']:
+                            fft_bits.append(str(fft_stats['reason'])[:18])
+                        fft_bits.append(f"#{fft_stats['events']}")
+                        if fft_stats['idle']:
+                            fft_bits.append(f"i{fft_stats['idle']}")
+                        if fft_stats['active']:
+                            fft_bits.append('active')
+                        fft_str = ' | fft ' + ' '.join(fft_bits)
+                    print(
+                        f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} "
+                        f"| sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}"
+                        f"{herm_str}{top3_str}{mono_str}{div_str}{retire_str}{fft_str}"
+                    )
                 if context_best > best_ever_fit:
                     best_ever_fit = context_best
                     best_ever = self.population[best_idx].copy()
@@ -13591,7 +13700,9 @@ class NomologyEnv:
     last_fft_payload: Dict[str, Any] = field(default_factory=dict)
     fft_events_total: int = 0
     fft_idle_steps: int = 0
-    fft_idle_limit: int = 6
+    fft_idle_limit: int = 4
+    fft_min_trigger_chance: float = 0.18
+    fft_forced_strength_bias: float = 0.1
     last_fft_reason: str = ''
     _noise_counter: float = field(default=0.0, init=False, repr=False)
     _last_weaver_error: Optional[str] = field(default=None, init=False, repr=False)
@@ -13723,14 +13834,19 @@ class NomologyEnv:
         self.noise_jitter = float(np.clip(self.noise_jitter * (1.0 + 0.2 * spread), 0.001, 0.065))
         bonus_mean = float(max(payload.get('diversity_bonus_mean', 0.0), 0.0))
         bonus_total = float(max(payload.get('diversity_bonus_total', 0.0), 0.0))
+        entropy_boost = float(max(payload.get('diversity_entropy_boost', 1.0), 0.0))
         if bonus_mean > 0.0 or bonus_total > 0.0:
             self.intensity = float(np.clip(self.intensity * (1.0 + 0.04 * bonus_mean) + 0.006 * bonus_total, 0.05, 1.2))
+        if entropy_boost > 1.0:
+            self.intensity = float(np.clip(self.intensity * (1.0 + 0.03 * (entropy_boost - 1.0)), 0.05, 1.2))
+            self.noise_focus = float(np.clip(self.noise_focus * (0.92 + 0.1 * (entropy_boost - 1.0)), 0.0, 2.5))
         profile = getattr(self, 'noise_profile', None)
         if isinstance(profile, dict):
             profile['diversity_bonus'] = float(payload.get('diversity_bonus', 0.0))
             profile['diversity_bonus_mean'] = bonus_mean
             profile['diversity_bonus_total'] = bonus_total
             profile['diversity_bonus_scale'] = float(payload.get('diversity_bonus_scale', payload.get('diversity_bonus', 0.0)))
+            profile['diversity_entropy_boost'] = entropy_boost
 
     def _refresh_noise(self, advance: bool=False, surge: bool=False, allow_fft: bool=True) -> None:
         if advance:
@@ -13791,6 +13907,8 @@ class NomologyEnv:
                 base_chance += 0.15
             if self.rl_mode:
                 base_chance *= 0.78
+            min_chance = float(max(0.0, getattr(self, 'fft_min_trigger_chance', 0.0)))
+            base_chance = float(max(min_chance, base_chance))
             if self._rng.random() < min(0.96, base_chance):
                 ambient_strength = float(
                     np.clip(
@@ -13813,9 +13931,10 @@ class NomologyEnv:
             if not fft_triggered:
                 self.fft_idle_steps = int(getattr(self, 'fft_idle_steps', 0)) + 1
                 if self.fft_idle_steps >= idle_limit:
+                    forced_bias = float(max(0.0, getattr(self, 'fft_forced_strength_bias', 0.0)))
                     forced_strength = float(
                         np.clip(
-                            0.65
+                            0.65 + forced_bias
                             + 0.45 * float(self.intensity)
                             + 0.18 * focus_term
                             + 0.09 * entropy_term,
@@ -14807,6 +14926,7 @@ class Telemetry:
                     'structural_spread',
                     'diversity_bonus',
                     'diversity_bonus_scale',
+                    'diversity_entropy_boost',
                     'diversity_power',
                     'env_noise',
                     'env_focus',
@@ -14986,6 +15106,7 @@ class Telemetry:
             float(metrics.get('structural_spread', float('nan'))),
             float(metrics.get('diversity_bonus', float('nan'))),
             float(metrics.get('diversity_bonus_scale', metrics.get('diversity_bonus', float('nan')))),
+            float(metrics.get('diversity_entropy_boost', float('nan'))),
             float(metrics.get('diversity_power', float('nan'))),
             float(metrics.get('env_noise', float('nan'))),
             float(metrics.get('env_focus', float('nan'))),
