@@ -5475,18 +5475,21 @@ class ReproPlanaNEATPlus:
 
         self._top3_static_ids = ids
         raw_static = int(watch.get('unchanged_count', 0))
-        base_multiplier = 1.0 + 0.6 * math.log1p(raw_static)
+        base_multiplier = 1.0 + 0.85 * math.log1p(raw_static)
         if raw_static >= window:
-            base_multiplier += 0.25 * (raw_static - window + 1)
+            base_multiplier += 0.35 * (raw_static - window + 1)
         if stagnating and raw_static > 0:
-            base_multiplier *= 1.0 + min(1.8, 0.25 * raw_static)
+            base_multiplier *= 1.0 + min(3.0, 0.38 * raw_static)
         if family_lock and raw_static > 0:
-            base_multiplier *= 1.0 + min(1.2, 0.18 * raw_static)
-        if stasis_signal > 0.35:
-            base_multiplier *= 1.0 + min(0.9, 0.12 * raw_static)
-        base_multiplier = float(np.clip(base_multiplier, 1.0, 12.0))
+            base_multiplier *= 1.0 + min(1.8, 0.22 * raw_static)
+        if stasis_signal > 0.2 and raw_static > 0:
+            base_multiplier *= 1.0 + min(1.4, 0.18 * raw_static * (0.5 + stasis_signal))
+        if delta_mag >= delta_threshold and raw_static > 0:
+            ratio = float(np.clip(delta_mag / (delta_threshold + 1e-09), 1.0, 3.5))
+            base_multiplier *= 1.0 + min(1.2, 0.1 * raw_static * (ratio - 1.0))
+        base_multiplier = float(np.clip(base_multiplier, 1.0, 18.0))
         if not unchanged:
-            base_multiplier = max(1.0, base_multiplier * 0.6)
+            base_multiplier = max(1.0, base_multiplier * 0.45)
         self._top3_static_count = raw_static if unchanged else 0
         self._top3_static_pressure = base_multiplier
         self._top3_static_snapshot = {
@@ -5500,6 +5503,11 @@ class ReproPlanaNEATPlus:
             'pressure': float(self._top3_static_pressure),
             'window': int(window),
         }
+        env_state = getattr(self, 'env', None)
+        if isinstance(env_state, dict):
+            env_state['top_static_pressure'] = float(self._top3_static_pressure)
+            env_state['top_static_count'] = int(self._top3_static_count)
+            env_state['top_static_window'] = int(window)
         self._apply_altruism_retirement(top3_best, fitnesses, baseline_fitnesses, generation)
 
     def _trigger_stagnation_intervention(
@@ -5520,8 +5528,12 @@ class ReproPlanaNEATPlus:
             watch['cooldown'] = int(max(1, getattr(self, 'stagnation_commission_cooldown', 6)))
             watch['count'] = 0
             watch['interventions'] = int(watch.get('interventions', 0)) + 1
+        top_pressure = float(max(1.0, getattr(self, '_top3_static_pressure', 1.0)))
+        pressure_cap = float(np.clip(top_pressure, 1.0, 6.0))
         penalty_scale = float(np.clip(getattr(self, 'stagnation_commission_strength', 0.35), 0.05, 2.0))
+        penalty_scale = float(np.clip(penalty_scale * (0.6 + 0.4 * pressure_cap), 0.08, 4.0))
         penalty_boost = 1.0 + (watch.get('interventions', 0) if isinstance(watch, dict) else 0) * 0.1
+        penalty_boost *= float(1.0 + 0.15 * (pressure_cap - 1.0))
         penalty_floor = min(baseline_fitnesses) if baseline_fitnesses else -1.0
         flagged = getattr(self, '_stagnation_flagged', {})
         expiry = int(generation + max(1, getattr(self, 'stagnation_flagged_window', 12)))
@@ -5556,25 +5568,46 @@ class ReproPlanaNEATPlus:
         self._stagnation_elite_freeze = max(int(getattr(self, '_stagnation_elite_freeze', 0)), freeze)
         try:
             diff_prev = float(self.env.get('difficulty', 0.0))
-            self.env['difficulty'] = float(np.clip(diff_prev + getattr(self, 'stagnation_difficulty_bump', 0.12), 0.0, 5.0))
+            diff_gain = float(getattr(self, 'stagnation_difficulty_bump', 0.12)) * float(0.75 + 0.25 * pressure_cap)
+            self.env['difficulty'] = float(np.clip(diff_prev + diff_gain, 0.0, 6.0))
             noise_prev = float(self.env.get('noise_std', 0.0))
-            self.env['noise_std'] = float(np.clip(noise_prev * (1.0 + 0.4 * penalty_scale) + 0.01, 0.0, 2.5))
+            noise_scale = float(1.0 + 0.45 * penalty_scale * (0.7 + 0.3 * pressure_cap))
+            self.env['noise_std'] = float(np.clip(noise_prev * noise_scale + 0.02 * pressure_cap, 0.0, 3.0))
             focus_prev = float(self.env.get('noise_focus', 0.0) or 0.0)
             entropy_prev = float(self.env.get('noise_entropy', 0.0) or 0.0)
-            self.env['noise_focus'] = float(np.clip(focus_prev * 0.6 + 0.4, 0.0, 2.0))
-            self.env['noise_entropy'] = float(np.clip(entropy_prev * 0.5 + 0.5, 0.0, 2.5))
+            self.env['noise_focus'] = float(np.clip(focus_prev * (0.5 + 0.1 * pressure_cap) + 0.35 * pressure_cap, 0.0, 3.0))
+            self.env['noise_entropy'] = float(np.clip(entropy_prev * (0.4 + 0.1 * pressure_cap) + 0.6 * pressure_cap, 0.0, 4.0))
+            wave_prev = float(self.env.get('difficulty_wave', 0.0) or 0.0)
+            self.env['difficulty_wave'] = float(np.clip(wave_prev * 0.55 + diff_gain * pressure_cap, -6.0, 6.0))
             self.env['stagnation_commission_gen'] = int(generation)
             self.env['stagnation_commission_reason'] = reason
+            self.env['stagnation_penalty_scale'] = float(penalty_scale)
+            self.env['stagnation_penalty_boost'] = float(penalty_boost)
+            self.env['stagnation_top_pressure'] = float(top_pressure)
         except Exception:
             pass
         controller = getattr(self, 'spinor_controller', None)
         fft_payload = None
         if controller is not None:
             env_obj = getattr(controller, 'env', None)
+            if env_obj is not None:
+                try:
+                    env_obj.intensity = float(np.clip(env_obj.intensity * (1.06 + 0.08 * pressure_cap) + 0.03 * penalty_scale, 0.05, 1.35))
+                    env_obj.drift_scale = float(np.clip(env_obj.drift_scale * (1.0 + 0.05 * pressure_cap), 0.001, 0.2))
+                    env_obj.noise_jitter = float(np.clip(env_obj.noise_jitter * (1.0 + 0.3 * penalty_scale), 0.002, 0.4))
+                    new_max = float(np.clip(env_obj.noise_max * (1.02 + 0.05 * pressure_cap), 0.05, 0.55))
+                    new_min = float(np.clip(env_obj.noise_min * (0.9 - 0.02 * pressure_cap), 0.006, new_max * 0.95))
+                    env_obj.noise_max = new_max
+                    env_obj.noise_min = min(new_min, new_max * 0.98)
+                    env_obj.fft_retention = int(np.clip(env_obj.fft_retention + max(1, int(round(pressure_cap))), 1, 16))
+                    if hasattr(env_obj, '_refresh_noise'):
+                        env_obj._refresh_noise(advance=True, surge=True)
+                except Exception:
+                    pass
             if env_obj is not None and hasattr(env_obj, 'trigger_fft_spike'):
                 try:
                     fft_payload = env_obj.trigger_fft_spike(
-                        strength=float(1.0 + penalty_scale),
+                        strength=float((1.0 + penalty_scale) * (0.7 + 0.3 * pressure_cap)),
                         bands=None,
                         reason=f'stagnation@{generation}',
                     )
@@ -5593,6 +5626,8 @@ class ReproPlanaNEATPlus:
             'context': float(context),
             'top_family_share': float(top_family_share),
             'stasis': float(stasis),
+            'top_pressure': float(top_pressure),
+            'penalty_boost': float(penalty_boost),
             'fft': fft_payload,
         }
         self.stagnation_commission_history.append(record)
