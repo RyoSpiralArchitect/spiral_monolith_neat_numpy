@@ -4739,7 +4739,14 @@ class ReproPlanaNEATPlus:
         self.monodromy_envelope_bias = 0.9
         self.monodromy_envelope_cap = 1.25
         self.monodromy_noise_style_overrides: Dict[str, Dict[str, Any]] = {}
+        self.monodromy_non_rl_pressure_boost = 1.45
+        self.monodromy_non_rl_base_floor = 0.012
+        self.monodromy_non_rl_cap_gain = 0.35
+        self.monodromy_non_rl_envelope_floor = 0.42
+        self.monodromy_non_rl_envelope_bias = 1.1
+        self.monodromy_non_rl_top_pressure_min = 1.4
         self._monodromy_registry: Dict[int, Dict[str, float]] = {}
+        self._monodromy_last_boost: float = 1.0
         self._monodromy_snapshot: Dict[str, float] = {
             'pressure_mean': 0.0,
             'pressure_max': 0.0,
@@ -6856,6 +6863,8 @@ class ReproPlanaNEATPlus:
                 'top3_static_count': 0,
                 'top3_pressure': 1.0,
                 'top3_static': {},
+                'rl_mode': bool(getattr(self, '_monodromy_rl_mode', False)),
+                'pressure_boost': float(getattr(self, '_monodromy_last_boost', 1.0)),
             }
 
         n = len(fitnesses)
@@ -6864,6 +6873,16 @@ class ReproPlanaNEATPlus:
             return list(fitnesses)
         base = float(getattr(self, 'monodromy_pressure_base', 0.0))
         rng = float(getattr(self, 'monodromy_pressure_range', 0.0))
+        rl_mode = bool(getattr(self, '_monodromy_rl_mode', False))
+        boost = 1.0
+        if not rl_mode:
+            boost = float(max(1.0, getattr(self, 'monodromy_non_rl_pressure_boost', 1.0)))
+            base_floor = float(max(0.0, getattr(self, 'monodromy_non_rl_base_floor', 0.0)))
+            base = max(base * boost, base + base_floor)
+            rng = max(rng * (1.0 + 0.5 * (boost - 1.0)), rng + base * 0.35)
+        else:
+            boost = 1.0
+        self._monodromy_last_boost = float(boost)
         if base <= 0.0 and rng <= 0.0:
             _reset_snapshot()
             return list(fitnesses)
@@ -6898,6 +6917,10 @@ class ReproPlanaNEATPlus:
         top3_multiplier = float(max(1.0, getattr(self, '_top3_static_pressure', 1.0)))
         top3_count = int(max(0, getattr(self, '_top3_static_count', 0)))
         top3_state = getattr(self, '_top3_static_snapshot', None)
+        if not rl_mode:
+            min_top = float(max(1.0, getattr(self, 'monodromy_non_rl_top_pressure_min', 1.0)))
+            top3_multiplier = float(max(top3_multiplier, min_top))
+            top3_multiplier *= float(max(1.0, 1.0 + 0.35 * (boost - 1.0)))
         if signature_counts is None:
             signature_counts = Counter(signature_map.values()) if signature_map else Counter()
         else:
@@ -7044,6 +7067,11 @@ class ReproPlanaNEATPlus:
         envelope_floor = float(np.clip(getattr(self, 'monodromy_envelope_floor', 0.0), 0.0, 1.0))
         envelope_bias = float(max(0.0, getattr(self, 'monodromy_envelope_bias', 0.0)))
         envelope_cap = float(max(envelope_floor, float(getattr(self, 'monodromy_envelope_cap', 1.0))))
+        if not rl_mode:
+            cap_gain = float(max(0.0, getattr(self, 'monodromy_non_rl_cap_gain', 0.0)))
+            cap = float(max(cap * (1.0 + cap_gain), cap + base * 2.0))
+            envelope_floor = float(max(envelope_floor, getattr(self, 'monodromy_non_rl_envelope_floor', envelope_floor)))
+            envelope_bias = float(max(envelope_bias, getattr(self, 'monodromy_non_rl_envelope_bias', envelope_bias)))
         registry = getattr(self, '_monodromy_registry', None)
         if registry is None:
             registry = {}
@@ -7334,12 +7362,20 @@ class ReproPlanaNEATPlus:
             'span_scale': float(span_scale_safe),
             'top3_pressure': float(top3_multiplier),
             'top3_static_count': int(top3_count),
+            'rl_mode': bool(rl_mode),
+            'pressure_boost': float(boost),
         }
         if isinstance(top3_state, dict):
             self._monodromy_snapshot['top3_static'] = dict(top3_state)
         return adjusted
 
     def evolve(self, fitness_fn: Callable[[Genome], float], n_generations=100, target_fitness=None, verbose=True, env_schedule=None):
+        is_rl_task = bool(
+            getattr(fitness_fn, 'is_rl', False)
+            or getattr(fitness_fn, 'rl_mode', False)
+            or getattr(fitness_fn, 'rl', False)
+        )
+        self._monodromy_rl_mode = bool(is_rl_task)
         history = []
         best_ever = None
         best_ever_fit = -1000000000.0
@@ -7351,6 +7387,7 @@ class ReproPlanaNEATPlus:
         for step in range(n_generations):
             gen = start_gen + step
             self.generation = gen
+            self._monodromy_rl_mode = bool(is_rl_task)
             try:
                 prev = history[-1] if history else (None, None)
                 if env_schedule is not None:
@@ -11513,6 +11550,8 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
             pass
     _fitness.close_env = _close_env
     _fitness.env = env
+    _fitness.is_rl = True
+    _fitness.rl_mode = True
     return _fitness
 
 def eval_with_node_activations(genome: 'Genome', obs_vec: np.ndarray):
@@ -13383,8 +13422,11 @@ class NomologyEnv:
     noise_entropy: float = 0.0
     noise_harmonics: Dict[str, float] = field(default_factory=dict)
     noise_style_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    fft_retention: int = 3
+    last_fft_payload: Dict[str, Any] = field(default_factory=dict)
     _noise_counter: float = field(default=0.0, init=False, repr=False)
     _last_weaver_error: Optional[str] = field(default=None, init=False, repr=False)
+    _fft_decay: int = field(default=0, init=False, repr=False)
     diversity_signal: Dict[str, float] = field(default_factory=dict)
     rl_objective: Dict[str, float] = field(default_factory=dict)
     rl_mode: bool = False
@@ -13418,6 +13460,8 @@ class NomologyEnv:
         self.last_env_shift = 0.0
         self.last_leader_id = None
         self.last_advantage_penalty = False
+        self._fft_decay = 0
+        self.last_fft_payload = {}
 
     def noise_style(self, kind: Optional[str]=None) -> Dict[str, Any]:
         target = kind or self.noise_kind
@@ -13555,12 +13599,30 @@ class NomologyEnv:
         self.noise_kind = kind
         self.noise_profile = profile
         if allow_fft:
-            base_chance = 0.06 + 0.18 * float(self.intensity)
-            base_chance += 0.1 * float(np.clip(getattr(self, 'noise_focus', 0.0), 0.0, 2.5))
+            focus_term = float(np.clip(getattr(self, 'noise_focus', 0.0), 0.0, 2.5))
+            entropy_term = float(np.clip(getattr(self, 'noise_entropy', 0.0), 0.0, 3.5))
+            base_chance = 0.12 + 0.25 * float(self.intensity)
+            base_chance += 0.14 * focus_term
+            base_chance += 0.06 * entropy_term
             if surge:
-                base_chance += 0.12
-            if self._rng.random() < min(0.9, base_chance):
-                ambient_strength = float(np.clip(0.6 + 0.8 * float(self.intensity) + 0.4 * float(self.noise_focus), 0.45, 2.6))
+                base_chance += 0.15
+            if self.rl_mode:
+                base_chance *= 0.78
+            if self._rng.random() < min(0.96, base_chance):
+                ambient_strength = float(
+                    np.clip(
+                        0.8
+                        + 1.15 * float(self.intensity)
+                        + 0.5 * focus_term
+                        + 0.12 * entropy_term,
+                        0.55,
+                        3.4,
+                    )
+                )
+                if self.rl_mode:
+                    ambient_strength *= 0.88
+                else:
+                    ambient_strength *= 1.08
                 reason = 'ambient_fft_surge' if surge else 'ambient_fft'
                 self.trigger_fft_spike(strength=ambient_strength, reason=reason)
         style = self.noise_style(kind)
@@ -13600,6 +13662,19 @@ class NomologyEnv:
             self.noise_harmonics = {}
         self.noise_focus = float(profile.get('mix_focus', focus_val))
         self.noise_entropy = float(profile.get('mix_entropy', entropy_val))
+        if self._fft_decay > 0 and isinstance(self.last_fft_payload, dict):
+            payload = self.last_fft_payload
+            profile['fft_peak'] = float(payload.get('peak', float('nan')))
+            profile['fft_entropy'] = float(payload.get('entropy', float('nan')))
+            profile['fft_reason'] = payload.get('reason', '')
+            profile['fft_strength'] = float(payload.get('strength', 0.0))
+            profile['fft_active'] = True
+            self._fft_decay = max(0, int(self._fft_decay) - 1)
+            payload['steps_left'] = int(self._fft_decay)
+            if self._fft_decay <= 0:
+                payload['steps_left'] = 0
+        elif isinstance(self.last_fft_payload, dict):
+            self.last_fft_payload.pop('steps_left', None)
 
     def trigger_fft_spike(self, strength: float=1.0, bands: Optional[int]=None, reason: str='') -> Dict[str, Any]:
         bands = int(bands) if bands is not None else int(max(12, self.noise_stage_len * 3))
@@ -13621,8 +13696,8 @@ class NomologyEnv:
             entropy = float(-(spectrum[:keep] * np.log(spectrum[:keep] + 1e-12)).sum() / np.log(keep))
         self.noise_harmonics = harmonics
         self.noise_focus = float(np.clip(0.45 * self.noise_focus + 0.55 * peak * (1.0 + 0.35 * strength), 0.0, 2.2))
-        self.noise_entropy = float(np.clip(0.5 * self.noise_entropy + 0.5 * entropy * (1.0 + 0.25 * strength), 0.0, 3.2))
-        self.noise = float(np.clip(self.noise * (1.0 + 0.34 * strength) + 0.01 * strength, self.noise_min, self.noise_max))
+        self.noise_entropy = float(np.clip(0.5 * self.noise_entropy + 0.5 * entropy * (1.0 + 0.3 * strength), 0.0, 3.4))
+        self.noise = float(np.clip(self.noise * (1.0 + 0.38 * strength) + 0.015 * strength, self.noise_min, self.noise_max))
         try:
             self.noise_kind = str(self._rng.choice(self.noise_palette))
         except Exception:
@@ -13632,10 +13707,10 @@ class NomologyEnv:
         self.noise_kind_symbol = style.get('symbol', self.noise_kind_symbol)
         self.noise_kind_color = style.get('color', self.noise_kind_color)
         self.noise_kind_code = int(style.get('index', self.noise_kind_code))
-        self.turns = float(np.clip(self.turns * (1.0 + self._rng.normal(0.0, 0.12 * strength)), 0.6, 3.1))
+        self.turns = float(np.clip(self.turns * (1.0 + self._rng.normal(0.0, 0.14 * strength)), 0.6, 3.1))
         self.rot_bias = float(np.clip(self.rot_bias + self._rng.normal(0.0, 0.55 * strength), -math.pi, math.pi))
-        self.noise_stage_len = int(np.clip(float(self.noise_stage_len) * (1.0 - 0.08 * strength) + 1.0, 4.0, 32.0))
-        self.intensity = float(np.clip(self.intensity * (1.08 + 0.2 * strength) + 0.02, 0.05, 1.05))
+        self.noise_stage_len = int(np.clip(float(self.noise_stage_len) * (1.0 - 0.1 * strength) + 1.0, 3.0, 32.0))
+        self.intensity = float(np.clip(self.intensity * (1.12 + 0.25 * strength) + 0.025, 0.05, 1.12))
         self.regime_id = int(self.regime_id + 1)
         self._refresh_noise(advance=True, surge=True, allow_fft=False)
         payload = {
@@ -13650,6 +13725,12 @@ class NomologyEnv:
         self.noise_profile['fft_entropy'] = float(self.noise_entropy)
         self.noise_profile['fft_reason'] = reason
         self.noise_profile['fft_stamp'] = time.time()
+        self.noise_profile['fft_strength'] = float(strength)
+        retention = int(max(1, getattr(self, 'fft_retention', 1)))
+        payload['timestamp'] = time.time()
+        payload['steps_left'] = int(retention)
+        self.last_fft_payload = dict(payload)
+        self._fft_decay = int(retention)
         return payload
 
     def maybe_switch(self) -> bool:
@@ -14542,11 +14623,40 @@ class Telemetry:
             harm_payload = _json.dumps({k: float(v) for k, v in harmonics.items()})
         else:
             harm_payload = '{}'
-        fft_peak = float(profile.get('fft_peak', float('nan')) if profile else float('nan'))
-        fft_entropy = float(profile.get('fft_entropy', float('nan')) if profile else float('nan'))
+        fft_peak = float('nan')
+        fft_entropy = float('nan')
         fft_reason = ''
-        if isinstance(profile, dict):
-            fft_reason = str(profile.get('fft_reason', ''))
+        fft_source: Optional[Dict[str, Any]] = profile if isinstance(profile, dict) else None
+        if not fft_source or (
+            'fft_peak' not in fft_source
+            and 'fft_entropy' not in fft_source
+            and 'fft_reason' not in fft_source
+        ):
+            last_fft = getattr(env, 'last_fft_payload', None)
+            if isinstance(last_fft, dict) and last_fft:
+                fft_source = last_fft
+        if isinstance(fft_source, dict):
+            if 'fft_peak' in fft_source or 'peak' in fft_source:
+                try:
+                    fft_peak = float(fft_source.get('fft_peak', fft_source.get('peak', float('nan'))))
+                except Exception:
+                    fft_peak = float('nan')
+            if 'fft_entropy' in fft_source or 'entropy' in fft_source:
+                try:
+                    fft_entropy = float(fft_source.get('fft_entropy', fft_source.get('entropy', float('nan'))))
+                except Exception:
+                    fft_entropy = float('nan')
+            reason_val = fft_source.get('fft_reason', fft_source.get('reason', ''))
+            if isinstance(reason_val, str):
+                fft_reason = reason_val
+            strength_val = fft_source.get('fft_strength', fft_source.get('strength'))
+            if strength_val is not None:
+                try:
+                    strength_str = f"s={float(strength_val):.2f}"
+                except Exception:
+                    strength_str = ''
+                if strength_str:
+                    fft_reason = f"{fft_reason}|{strength_str}" if fft_reason else strength_str
         lazy_share = float(getattr(env, 'lazy_share', 0.0))
         lazy_anchor = float(getattr(env, 'lazy_anchor', 0.0))
         lazy_gap = float(getattr(env, 'lazy_gap', 0.0))
