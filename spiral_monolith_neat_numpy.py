@@ -573,7 +573,11 @@ def _rl_collective_signal(
         if done_flags:
             done_ratio = float(sum(done_flags) / len(done_flags))
     coeffs = _ensure_rl_signal_coeffs(genome)
-    program = _rl_signal_program_for(genome)
+    requested_program = _rl_signal_program_for(genome)
+    default_program = _RL_SIGNAL_DSL_TEMPLATE.format(
+        **{k: repr(v) for k, v in _RL_SIGNAL_COEFF_DEFAULTS.items()}
+    )
+    program = requested_program
     state = {
         'stability': stability,
         'trend_norm': trend_norm,
@@ -586,19 +590,15 @@ def _rl_collective_signal(
     }
     signal = _rl_run_signal_program(state, program)
     if signal is None:
-        stress_base = 0.35 + 0.45 * (1.0 - stability) + 0.2 * abs(trend_norm) + 0.15 * done_ratio
-        stress = float(np.clip(stress_base, 0.0, 1.0))
-        altruism_target = float(np.clip(0.4 + 0.4 * stability + 0.2 * (1.0 - stress) + 0.15 * novelty_scale, 0.0, 1.0))
-        solidarity = float(np.clip(0.3 + 0.4 * stability + 0.15 * lazy_share + 0.15 * (1.0 - done_ratio), 0.0, 1.0))
-        span_component = float(np.tanh((reward_span + reward_std) / denom))
-        advantage_base = 0.45 + 0.35 * trend_norm + 0.25 * span_component + 0.1 * novelty_scale
-        advantage = float(np.clip(advantage_base, 0.0, 1.0))
+        program = default_program
+        signal = _rl_run_signal_program(state, program)
+    if signal is None:
         signal = {
-            'altruism_target': altruism_target,
-            'solidarity': solidarity,
-            'stress': stress,
-            'lazy_share': lazy_share,
-            'advantage': advantage,
+            'altruism_target': float(np.clip(coeffs.get('altruism_base', 0.4), 0.0, 1.0)),
+            'solidarity': float(np.clip(coeffs.get('solidarity_base', 0.3), 0.0, 1.0)),
+            'stress': float(np.clip(coeffs.get('stress_bias', 0.35), 0.0, 1.0)),
+            'lazy_share': float(np.clip(lazy_share, 0.0, 1.0)),
+            'advantage': float(np.clip(coeffs.get('advantage_base', 0.45), 0.0, 1.0)),
         }
     else:
         signal = {
@@ -610,6 +610,7 @@ def _rl_collective_signal(
         }
     if isinstance(meta, dict):
         meta['signal_kernel'] = dict(coeffs)
+        meta['signal_program_requested'] = requested_program
         meta['signal_program'] = program
     return signal
 
@@ -3209,6 +3210,10 @@ class ReproPlanaNEATPlus:
         self._stagnation_elite_freeze = 0
         self._stagnation_flagged: Dict[int, int] = {}
         self._stagnation_pending_event: Optional[Dict[str, Any]] = None
+        self._top3_static_ids: Tuple[int, ...] = tuple()
+        self._top3_static_count: int = 0
+        self._top3_static_pressure: float = 1.0
+        self._top3_static_snapshot: Dict[str, Any] = {}
         self.stagnation_commission_history: List[Dict[str, Any]] = []
         self.rl_param_mutation_rate = 0.35
         nodes = {}
@@ -3694,6 +3699,7 @@ class ReproPlanaNEATPlus:
             watch = {
                 'last_ids': tuple(),
                 'count': 0,
+                'unchanged_count': 0,
                 'last_best': None,
                 'last_avg': None,
                 'cooldown': 0,
@@ -3709,6 +3715,18 @@ class ReproPlanaNEATPlus:
         ids = tuple(int(g.id) for g, _fit, _gen in top3_best[:3])
         if not ids:
             watch.update({'last_ids': tuple(), 'count': 0, 'last_best': best_fit, 'last_avg': avg_fit, 'last_gen': int(generation)})
+            self._top3_static_ids = tuple()
+            self._top3_static_count = 0
+            self._top3_static_pressure = 1.0
+            self._top3_static_snapshot = {
+                'generation': int(generation),
+                'count': 0,
+                'pressure': 1.0,
+                'stagnating': False,
+                'family_lock': False,
+                'delta_mag': 0.0,
+                'window': max(3, int(getattr(self, 'stagnation_window', 6))),
+            }
             return
         last_ids = tuple(watch.get('last_ids', tuple()))
         unchanged = ids == last_ids and len(ids) == len(last_ids)
@@ -3753,6 +3771,10 @@ class ReproPlanaNEATPlus:
             watch['count'] = 1
         else:
             watch['count'] = 0
+        if unchanged:
+            watch['unchanged_count'] = int(watch.get('unchanged_count', 0)) + 1
+        else:
+            watch['unchanged_count'] = 0
         reason_parts: List[str] = []
         if stagnating:
             reason_parts.append('delta')
@@ -3783,6 +3805,34 @@ class ReproPlanaNEATPlus:
                 top_family_share=top_family_share,
                 stasis=stasis_signal,
             )
+
+        self._top3_static_ids = ids
+        raw_static = int(watch.get('unchanged_count', 0))
+        base_multiplier = 1.0 + 0.6 * math.log1p(raw_static)
+        if raw_static >= window:
+            base_multiplier += 0.25 * (raw_static - window + 1)
+        if stagnating and raw_static > 0:
+            base_multiplier *= 1.0 + min(1.8, 0.25 * raw_static)
+        if family_lock and raw_static > 0:
+            base_multiplier *= 1.0 + min(1.2, 0.18 * raw_static)
+        if stasis_signal > 0.35:
+            base_multiplier *= 1.0 + min(0.9, 0.12 * raw_static)
+        base_multiplier = float(np.clip(base_multiplier, 1.0, 12.0))
+        if not unchanged:
+            base_multiplier = max(1.0, base_multiplier * 0.6)
+        self._top3_static_count = raw_static if unchanged else 0
+        self._top3_static_pressure = base_multiplier
+        self._top3_static_snapshot = {
+            'generation': int(generation),
+            'ids': ids,
+            'count': int(raw_static if unchanged else 0),
+            'stagnating': bool(stagnating),
+            'family_lock': bool(family_lock),
+            'stasis_signal': float(stasis_signal),
+            'delta_mag': float(delta_mag),
+            'pressure': float(self._top3_static_pressure),
+            'window': int(window),
+        }
 
     def _trigger_stagnation_intervention(
         self,
@@ -4286,6 +4336,21 @@ class ReproPlanaNEATPlus:
         ]
         templates = [tpl for tpl in templates if isinstance(tpl, str) and tpl.strip()]
         child.rl_weight_program_template = templates[0] if templates else _RL_WEIGHT_DSL_TEMPLATE
+        sig_m = _rl_sanitise_signal_coeffs(getattr(mother, 'rl_signal_coeffs', None) if mother is not None else None)
+        sig_f = _rl_sanitise_signal_coeffs(getattr(father, 'rl_signal_coeffs', None) if father is not None else None)
+        sig_mix: Dict[str, float] = {}
+        for key in _RL_SIGNAL_COEFF_DEFAULTS:
+            mv = sig_m.get(key, _RL_SIGNAL_COEFF_DEFAULTS[key])
+            fv = sig_f.get(key, _RL_SIGNAL_COEFF_DEFAULTS[key])
+            blend = float(self.rng.uniform(0.3, 0.7))
+            sig_mix[key] = float(blend * mv + (1.0 - blend) * fv)
+        child.rl_signal_coeffs = sig_mix
+        sig_templates = [
+            getattr(mother, 'rl_signal_program_template', None) if mother is not None else None,
+            getattr(father, 'rl_signal_program_template', None) if father is not None else None,
+        ]
+        sig_templates = [tpl for tpl in sig_templates if isinstance(tpl, str) and tpl.strip()]
+        child.rl_signal_program_template = sig_templates[0] if sig_templates else _RL_SIGNAL_DSL_TEMPLATE
         limit = int(getattr(child, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
         child.rl_memory_limit = limit
         merged = deque(maxlen=limit)
@@ -5042,6 +5107,9 @@ class ReproPlanaNEATPlus:
                 'family_factor_mean': 1.0,
                 'family_factor_max': 1.0,
                 'span_scale': 0.0,
+                'top3_static_count': 0,
+                'top3_pressure': 1.0,
+                'top3_static': {},
             }
 
         n = len(fitnesses)
@@ -5080,6 +5148,9 @@ class ReproPlanaNEATPlus:
         entropy_excess = max(0.0, float(noise_entropy) - float(noise_focus))
         noise_factor = float(np.clip(1.0 + noise_weight * (noise_bias - 0.3 * entropy_excess), 0.2, 1.6))
         self._monodromy_noise_tag = style.get('symbol', noise_kind or '')
+        top3_multiplier = float(max(1.0, getattr(self, '_top3_static_pressure', 1.0)))
+        top3_count = int(max(0, getattr(self, '_top3_static_count', 0)))
+        top3_state = getattr(self, '_top3_static_snapshot', None)
         if signature_counts is None:
             signature_counts = Counter(signature_map.values()) if signature_map else Counter()
         else:
@@ -5339,6 +5410,7 @@ class ReproPlanaNEATPlus:
             target *= div_factor
             target *= grace_factor
             target *= noise_factor
+            target *= top3_multiplier
             info = family_metrics.get(family_id) if family_metrics else None
             members = family_members.get(family_id, tuple())
             if info:
@@ -5484,7 +5556,11 @@ class ReproPlanaNEATPlus:
             'family_share_delta_mean': float(family_trend_mean),
             'family_target_share': float(family_target_share),
             'span_scale': float(span_scale_safe),
+            'top3_pressure': float(top3_multiplier),
+            'top3_static_count': int(top3_count),
         }
+        if isinstance(top3_state, dict):
+            self._monodromy_snapshot['top3_static'] = dict(top3_state)
         return adjusted
 
     def evolve(self, fitness_fn: Callable[[Genome], float], n_generations=100, target_fitness=None, verbose=True, env_schedule=None):
@@ -5578,15 +5654,18 @@ class ReproPlanaNEATPlus:
                 base_div_bonus = float(getattr(self, 'structure_diversity_bonus', 0.0))
                 base_div_power = float(getattr(self, 'structure_diversity_power', 1.0))
                 diversity_counts = np.asarray(list(signature_counts.values()), dtype=np.float64) if signature_counts else np.zeros(0, dtype=np.float64)
+                diversity_entropy_raw = 0.0
+                diversity_entropy_norm = 0.0
                 if diversity_counts.size:
                     freq = diversity_counts / max(1.0, diversity_counts.sum())
                     raw_entropy = float(-(freq * np.log(freq + 1e-12)).sum())
                     max_entropy = float(np.log(max(1.0, diversity_counts.size)))
-                    diversity_entropy = raw_entropy / max(max_entropy, 1e-12) if max_entropy > 0 else 0.0
-                else:
-                    diversity_entropy = 0.0
-                diversity_entropy = float(max(0.0, diversity_entropy))
-                diversity_scarcity = float(1.0 - diversity_entropy)
+                    diversity_entropy_raw = float(max(0.0, raw_entropy))
+                    if max_entropy > 0:
+                        diversity_entropy_norm = float(diversity_entropy_raw / max(max_entropy, 1e-12))
+                    else:
+                        diversity_entropy_norm = float(diversity_entropy_raw)
+                diversity_scarcity = float(max(0.0, 1.0 - diversity_entropy_norm))
                 family_entropy = 0.0
                 top_family_share = 0.0
                 family_surplus_ratio_max = 0.0
@@ -5625,7 +5704,8 @@ class ReproPlanaNEATPlus:
                 household_pressure = float(self._household_pressure())
                 diversity_snapshot = {
                     'gen': int(gen),
-                    'entropy': float(diversity_entropy),
+                    'entropy': float(diversity_entropy_raw),
+                    'entropy_norm': float(diversity_entropy_norm),
                     'scarcity': float(diversity_scarcity),
                     'complexity_mean': float(complexity_mean),
                     'complexity_std': float(complexity_std),
@@ -5644,7 +5724,7 @@ class ReproPlanaNEATPlus:
                     'family_surplus_ratio_mean': float(family_surplus_ratio_mean),
                     'household_pressure': float(household_pressure),
                 }
-                self._update_collective_signal(diversity_entropy, diversity_scarcity, family_surplus_ratio_mean, gen)
+                self._update_collective_signal(diversity_entropy_norm, diversity_scarcity, family_surplus_ratio_mean, gen)
                 self._diversity_snapshot = diversity_snapshot
                 self.diversity_history.append(diversity_snapshot)
                 if len(self.diversity_history) > int(getattr(self, 'diversity_history_limit', 4096)):
@@ -5923,6 +6003,7 @@ class ReproPlanaNEATPlus:
                             f" div{mono.get('diversity_mean', 0.0):.2f} gr{mono.get('grace_mean', 0.0):.2f}"
                             f" nf{mono.get('noise_factor', 1.0):.2f} fam{mono.get('family_factor_mean', 1.0):.2f}@{int(mono.get('families', 0))}"
                             f" σ{mono.get('span_scale', 0.0):.3f}"
+                            f" τ{mono.get('top3_pressure', 1.0):.2f}@{int(mono.get('top3_static_count', 0))}"
                         )
                         nk = mono.get('noise_kind')
                         if nk:
@@ -5931,8 +6012,10 @@ class ReproPlanaNEATPlus:
                     div_snap = getattr(self, '_diversity_snapshot', None)
                     if isinstance(div_snap, dict) and div_snap:
                         try:
+                            entropy_raw = float(div_snap.get('entropy', 0.0))
+                            entropy_norm = float(div_snap.get('entropy_norm', entropy_raw))
                             div_str = (
-                                f" | div H{float(div_snap.get('entropy', 0.0)):.2f}"
+                                f" | div H{entropy_raw:.2f} η{entropy_norm:.2f}"
                                 f" sc{float(div_snap.get('scarcity', 0.0)):.2f}"
                                 f" κ{float(div_snap.get('structural_spread', 0.0)):.2f}"
                             )
@@ -7179,6 +7262,7 @@ def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: st
     fields = [
         'gen',
         'entropy',
+        'entropy_norm',
         'scarcity',
         'family_entropy',
         'top_family_share',
@@ -7210,6 +7294,7 @@ def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: st
             writer.writerow(payload)
     gens = np.array([int(item.get('gen', idx)) for idx, item in enumerate(div_history)], dtype=np.int32)
     entropy = np.array([float(item.get('entropy', 0.0)) for item in div_history], dtype=np.float64)
+    entropy_norm = np.array([float(item.get('entropy_norm', 0.0)) for item in div_history], dtype=np.float64)
     scarcity = np.array([float(item.get('scarcity', 0.0)) for item in div_history], dtype=np.float64)
     family_entropy = np.array([float(item.get('family_entropy', 0.0)) for item in div_history], dtype=np.float64)
     top_family_share = np.array([float(item.get('top_family_share', 0.0)) for item in div_history], dtype=np.float64)
@@ -7224,7 +7309,8 @@ def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: st
     household_pressure = np.array([float(item.get('household_pressure', 0.0)) for item in div_history], dtype=np.float64)
     fig, axes = plt.subplots(2, 1, sharex=True, figsize=(7.4, 6.0))
     ax_top, ax_bottom = axes
-    ax_top.plot(gens, entropy, label='entropy (structural)', color='#1f78b4', linewidth=1.8)
+    ax_top.plot(gens, entropy, label='entropy raw', color='#1f78b4', linewidth=1.8)
+    ax_top.plot(gens, entropy_norm, label='entropy norm', color='#4f9bd9', linewidth=1.4, linestyle=':')
     ax_top.plot(gens, scarcity, label='scarcity', color='#d62728', linewidth=1.6)
     ax_top.plot(gens, family_entropy, label='entropy (family)', color='#6a3d9a', linewidth=1.4, linestyle='-.')
     ax_top.fill_between(gens, 0.0, scarcity, color='#ff9896', alpha=0.25)
@@ -8781,7 +8867,9 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
     novelty_gain = 0.25 + 0.55 * (1.0 - stability)
     recency_gain = 0.2 + 0.5 * max(0.0, -trend_norm)
     coeffs = _ensure_rl_weight_coeffs(genome)
-    program = _rl_weight_program_for(genome)
+    requested_program = _rl_weight_program_for(genome)
+    default_program = _RL_WEIGHT_DSL_TEMPLATE.format(**{k: repr(v) for k, v in _RL_WEIGHT_COEFF_DEFAULTS.items()})
+    program = requested_program
     weight_state = {
         'weights': ret_weights.copy(),
         'ret_weights': ret_weights,
@@ -8800,9 +8888,10 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
     }
     weights = _rl_run_weight_program(weight_state, program)
     if weights is None or weights.shape != ret_weights.shape:
-        weights = ret_weights + novelty_gain * (0.5 + novelty)
-        weights += coeffs.get('priority_gain', 0.35) * priority
-        weights += recency_gain * recency * coeffs.get('recency_scale', 1.0)
+        program = default_program
+        weights = _rl_run_weight_program(weight_state, program)
+    if weights is None or weights.shape != ret_weights.shape:
+        weights = ret_weights.copy()
     weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1e-8)
     weights = np.clip(weights, 1e-8, None)
     total_w = float(np.sum(weights))
@@ -8902,11 +8991,17 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
     l2 = float(getattr(genome, 'rl_l2', 0.0001))
     batch_returns = [float(p.get('return', p.get('reward', 0.0))) for p in picked]
     collective_signal = _rl_collective_signal(genome, meta, rewards=batch_returns, experiences=picked)
-    signal_program = _rl_signal_program_for(genome)
+    signal_kernel = dict(_ensure_rl_signal_coeffs(genome))
     meta['weight_kernel'] = dict(coeffs)
+    meta['weight_program_requested'] = requested_program
     meta['weight_program'] = program
-    meta['signal_kernel'] = dict(_ensure_rl_signal_coeffs(genome))
-    meta['signal_program'] = signal_program
+    meta['signal_kernel'] = signal_kernel
+    signal_program_active = meta.get('signal_program')
+    if not isinstance(signal_program_active, str) or not signal_program_active.strip():
+        signal_program_active = _rl_signal_program_for(genome)
+        meta['signal_program'] = signal_program_active
+    signal_program_requested = meta.get('signal_program_requested', signal_program_active)
+    meta['signal_program_requested'] = signal_program_requested
     try:
         history = train_with_backprop_numpy(
             genome,
@@ -8930,9 +9025,11 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
             'novelty_mean': novelty_mean,
             'priority_mean': priority_mean,
             'weight_kernel': dict(coeffs),
+            'weight_program_requested': requested_program,
             'weight_program': program,
-            'signal_kernel': dict(meta.get('signal_kernel', {})),
-            'signal_program': signal_program,
+            'signal_kernel': dict(signal_kernel),
+            'signal_program_requested': signal_program_requested,
+            'signal_program': signal_program_active,
         }
         if history:
             meta['last_replay']['final_loss'] = float(history[-1])
@@ -8946,9 +9043,11 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
                 'collective_signal': dict(collective_signal),
                 'mean_return': float(np.mean(batch_returns)) if batch_returns else 0.0,
                 'weight_kernel': dict(coeffs),
+                'weight_program_requested': requested_program,
                 'weight_program': program,
-                'signal_kernel': dict(meta.get('signal_kernel', {})),
-                'signal_program': signal_program,
+                'signal_kernel': dict(signal_kernel),
+                'signal_program_requested': signal_program_requested,
+                'signal_program': signal_program_active,
             },
         )
     except Exception:
@@ -8976,8 +9075,13 @@ def _rl_update_meta_profile(
         meta['gamma_push'] = float(gamma)
         meta['memory_util'] = memory_util
         meta['collective_signal'] = _rl_collective_signal(genome, meta, rewards=[], experiences=experiences)
-        meta['signal_kernel'] = dict(_ensure_rl_signal_coeffs(genome))
-        meta['signal_program'] = _rl_signal_program_for(genome)
+        signal_kernel = dict(_ensure_rl_signal_coeffs(genome))
+        meta['signal_kernel'] = signal_kernel
+        signal_program_active = meta.get('signal_program')
+        if not isinstance(signal_program_active, str) or not signal_program_active.strip():
+            signal_program_active = _rl_signal_program_for(genome)
+            meta['signal_program'] = signal_program_active
+        meta['signal_program_requested'] = meta.get('signal_program_requested', signal_program_active)
         return
     rewards_arr = np.asarray(rewards, dtype=np.float64)
     avg_reward = float(np.mean(rewards_arr))
@@ -9091,9 +9195,16 @@ def _rl_update_meta_profile(
     signal = _rl_collective_signal(genome, meta, rewards=rewards, experiences=experiences)
     meta['collective_signal'] = dict(signal)
     meta['weight_kernel'] = dict(_ensure_rl_weight_coeffs(genome))
-    meta['weight_program'] = _rl_weight_program_for(genome)
-    meta['signal_kernel'] = dict(_ensure_rl_signal_coeffs(genome))
-    meta['signal_program'] = _rl_signal_program_for(genome)
+    weight_program = _rl_weight_program_for(genome)
+    meta['weight_program_requested'] = weight_program
+    meta['weight_program'] = weight_program
+    signal_kernel = dict(_ensure_rl_signal_coeffs(genome))
+    meta['signal_kernel'] = signal_kernel
+    signal_program_active = meta.get('signal_program')
+    if not isinstance(signal_program_active, str) or not signal_program_active.strip():
+        signal_program_active = _rl_signal_program_for(genome)
+        meta['signal_program'] = signal_program_active
+    meta['signal_program_requested'] = meta.get('signal_program_requested', signal_program_active)
     if params_before != getattr(genome, 'rl_params', {}) and 'rl_params' not in changes:
         changes['rl_params'] = dict(genome.rl_params)
     if changes:
@@ -11567,7 +11678,8 @@ class SelfReproducingEvaluator:
         div_state = getattr(self, '_diversity_feedback', {}) or {}
         scarcity = float(np.clip(div_state.get('scarcity', 0.0), 0.0, 1.0))
         spread = float(np.clip(div_state.get('structural_spread', 0.0), 0.0, 4.0))
-        entropy = float(np.clip(div_state.get('entropy', 0.0), 0.0, 1.2))
+        entropy_norm = float(np.clip(div_state.get('entropy_norm', div_state.get('entropy', 0.0)), 0.0, 1.2))
+        entropy_raw = float(max(0.0, div_state.get('entropy', entropy_norm)))
         share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
         prev_noise = float(getattr(env, 'noise', 0.05))
         prev_turns = float(getattr(env, 'turns', 1.6))
@@ -11575,7 +11687,7 @@ class SelfReproducingEvaluator:
         scale_noise, scale_turns, scale_rot = self.output_scale
         scale_noise *= float(1.0 + 0.35 * scarcity)
         scale_turns *= float(1.0 + 0.2 * spread)
-        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy))
+        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy_norm))
         mod_out0 = float(out[0] * (1.0 - 0.35 * share) + anchor * 0.35)
         mod_out1 = float(out[1] * (1.0 - 0.3 * share) + (anchor + gap * 0.5) * 0.3)
         mod_out2 = float(out[2] * (1.0 - 0.3 * share) + gap * 0.6)
@@ -11730,7 +11842,8 @@ class SelfReproducingEvaluator:
         div_state = getattr(self, '_diversity_feedback', {}) or {}
         scarcity = float(np.clip(div_state.get('scarcity', 0.0), 0.0, 1.0))
         spread = float(np.clip(div_state.get('structural_spread', 0.0), 0.0, 4.0))
-        entropy = float(np.clip(div_state.get('entropy', 0.0), 0.0, 1.2))
+        entropy_norm = float(np.clip(div_state.get('entropy_norm', div_state.get('entropy', 0.0)), 0.0, 1.2))
+        entropy_raw = float(max(0.0, div_state.get('entropy', entropy_norm)))
         share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
         lazy_pressure = float(np.clip(share * (1.0 + 0.5 * stasis + 0.25 * abs(gap)), 0.0, 1.6))
         prev_noise = float(getattr(env, 'noise', 0.05))
@@ -11739,7 +11852,7 @@ class SelfReproducingEvaluator:
         scale_noise, scale_turns, scale_rot = self.output_scale
         scale_noise *= float(1.0 + 0.35 * scarcity + 0.55 * lazy_pressure)
         scale_turns *= float(1.0 + 0.2 * spread + 0.4 * lazy_pressure)
-        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy) + 0.35 * lazy_pressure)
+        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy_norm) + 0.35 * lazy_pressure)
         anchor_pull = float(np.clip(0.35 + 0.25 * lazy_pressure, 0.0, 0.85))
         gap_pull = float(np.clip(0.45 + 0.25 * lazy_pressure, 0.0, 0.9))
         mod_out0 = float(consensus[0] * (1.0 - anchor_pull) + anchor * anchor_pull)
