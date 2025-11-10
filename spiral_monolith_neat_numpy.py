@@ -6121,9 +6121,51 @@ class ReproPlanaNEATPlus:
                 return until > now_gen
             return False
 
-        def _filter_retired(pool_seq: Sequence['Genome']) -> List['Genome']:
+        retire_fallbacks: Dict[str, int] = {}
+
+        def _register_retire_fallback(kind: str) -> None:
+            retire_fallbacks[kind] = retire_fallbacks.get(kind, 0) + 1
+
+        def _filter_retired(
+            pool_seq: Sequence['Genome'],
+            *,
+            species_hint: Optional['Species'] = None,
+            selector: Optional[Callable[['Genome'], bool]] = None,
+            label: str = 'pool',
+        ) -> List['Genome']:
             filtered = [g for g in pool_seq if not _is_retired(g)]
-            return filtered if filtered else list(pool_seq)
+            if filtered:
+                return filtered
+
+            predicate: Callable[['Genome'], bool] = selector or (lambda _g: True)
+
+            substitutes: List['Genome'] = []
+            if species_hint is not None:
+                for candidate, _fit in species_hint.members:
+                    if candidate in pool_seq:
+                        continue
+                    if predicate(candidate) and not _is_retired(candidate):
+                        substitutes.append(candidate)
+                        if len(substitutes) >= max(1, len(pool_seq) or 1):
+                            break
+            if not substitutes:
+                for alt_species in species_pool:
+                    if species_hint is not None and alt_species is species_hint:
+                        continue
+                    for candidate, _fit in alt_species.members:
+                        if predicate(candidate) and not _is_retired(candidate):
+                            substitutes.append(candidate)
+                            if len(substitutes) >= max(1, len(pool_seq) or 1):
+                                break
+                    if substitutes:
+                        break
+            if substitutes:
+                _register_retire_fallback(label)
+                return substitutes
+
+            if pool_seq:
+                _register_retire_fallback(f'{label}_forced')
+            return list(pool_seq)
 
         effective_elitism = max(0, int(getattr(self, '_elitism_effective', self.elitism)))
         elites: List['Genome'] = []
@@ -6152,15 +6194,45 @@ class ReproPlanaNEATPlus:
             self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen, 'family_id': child.family_id}
         remaining = offspring_counts[sidx] - len(elites)
         k = max(2, int(math.ceil(self.survival_rate * len(sp.members))))
-        females = _filter_retired([g for g, _ in sp.members[:k] if g.sex == 'female'])
-        males = _filter_retired([g for g, _ in sp.members[:k] if g.sex == 'male'])
-        hermaphrodites = _filter_retired([g for g, _ in sp.members[:k] if g.sex == 'hermaphrodite'])
-        pool = _filter_retired([g for g, _ in sp.members[:k]])
+        females = _filter_retired(
+            [g for g, _ in sp.members[:k] if g.sex == 'female'],
+            species_hint=sp,
+            selector=lambda g: g.sex == 'female',
+            label='female_pool',
+        )
+        males = _filter_retired(
+            [g for g, _ in sp.members[:k] if g.sex == 'male'],
+            species_hint=sp,
+            selector=lambda g: g.sex == 'male',
+            label='male_pool',
+        )
+        hermaphrodites = _filter_retired(
+            [g for g, _ in sp.members[:k] if g.sex == 'hermaphrodite'],
+            species_hint=sp,
+            selector=lambda g: g.sex == 'hermaphrodite',
+            label='hermaphrodite_pool',
+        )
+        pool = _filter_retired([g for g, _ in sp.members[:k]], species_hint=sp, label='mixed_pool')
         non_elite_ids = set(getattr(self, '_last_top3_ids', set()))
         if not females or not males:
-            females = _filter_retired([g for g, _ in sp.members if g.sex == 'female']) or females
-            males = _filter_retired([g for g, _ in sp.members if g.sex == 'male']) or males
-            hermaphrodites = _filter_retired([g for g, _ in sp.members if g.sex == 'hermaphrodite']) or hermaphrodites
+            females = _filter_retired(
+                [g for g, _ in sp.members if g.sex == 'female'],
+                species_hint=sp,
+                selector=lambda g: g.sex == 'female',
+                label='female_backfill',
+            ) or females
+            males = _filter_retired(
+                [g for g, _ in sp.members if g.sex == 'male'],
+                species_hint=sp,
+                selector=lambda g: g.sex == 'male',
+                label='male_backfill',
+            ) or males
+            hermaphrodites = _filter_retired(
+                [g for g, _ in sp.members if g.sex == 'hermaphrodite'],
+                species_hint=sp,
+                selector=lambda g: g.sex == 'hermaphrodite',
+                label='hermaphrodite_backfill',
+            ) or hermaphrodites
         mix_ratio = self._mix_asexual_ratio()
         monitor = getattr(self, 'lcs_monitor', None)
         weight_tol = getattr(monitor, 'eps', 0.0) if monitor is not None else 0.0
@@ -6220,8 +6292,18 @@ class ReproPlanaNEATPlus:
             else:
                 use_sexual_reproduction = True
             if use_sexual_reproduction:
-                potential_mothers = _filter_retired(females + hermaphrodites)
-                potential_fathers = _filter_retired(males + hermaphrodites)
+                potential_mothers = _filter_retired(
+                    females + hermaphrodites,
+                    species_hint=sp,
+                    selector=lambda g: g.sex in ('female', 'hermaphrodite'),
+                    label='mother_pool',
+                )
+                potential_fathers = _filter_retired(
+                    males + hermaphrodites,
+                    species_hint=sp,
+                    selector=lambda g: g.sex in ('male', 'hermaphrodite'),
+                    label='father_pool',
+                )
                 if potential_mothers and potential_fathers and (self.rng.random() > self.pollen_flow_rate):
                     mother = potential_mothers[int(self.rng.integers(len(potential_mothers)))]
                     if potential_fathers:
@@ -6237,9 +6319,23 @@ class ReproPlanaNEATPlus:
                 elif len(species_pool) > 1:
                     mother = pool[int(self.rng.integers(len(pool)))]
                     other = species_pool[(sidx + 1) % len(species_pool)]
-                    other_pool = _filter_retired([g for g, _ in other.members])
-                    other_males = _filter_retired([g for g, _ in other.members if g.sex == 'male'])
-                    other_herm = _filter_retired([g for g, _ in other.members if g.sex == 'hermaphrodite'])
+                    other_pool = _filter_retired(
+                        [g for g, _ in other.members],
+                        species_hint=other,
+                        label='cross_pool',
+                    )
+                    other_males = _filter_retired(
+                        [g for g, _ in other.members if g.sex == 'male'],
+                        species_hint=other,
+                        selector=lambda g: g.sex == 'male',
+                        label='cross_male_pool',
+                    )
+                    other_herm = _filter_retired(
+                        [g for g, _ in other.members if g.sex == 'hermaphrodite'],
+                        species_hint=other,
+                        selector=lambda g: g.sex == 'hermaphrodite',
+                        label='cross_herm_pool',
+                    )
                     father_pool = other_males + other_herm if other_males or other_herm else other_pool
                     father = father_pool[int(self.rng.integers(len(father_pool)))]
                     mode = 'sexual_cross'
@@ -6329,6 +6425,15 @@ class ReproPlanaNEATPlus:
                     events.setdefault('hermaphrodite_suppressed', 0)
                     events['hermaphrodite_suppressed'] += 1
             remaining -= 1
+        if retire_fallbacks:
+            snap = getattr(self, '_altruism_retirement_snapshot', None)
+            if isinstance(snap, dict):
+                updated = dict(snap)
+                existing = dict(updated.get('fallbacks', {}))
+                for key, val in retire_fallbacks.items():
+                    existing[key] = int(existing.get(key, 0)) + int(val)
+                updated['fallbacks'] = existing
+                self._altruism_retirement_snapshot = updated
         return (new_pop, events)
 
     def reproduce(self, species, fitnesses):
@@ -7853,6 +7958,10 @@ class ReproPlanaNEATPlus:
                             retire_str = f" | retire ϕ{pressure_val:.2f} ρ{retired_count}@{candidate_count}"
                             if static_count:
                                 retire_str += f" s{static_count}"
+                            fallbacks = retire_snap.get('fallbacks', {})
+                            if isinstance(fallbacks, dict) and fallbacks:
+                                fallback_bits = ','.join(f"{k}:{v}" for k, v in sorted(fallbacks.items()))
+                                retire_str += f" f[{fallback_bits}]"
                         except Exception:
                             retire_str = ''
                     print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}{div_str}{retire_str}")
