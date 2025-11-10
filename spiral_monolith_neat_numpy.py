@@ -187,18 +187,23 @@ _RL_SIGNAL_COEFF_DEFAULTS: Dict[str, float] = {
     'stress_instability': 0.45,
     'stress_trend': 0.2,
     'stress_done': 0.15,
+    'stress_team': 0.25,
     'altruism_base': 0.4,
     'altruism_stability': 0.4,
     'altruism_relief': 0.2,
     'altruism_novelty': 0.15,
+    'altruism_team': 0.25,
     'solidarity_base': 0.3,
     'solidarity_stability': 0.4,
     'solidarity_lazy': 0.15,
     'solidarity_done_relief': 0.15,
+    'solidarity_team': 0.2,
     'advantage_base': 0.45,
     'advantage_trend': 0.35,
     'advantage_span': 0.25,
     'advantage_novelty': 0.1,
+    'advantage_team': 0.2,
+    'advantage_best': 0.12,
 }
 
 _RL_SIGNAL_DSL_TEMPLATE = """
@@ -207,7 +212,8 @@ stress = clamp(
     {stress_bias}
     + {stress_instability} * (1.0 - stability)
     + {stress_trend} * abs(trend_norm)
-    + {stress_done} * done_ratio,
+    + {stress_done} * done_ratio
+    + {stress_team} * team_pressure,
     0.0,
     1.0
 );
@@ -215,7 +221,8 @@ altruism_target = clamp(
     {altruism_base}
     + {altruism_stability} * stability
     + {altruism_relief} * (1.0 - stress)
-    + {altruism_novelty} * novelty_scale,
+    + {altruism_novelty} * novelty_scale
+    + {altruism_team} * team_alignment,
     0.0,
     1.0
 );
@@ -223,7 +230,8 @@ solidarity = clamp(
     {solidarity_base}
     + {solidarity_stability} * stability
     + {solidarity_lazy} * lazy_share
-    + {solidarity_done_relief} * (1.0 - done_ratio),
+    + {solidarity_done_relief} * (1.0 - done_ratio)
+    + {solidarity_team} * team_alignment,
     0.0,
     1.0
 );
@@ -232,13 +240,75 @@ advantage = clamp(
     {advantage_base}
     + {advantage_trend} * trend_norm
     + {advantage_span} * span_component
-    + {advantage_novelty} * novelty_scale,
+    + {advantage_novelty} * novelty_scale
+    + {advantage_team} * team_trend
+    + {advantage_best} * team_best,
     0.0,
     1.0
 );
 """
 
 _RL_SIGNAL_PROGRAM_CACHE: Dict[str, Any] = {}
+
+_RL_SCHED_COEFF_DEFAULTS: Dict[str, float] = {
+    'entropy_bias': 0.02,
+    'entropy_norm_gain': 0.35,
+    'entropy_instability': 0.3,
+    'entropy_novelty': 0.25,
+    'entropy_team': 0.18,
+    'entropy_span': 0.12,
+    'lr_bias': 0.0,
+    'lr_norm_gain': 0.55,
+    'lr_instability': 0.25,
+    'lr_memory': -0.35,
+    'lr_team': 0.18,
+    'lr_span': 0.1,
+    'gamma_bias': 0.0,
+    'gamma_norm_gain': 0.12,
+    'gamma_stability': 0.08,
+    'gamma_novelty': 0.18,
+    'gamma_team': 0.1,
+    'gamma_span': 0.05,
+}
+
+_RL_SCHED_DSL_TEMPLATE = """
+// cpp-ish DSL for RL hyperparameter scheduling.
+instability = (1.0 - stability);
+entropy = clamp(
+    entropy
+    + {entropy_bias}
+    + {entropy_norm_gain} * norm_delta
+    + {entropy_instability} * instability
+    + {entropy_novelty} * novelty_scale
+    + {entropy_team} * team_alignment
+    + {entropy_span} * reward_span_norm,
+    1e-5,
+    0.5
+);
+lr = clamp(
+    lr * (1.0 + {lr_norm_gain} * norm_delta)
+    + {lr_bias}
+    + {lr_instability} * instability
+    + {lr_memory} * (1.0 - memory_util)
+    + {lr_team} * team_alignment
+    + {lr_span} * reward_span_norm,
+    1e-5,
+    0.2
+);
+gamma = clamp(
+    gamma
+    + {gamma_bias}
+    + {gamma_norm_gain} * norm_delta
+    + {gamma_stability} * stability
+    + {gamma_novelty} * novelty_scale
+    + {gamma_team} * team_alignment
+    + {gamma_span} * reward_span_norm,
+    0.4,
+    0.9995
+);
+"""
+
+_RL_SCHED_PROGRAM_CACHE: Dict[str, Any] = {}
 
 
 def _rl_default_meta() -> Dict[str, Any]:
@@ -369,6 +439,34 @@ def _ensure_rl_signal_coeffs(genome: 'Genome') -> Dict[str, float]:
     return coeffs
 
 
+def _rl_sanitise_scheduler_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_RL_SCHED_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _RL_SCHED_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            if key.endswith('_bias'):
+                val = float(np.clip(val, -0.5, 0.5))
+            elif key.endswith('_memory'):
+                val = float(np.clip(val, -1.5, 0.0))
+            else:
+                val = float(np.clip(val, -1.5, 1.5))
+            base[key] = val
+    return base
+
+
+def _ensure_rl_scheduler_coeffs(genome: 'Genome') -> Dict[str, float]:
+    coeffs = getattr(genome, 'rl_scheduler_coeffs', None)
+    coeffs = _rl_sanitise_scheduler_coeffs(coeffs)
+    genome.rl_scheduler_coeffs = coeffs
+    return coeffs
+
+
 def _rl_weight_program_for(genome: 'Genome') -> str:
     template = getattr(genome, 'rl_weight_program_template', None)
     if not isinstance(template, str) or not template.strip():
@@ -397,6 +495,22 @@ def _rl_signal_program_for(genome: 'Genome') -> str:
     except KeyError:
         program = _RL_SIGNAL_DSL_TEMPLATE.format(
             **{k: repr(v) for k, v in _RL_SIGNAL_COEFF_DEFAULTS.items()}
+        )
+    return program
+
+
+def _rl_scheduler_program_for(genome: 'Genome') -> str:
+    template = getattr(genome, 'rl_scheduler_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _RL_SCHED_DSL_TEMPLATE
+        genome.rl_scheduler_program_template = template
+    coeffs = _ensure_rl_scheduler_coeffs(genome)
+    formatted = {key: repr(float(value)) for key, value in coeffs.items()}
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        program = _RL_SCHED_DSL_TEMPLATE.format(
+            **{k: repr(v) for k, v in _RL_SCHED_COEFF_DEFAULTS.items()}
         )
     return program
 
@@ -438,6 +552,26 @@ def _rl_compile_signal_program(program: str):
     src = '\n'.join(lines)
     compiled = compile(src, '<rl_signal_program>', 'exec')
     _RL_SIGNAL_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _rl_compile_scheduler_program(program: str):
+    cached = _RL_SCHED_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty RL scheduler program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<rl_scheduler_program>', 'exec')
+    _RL_SCHED_PROGRAM_CACHE[program] = compiled
     return compiled
 
 
@@ -483,6 +617,28 @@ def _rl_run_signal_program(state: Dict[str, Any], program: str) -> Optional[Dict
         return None
     result: Dict[str, float] = {}
     for key in ('altruism_target', 'solidarity', 'stress', 'lazy_share', 'advantage'):
+        val = locals_dict.get(key, state.get(key))
+        if val is None:
+            return None
+        try:
+            result[key] = float(val)
+        except Exception:
+            return None
+    return result
+
+
+def _rl_run_scheduler_program(state: Dict[str, Any], program: str) -> Optional[Dict[str, float]]:
+    try:
+        compiled = _rl_compile_scheduler_program(program)
+    except Exception:
+        return None
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    result: Dict[str, float] = {}
+    for key in ('entropy', 'lr', 'gamma'):
         val = locals_dict.get(key, state.get(key))
         if val is None:
             return None
@@ -541,6 +697,20 @@ def _mutate_rl_signal_kernel(genome: 'Genome', rng: np.random.Generator) -> None
     genome.rl_signal_coeffs = coeffs
 
 
+def _mutate_rl_scheduler_kernel(genome: 'Genome', rng: np.random.Generator) -> None:
+    coeffs = _ensure_rl_scheduler_coeffs(genome)
+    key = rng.choice(list(_RL_SCHED_COEFF_DEFAULTS.keys()))
+    current = float(coeffs.get(key, _RL_SCHED_COEFF_DEFAULTS[key]))
+    if key.endswith('_bias'):
+        current = float(np.clip(current + rng.normal(0.0, 0.05), -0.5, 0.5))
+    elif key.endswith('_memory'):
+        current = float(np.clip(current + rng.normal(0.0, 0.08), -1.5, 0.0))
+    else:
+        current = float(np.clip(current + rng.normal(0.0, 0.12), -1.5, 1.5))
+    coeffs[key] = current
+    genome.rl_scheduler_coeffs = coeffs
+
+
 def _rl_collective_signal(
     genome: 'Genome',
     meta: Dict[str, Any],
@@ -567,6 +737,10 @@ def _rl_collective_signal(
     lazy_strength = float(np.clip(getattr(genome, 'lazy_lineage_strength', 0.0), 0.0, 4.0))
     lazy_share_base = lazy_strength / (lazy_strength + 1.5) if lazy_strength > 0 else 0.0
     lazy_share = float(np.clip(0.2 + 0.45 * lazy_share_base + 0.35 * memory_util, 0.0, 1.0))
+    team_alignment = float(np.clip(meta.get('population_reward_alignment', 0.0), -1.0, 1.0))
+    team_trend = float(np.clip(meta.get('population_reward_trend_norm', 0.0), -1.0, 1.0))
+    team_best = float(np.clip(meta.get('population_reward_best_norm', 0.0), 0.0, 1.0))
+    team_pressure = float(max(0.0, meta.get('population_reward_pressure', 0.0)))
     done_ratio = 0.0
     if experiences:
         done_flags = [1.0 if bool(exp.get('done')) else 0.0 for exp in experiences]
@@ -587,6 +761,10 @@ def _rl_collective_signal(
         'reward_span': reward_span,
         'reward_std': reward_std,
         'denom': denom,
+        'team_alignment': team_alignment,
+        'team_trend': team_trend,
+        'team_best': team_best,
+        'team_pressure': team_pressure,
     }
     signal = _rl_run_signal_program(state, program)
     if signal is None:
@@ -599,6 +777,11 @@ def _rl_collective_signal(
             'stress': float(np.clip(coeffs.get('stress_bias', 0.35), 0.0, 1.0)),
             'lazy_share': float(np.clip(lazy_share, 0.0, 1.0)),
             'advantage': float(np.clip(coeffs.get('advantage_base', 0.45), 0.0, 1.0)),
+            'group_reward_alignment': float(team_alignment),
+            'group_reward_trend': float(team_trend),
+            'group_reward_best': float(team_best),
+            'group_reward_pressure': float(team_pressure),
+            'group_reward_delta': float(meta.get('population_reward_delta', 0.0)),
         }
     else:
         signal = {
@@ -607,6 +790,11 @@ def _rl_collective_signal(
             'stress': float(np.clip(signal.get('stress', 0.0), 0.0, 1.0)),
             'lazy_share': float(np.clip(signal.get('lazy_share', lazy_share), 0.0, 1.0)),
             'advantage': float(np.clip(signal.get('advantage', 0.0), 0.0, 1.0)),
+            'group_reward_alignment': float(np.clip(signal.get('group_reward_alignment', team_alignment), -1.0, 1.0)),
+            'group_reward_trend': float(np.clip(signal.get('group_reward_trend', team_trend), -1.0, 1.0)),
+            'group_reward_best': float(np.clip(signal.get('group_reward_best', team_best), 0.0, 1.0)),
+            'group_reward_pressure': float(max(0.0, signal.get('group_reward_pressure', team_pressure))),
+            'group_reward_delta': float(signal.get('group_reward_delta', meta.get('population_reward_delta', 0.0))),
         }
     if isinstance(meta, dict):
         meta['signal_kernel'] = dict(coeffs)
@@ -1326,6 +1514,8 @@ class Genome:
         self.rl_weight_program_template: str = _RL_WEIGHT_DSL_TEMPLATE
         self.rl_signal_coeffs: Dict[str, float] = dict(_RL_SIGNAL_COEFF_DEFAULTS)
         self.rl_signal_program_template: str = _RL_SIGNAL_DSL_TEMPLATE
+        self.rl_scheduler_coeffs: Dict[str, float] = dict(_RL_SCHED_COEFF_DEFAULTS)
+        self.rl_scheduler_program_template: str = _RL_SCHED_DSL_TEMPLATE
 
     def meta_reflect(self, event: str, payload: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
         info = dict(payload or {})
@@ -1414,6 +1604,13 @@ class Genome:
         g.rl_signal_coeffs = _rl_sanitise_signal_coeffs(sig_coeffs)
         sig_template = getattr(self, 'rl_signal_program_template', _RL_SIGNAL_DSL_TEMPLATE)
         g.rl_signal_program_template = sig_template if isinstance(sig_template, str) else _RL_SIGNAL_DSL_TEMPLATE
+        try:
+            sched_coeffs = dict(getattr(self, 'rl_scheduler_coeffs', {}))
+        except Exception:
+            sched_coeffs = dict(_RL_SCHED_COEFF_DEFAULTS)
+        g.rl_scheduler_coeffs = _rl_sanitise_scheduler_coeffs(sched_coeffs)
+        sched_template = getattr(self, 'rl_scheduler_program_template', _RL_SCHED_DSL_TEMPLATE)
+        g.rl_scheduler_program_template = sched_template if isinstance(sched_template, str) else _RL_SCHED_DSL_TEMPLATE
         return g
 
     def invalidate_caches(self, structure: bool=False, weights: bool=False):
@@ -3225,6 +3422,8 @@ class ReproPlanaNEATPlus:
         self._altruism_retirement_snapshot: Dict[str, Any] = {}
         self.stagnation_commission_history: List[Dict[str, Any]] = []
         self.rl_param_mutation_rate = 0.35
+        self._rl_collective_objective: Dict[str, float] = {}
+        self._rl_collective_history: deque = deque(maxlen=64)
         nodes = {}
         for i in range(num_inputs):
             nodes[i] = NodeGene(i, 'input', 'identity')
@@ -3528,6 +3727,78 @@ class ReproPlanaNEATPlus:
             fid = self._next_family_id()
         child.family_id = int(fid)
         return int(fid)
+
+    def _update_rl_collective_objective(self, generation: int) -> Dict[str, float]:
+        metas: List[Dict[str, Any]] = []
+        for g in self.population:
+            meta = getattr(g, 'rl_meta', None)
+            if not isinstance(meta, dict):
+                continue
+            if int(meta.get('episodes', 0) or 0) <= 0:
+                continue
+            metas.append(meta)
+        if not metas:
+            self._rl_collective_objective = {}
+            return {}
+        reward_mean = np.asarray(
+            [float(m.get('reward_ema', m.get('last_reward', 0.0))) for m in metas],
+            dtype=np.float64,
+        )
+        reward_best = np.asarray(
+            [float(m.get('best_reward', m.get('last_reward', 0.0))) for m in metas],
+            dtype=np.float64,
+        )
+        reward_trend = np.asarray(
+            [float(m.get('trend', 0.0)) for m in metas],
+            dtype=np.float64,
+        )
+        reward_var = np.asarray(
+            [max(0.0, float(m.get('reward_var', 0.0))) for m in metas],
+            dtype=np.float64,
+        )
+        pop_mean = float(np.mean(reward_mean)) if reward_mean.size else 0.0
+        pop_best = float(np.max(reward_best)) if reward_best.size else pop_mean
+        pop_trend = float(np.mean(reward_trend)) if reward_trend.size else 0.0
+        pop_var = float(np.mean(reward_var)) if reward_var.size else 0.0
+        pop_std = float(np.sqrt(max(pop_var, 1e-09)))
+        alignment = float(np.tanh(pop_mean / (1.0 + pop_std + abs(pop_best) * 0.05)))
+        trend_norm = float(np.tanh(pop_trend / (1.0 + pop_std + abs(pop_mean) * 0.1)))
+        best_norm = float(np.tanh(pop_best / (1.0 + pop_std + abs(pop_mean))))
+        spread = float(np.tanh(float(np.std(reward_mean)) / (1.0 + abs(pop_mean) + pop_std))) if reward_mean.size else 0.0
+        pressure = float(np.clip(max(0.0, -trend_norm) + 0.5 * max(0.0, 0.35 - alignment), 0.0, 2.0))
+        history = getattr(self, '_rl_collective_history', None)
+        prev_delta = 0.0
+        if isinstance(history, deque) and history:
+            prev_mean = float(history[-1].get('mean', 0.0))
+            prev_delta = float(pop_mean - prev_mean)
+        snapshot = {
+            'generation': int(generation),
+            'mean': pop_mean,
+            'best': pop_best,
+            'trend': pop_trend,
+            'std': pop_std,
+            'alignment': alignment,
+            'trend_norm': trend_norm,
+            'best_norm': best_norm,
+            'spread': spread,
+            'pressure': pressure,
+            'delta_mean': prev_delta,
+        }
+        if isinstance(history, deque):
+            history.append(snapshot)
+        for meta in metas:
+            meta['population_reward_mean'] = pop_mean
+            meta['population_reward_best'] = pop_best
+            meta['population_reward_trend'] = pop_trend
+            meta['population_reward_std'] = pop_std
+            meta['population_reward_alignment'] = alignment
+            meta['population_reward_trend_norm'] = trend_norm
+            meta['population_reward_best_norm'] = best_norm
+            meta['population_reward_pressure'] = pressure
+            meta['population_reward_spread'] = spread
+            meta['population_reward_delta'] = prev_delta
+        self._rl_collective_objective = snapshot
+        return snapshot
 
     def _update_lazy_feedback(self, generation: int, fitnesses: Sequence[float], best_idx: int, best_fit: float, avg_fit: float) -> None:
         total = len(self.population)
@@ -4160,15 +4431,29 @@ class ReproPlanaNEATPlus:
         lazy_share = float(np.clip(lazy.get('share', 0.0), 0.0, 1.0))
         advantage = float(getattr(evaluator, 'last_advantage_score', 0.0) or 0.0)
         altruism_hint = float(np.clip(getattr(evaluator, 'last_altruism_signal', 0.5) or 0.5, 0.0, 1.0))
-        solidarity = float(max(0.0, diversity_entropy))
-        stress = float(np.clip(diversity_scarcity + max(0.0, family_surplus_mean), 0.0, 2.5))
-        target = float(np.clip(0.6 * altruism_hint + 0.4 * (1.0 - advantage), 0.0, 1.0))
+        rl_obj = getattr(self, '_rl_collective_objective', {}) or {}
+        team_alignment = float(np.clip(rl_obj.get('alignment', 0.0), -1.0, 1.0))
+        team_trend = float(np.clip(rl_obj.get('trend_norm', 0.0), -1.0, 1.0))
+        team_best = float(np.clip(rl_obj.get('best_norm', 0.0), 0.0, 1.0))
+        team_pressure = float(max(0.0, rl_obj.get('pressure', 0.0)))
+        team_delta = float(rl_obj.get('delta_mean', 0.0))
+        solidarity = float(max(0.0, diversity_entropy)) + 0.35 * max(0.0, team_alignment)
+        stress = float(np.clip(diversity_scarcity + max(0.0, family_surplus_mean) + 0.6 * team_pressure, 0.0, 3.0))
+        altruism_drive = 0.6 * altruism_hint + 0.25 * (1.0 - advantage)
+        altruism_drive += 0.2 * (0.5 + 0.5 * team_alignment + 0.25 * team_trend)
+        altruism_drive += 0.1 * (0.5 + 0.5 * team_best + 0.3 * np.tanh(team_delta))
+        target = float(np.clip(altruism_drive, 0.0, 1.0))
         self._collective_signal = {
             'altruism_target': target,
             'solidarity': solidarity,
             'stress': stress,
             'lazy_share': lazy_share,
             'advantage': advantage,
+            'group_reward_alignment': float(team_alignment),
+            'group_reward_trend': float(team_trend),
+            'group_reward_best': float(team_best),
+            'group_reward_pressure': float(team_pressure),
+            'group_reward_delta': float(team_delta),
         }
         if controller is not None:
             try:
@@ -4393,6 +4678,8 @@ class ReproPlanaNEATPlus:
             _mutate_rl_weight_kernel(genome, self.rng)
         if rl_rate > 0.0 and self.rng.random() < 0.5 * rl_rate:
             _mutate_rl_signal_kernel(genome, self.rng)
+        if rl_rate > 0.0 and self.rng.random() < 0.5 * rl_rate:
+            _mutate_rl_scheduler_kernel(genome, self.rng)
 
     def _crossover_maternal_biased(self, mother: Genome, father: Genome, species_members):
         fit_dict = {g: f for g, f in species_members}
@@ -4568,6 +4855,21 @@ class ReproPlanaNEATPlus:
         ]
         sig_templates = [tpl for tpl in sig_templates if isinstance(tpl, str) and tpl.strip()]
         child.rl_signal_program_template = sig_templates[0] if sig_templates else _RL_SIGNAL_DSL_TEMPLATE
+        sched_m = _rl_sanitise_scheduler_coeffs(getattr(mother, 'rl_scheduler_coeffs', None) if mother is not None else None)
+        sched_f = _rl_sanitise_scheduler_coeffs(getattr(father, 'rl_scheduler_coeffs', None) if father is not None else None)
+        sched_mix: Dict[str, float] = {}
+        for key in _RL_SCHED_COEFF_DEFAULTS:
+            mv = sched_m.get(key, _RL_SCHED_COEFF_DEFAULTS[key])
+            fv = sched_f.get(key, _RL_SCHED_COEFF_DEFAULTS[key])
+            blend = float(self.rng.uniform(0.3, 0.7))
+            sched_mix[key] = float(blend * mv + (1.0 - blend) * fv)
+        child.rl_scheduler_coeffs = sched_mix
+        sched_templates = [
+            getattr(mother, 'rl_scheduler_program_template', None) if mother is not None else None,
+            getattr(father, 'rl_scheduler_program_template', None) if father is not None else None,
+        ]
+        sched_templates = [tpl for tpl in sched_templates if isinstance(tpl, str) and tpl.strip()]
+        child.rl_scheduler_program_template = sched_templates[0] if sched_templates else _RL_SCHED_DSL_TEMPLATE
         limit = int(getattr(child, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
         child.rl_memory_limit = limit
         merged = deque(maxlen=limit)
@@ -6153,6 +6455,10 @@ class ReproPlanaNEATPlus:
                 raw_best = float(np.max(baseline_fitnesses)) if baseline_fitnesses else best_fit
                 raw_avg = float(np.mean(baseline_fitnesses)) if baseline_fitnesses else avg_fit
                 self.raw_best_history.append((raw_best, raw_avg))
+                try:
+                    self._update_rl_collective_objective(gen)
+                except Exception:
+                    pass
                 self._update_lazy_feedback(gen, fitnesses, best_idx, best_fit, avg_fit)
                 self._imprint_population_altruism(fitnesses)
                 context_best = self._contextual_best_axis(best_fit, avg_fit)
@@ -6751,6 +7057,11 @@ def train_with_backprop_numpy(
     stress = float(collective_signal.get('stress', 0.0))
     lazy_share = float(collective_signal.get('lazy_share', 0.0))
     advantage = float(collective_signal.get('advantage', 0.0))
+    group_alignment = float(np.clip(collective_signal.get('group_reward_alignment', 0.0), -1.0, 1.0))
+    group_trend = float(np.clip(collective_signal.get('group_reward_trend', 0.0), -1.0, 1.0))
+    group_best = float(np.clip(collective_signal.get('group_reward_best', 0.0), 0.0, 1.0))
+    group_pressure = float(max(0.0, collective_signal.get('group_reward_pressure', 0.0)))
+    group_delta = float(collective_signal.get('group_reward_delta', 0.0))
     comp = compile_genome(genome)
     w = comp['w'].copy()
     history = []
@@ -6830,12 +7141,30 @@ def train_with_backprop_numpy(
             prev_alt = float(np.clip(getattr(node, 'altruism', 0.5), 0.0, 1.0))
             prev_mem = float(np.clip(getattr(node, 'altruism_memory', 0.0), -1.5, 1.5))
             prev_span = float(np.clip(getattr(node, 'altruism_span', 0.0), 0.0, 4.0))
-            solidarity_gain = 0.5 * solidarity + 0.3 * (1.0 - advantage) + 0.2 * lazy_share
+            solidarity_gain = (
+                0.45 * solidarity
+                + 0.25 * (1.0 - advantage)
+                + 0.18 * lazy_share
+                + 0.22 * (0.5 + 0.5 * group_alignment + 0.2 * group_trend)
+                + 0.1 * (0.5 + 0.5 * group_best + 0.25 * np.tanh(group_delta))
+            )
             target_alt = float(np.clip(0.6 * altruism_target + 0.4 * solidarity_gain, 0.0, 1.0))
             node.altruism = float(np.clip(0.72 * prev_alt + 0.28 * target_alt, 0.0, 1.0))
-            mem_target = float(np.clip(solidarity - stress, -1.5, 1.5))
+            mem_target = float(
+                np.clip(
+                    solidarity - stress + 0.25 * group_trend - 0.18 * group_pressure,
+                    -1.5,
+                    1.5,
+                )
+            )
             node.altruism_memory = float(np.clip(0.6 * prev_mem + 0.4 * mem_target, -1.5, 1.5))
-            span_target = float(np.clip(stress + advantage, 0.0, 4.0))
+            span_target = float(
+                np.clip(
+                    stress + advantage + 0.3 * group_pressure - 0.22 * group_trend,
+                    0.0,
+                    4.0,
+                )
+            )
             node.altruism_span = float(np.clip(0.65 * prev_span + 0.35 * span_target, 0.0, 4.0))
         if profile_out is not None:
             profile_out['avg_profile'] = np.asarray(avg_profile, dtype=np.float64)
@@ -9347,10 +9676,23 @@ def _rl_update_meta_profile(
             signal_program_active = _rl_signal_program_for(genome)
             meta['signal_program'] = signal_program_active
         meta['signal_program_requested'] = meta.get('signal_program_requested', signal_program_active)
+        sched_kernel = dict(_ensure_rl_scheduler_coeffs(genome))
+        meta['scheduler_kernel'] = sched_kernel
+        sched_program_active = meta.get('scheduler_program')
+        if not isinstance(sched_program_active, str) or not sched_program_active.strip():
+            sched_program_active = _rl_scheduler_program_for(genome)
+            meta['scheduler_program'] = sched_program_active
+        meta['scheduler_program_requested'] = meta.get('scheduler_program_requested', sched_program_active)
+        meta['scheduler_outputs'] = {
+            'entropy': float(entropy),
+            'lr': float(lr),
+            'gamma': float(gamma),
+        }
         return
     rewards_arr = np.asarray(rewards, dtype=np.float64)
     avg_reward = float(np.mean(rewards_arr))
     reward_std = float(np.std(rewards_arr))
+    reward_span = float(np.ptp(rewards_arr)) if rewards_arr.size else 0.0
     prev_ema = float(meta['reward_ema']) if meta.get('episodes', 0) > 0 else avg_reward
     if meta.get('episodes', 0) <= 0:
         meta['reward_ema'] = avg_reward
@@ -9430,22 +9772,77 @@ def _rl_update_meta_profile(
         genome.rl_memory = trimmed
         changes['rl_memory_limit'] = (base_limit, desired)
         memory_buf = list(trimmed)
+    limit = float(getattr(genome, 'rl_memory_limit', len(memory_buf) or 1))
+    memory_util = float(np.clip(len(memory_buf) / max(1.0, limit), 0.0, 1.0))
     params = getattr(genome, 'rl_params', {}) or {}
+    scheduler_program_used: Optional[str] = None
+    scheduler_requested: Optional[str] = None
+    scheduler_outputs: Optional[Dict[str, float]] = None
     if params:
         entropy_now = float(np.clip(params.get('entropy', entropy), 0.0, 0.5))
-        entropy_target = float(np.clip(entropy_now * (1.0 + (1.0 - stability) * 0.4 - 0.25 * norm_delta), 1e-5, 0.5))
-        entropy_target = float(np.clip(entropy_target * (1.0 + 0.3 * (1.0 - abs(novelty_scale))), 1e-5, 0.5))
         lr_now = float(np.clip(params.get('lr', lr), 1e-5, 0.2))
-        lr_scale = (1.0 + 0.55 * norm_delta) * (0.9 + 0.2 * (1.0 - memory_util))
-        lr_target = float(np.clip(lr_now * lr_scale, 1e-5, 0.2))
         gamma_now = float(np.clip(params.get('gamma', gamma), 0.4, 0.9995))
-        gamma_target = float(
-            np.clip(
-                gamma_now + 0.01 * norm_delta * (0.5 + 0.5 * stability) + 0.02 * novelty_scale,
-                0.4,
-                0.9995,
-            )
+        reward_span_norm = float(np.tanh(reward_span / denom)) if denom > 0 else 0.0
+        scheduler_state = {
+            'entropy': entropy_now,
+            'lr': lr_now,
+            'gamma': gamma_now,
+            'norm_delta': norm_delta,
+            'stability': stability,
+            'novelty_scale': float(np.clip(novelty_scale, -1.0, 1.0)),
+            'memory_util': float(np.clip(memory_util, 0.0, 1.0)),
+            'team_alignment': float(np.clip(meta.get('population_reward_alignment', 0.0), -1.0, 1.0)),
+            'team_trend': float(np.clip(meta.get('population_reward_trend_norm', 0.0), -1.0, 1.0)),
+            'team_pressure': float(max(0.0, meta.get('population_reward_pressure', 0.0))),
+            'team_best': float(np.clip(meta.get('population_reward_best_norm', 0.0), 0.0, 1.0)),
+            'reward_span_norm': reward_span_norm,
+        }
+        scheduler_requested = _rl_scheduler_program_for(genome)
+        default_sched_program = _RL_SCHED_DSL_TEMPLATE.format(
+            **{k: repr(v) for k, v in _RL_SCHED_COEFF_DEFAULTS.items()}
         )
+        program = scheduler_requested
+        scheduler_outputs = _rl_run_scheduler_program(scheduler_state, program)
+        if scheduler_outputs is None:
+            program = default_sched_program
+            scheduler_outputs = _rl_run_scheduler_program(scheduler_state, program)
+        if scheduler_outputs is None:
+            entropy_target = float(
+                np.clip(
+                    entropy_now * (1.0 + (1.0 - stability) * 0.4 - 0.25 * norm_delta),
+                    1e-5,
+                    0.5,
+                )
+            )
+            entropy_target = float(
+                np.clip(entropy_target * (1.0 + 0.3 * (1.0 - abs(novelty_scale))), 1e-5, 0.5)
+            )
+            lr_scale = (1.0 + 0.55 * norm_delta) * (0.9 + 0.2 * (1.0 - memory_util))
+            lr_target = float(np.clip(lr_now * lr_scale, 1e-5, 0.2))
+            gamma_target = float(
+                np.clip(
+                    gamma_now
+                    + 0.01 * norm_delta * (0.5 + 0.5 * stability)
+                    + 0.02 * novelty_scale,
+                    0.4,
+                    0.9995,
+                )
+            )
+            scheduler_outputs = {
+                'entropy': entropy_target,
+                'lr': lr_target,
+                'gamma': gamma_target,
+            }
+        else:
+            entropy_target = float(np.clip(scheduler_outputs.get('entropy', entropy_now), 1e-5, 0.5))
+            lr_target = float(np.clip(scheduler_outputs.get('lr', lr_now), 1e-5, 0.2))
+            gamma_target = float(np.clip(scheduler_outputs.get('gamma', gamma_now), 0.4, 0.9995))
+            scheduler_outputs = {
+                'entropy': entropy_target,
+                'lr': lr_target,
+                'gamma': gamma_target,
+            }
+        scheduler_program_used = program
         params.update({'entropy': entropy_target, 'lr': lr_target, 'gamma': gamma_target})
         genome.rl_params = params
         meta['entropy_push'] = entropy_target
@@ -9455,8 +9852,27 @@ def _rl_update_meta_profile(
         meta['entropy_push'] = float(entropy)
         meta['lr_push'] = float(lr)
         meta['gamma_push'] = float(gamma)
-    limit = float(getattr(genome, 'rl_memory_limit', len(memory_buf) or 1))
-    meta['memory_util'] = float(np.clip(len(memory_buf) / max(1.0, limit), 0.0, 1.0))
+    sched_active = meta.get('scheduler_program')
+    if not isinstance(sched_active, str) or not sched_active.strip():
+        sched_active = _rl_scheduler_program_for(genome)
+        meta['scheduler_program'] = sched_active
+    if scheduler_program_used is not None:
+        meta['scheduler_program'] = scheduler_program_used
+    scheduler_requested = scheduler_requested or meta.get('scheduler_program_requested', meta.get('scheduler_program'))
+    meta['scheduler_program_requested'] = scheduler_requested
+    meta['scheduler_kernel'] = dict(_ensure_rl_scheduler_coeffs(genome))
+    if scheduler_outputs is not None:
+        meta['scheduler_outputs'] = {k: float(v) for k, v in scheduler_outputs.items()}
+    else:
+        meta.setdefault(
+            'scheduler_outputs',
+            {
+                'entropy': float(meta['entropy_push']),
+                'lr': float(meta['lr_push']),
+                'gamma': float(meta['gamma_push']),
+            },
+        )
+    meta['memory_util'] = memory_util
     signal = _rl_collective_signal(genome, meta, rewards=rewards, experiences=experiences)
     meta['collective_signal'] = dict(signal)
     meta['weight_kernel'] = dict(_ensure_rl_weight_coeffs(genome))
