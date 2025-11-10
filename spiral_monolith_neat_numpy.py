@@ -154,9 +154,9 @@ _MONODROMY_TOGGLE_PARAMS: Tuple[str, ...] = (
     'monodromy_family_weight',
 )
 
-_DEFAULT_RL_MEMORY_LIMIT = 1024
+_DEFAULT_RL_MEMORY_LIMIT = 2048
 _RL_MEMORY_LIMIT_MIN = 128
-_RL_MEMORY_LIMIT_MAX = 8192
+_RL_MEMORY_LIMIT_MAX = 16384
 _RL_META_ALPHA = 0.3
 _RL_META_VAR_ALPHA = 0.18
 
@@ -3917,6 +3917,12 @@ class ReproPlanaNEATPlus:
             metas.append(meta)
         if not metas:
             self._rl_collective_objective = {}
+            controller = getattr(self, 'spinor_controller', None)
+            if controller is not None and hasattr(controller, 'update_rl_objective'):
+                try:
+                    controller.update_rl_objective(generation, {})
+                except Exception:
+                    pass
             return {}
         reward_mean = np.asarray(
             [float(m.get('reward_ema', m.get('last_reward', 0.0))) for m in metas],
@@ -3976,6 +3982,12 @@ class ReproPlanaNEATPlus:
             meta['population_reward_spread'] = spread
             meta['population_reward_delta'] = prev_delta
         self._rl_collective_objective = snapshot
+        controller = getattr(self, 'spinor_controller', None)
+        if controller is not None and hasattr(controller, 'update_rl_objective'):
+            try:
+                controller.update_rl_objective(generation, snapshot)
+            except Exception:
+                pass
         return snapshot
 
     def _update_lazy_feedback(self, generation: int, fitnesses: Sequence[float], best_idx: int, best_fit: float, avg_fit: float) -> None:
@@ -9555,8 +9567,14 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
     except Exception:
         limit = _DEFAULT_RL_MEMORY_LIMIT
     buf = getattr(genome, 'rl_memory', None)
+    prev_entries: List[Dict[str, Any]] = []
+    if isinstance(buf, deque):
+        prev_entries = list(buf)
     if not isinstance(buf, deque) or buf.maxlen != limit:
-        buf = deque(maxlen=limit)
+        if prev_entries:
+            buf = deque(prev_entries[-limit:], maxlen=limit)
+        else:
+            buf = deque(maxlen=limit)
     meta = _rl_prepare_meta(genome)
     reward_anchor = float(meta.get('reward_ema', 0.0))
     for exp in experiences:
@@ -9971,8 +9989,15 @@ def _rl_update_meta_profile(
     desired *= (1.0 + 0.1 * float(depth_spread))
     novelty_metric = float(meta.get('novelty_ema', 0.0))
     novelty_scale = float(np.tanh(novelty_metric / (abs(meta.get('reward_ema', 0.0)) + reward_std + 1e-6)))
+    reward_pressure = float(max(0.0, meta.get('population_reward_pressure', 0.0)))
+    reward_trend = float(np.clip(meta.get('population_reward_trend_norm', 0.0), -1.0, 1.0))
+    reward_alignment = float(np.clip(meta.get('population_reward_alignment', 0.0), -1.0, 1.0))
+    reward_spread = float(np.clip(meta.get('population_reward_spread', 0.0), 0.0, 2.0))
     novelty_gain = 1.0 + 0.25 * abs(novelty_scale)
-    desired = int(np.clip(round(desired * novelty_gain), _RL_MEMORY_LIMIT_MIN, _RL_MEMORY_LIMIT_MAX))
+    novelty_gain *= (1.0 + 0.12 * reward_pressure)
+    reward_gain = (1.0 + 0.18 * reward_spread + 0.22 * max(0.0, -reward_trend))
+    reward_gain *= (1.0 + 0.1 * abs(reward_alignment))
+    desired = int(np.clip(round(desired * novelty_gain * reward_gain), _RL_MEMORY_LIMIT_MIN, _RL_MEMORY_LIMIT_MAX))
     buf_list = memory_buf
     if desired != base_limit:
         trimmed = deque(buf_list[-desired:], maxlen=desired)
@@ -12352,6 +12377,14 @@ class SelfReproducingEvaluator:
     _resilience_notes: deque = field(default_factory=lambda: deque(maxlen=16), init=False, repr=False)
     last_leader_council: Tuple[int, ...] = field(default_factory=tuple, init=False, repr=False)
     last_council_dispersion: float = field(default=0.0, init=False, repr=False)
+    rl_mode: bool = field(default=False, init=False)
+    _rl_objective: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    _rl_objective_generation: int = field(default=-1, init=False, repr=False)
+    _rl_feature_dim: int = field(default=8, init=False, repr=False)
+    last_reward_alignment: float = field(default=0.0, init=False, repr=False)
+    last_reward_trend: float = field(default=0.0, init=False, repr=False)
+    last_reward_pressure: float = field(default=0.0, init=False, repr=False)
+    last_reward_mean: float = field(default=0.0, init=False, repr=False)
     lazy_feedback_smoothing: float = 0.35
     lazy_feedback_decay: float = 0.25
     _lazy_feedback: Dict[str, Any] = field(
@@ -12440,6 +12473,52 @@ class SelfReproducingEvaluator:
         ]
         if embed is not None:
             base.extend(embed.tolist())
+        rl_obj = getattr(self, '_rl_objective', {}) or {}
+        rl_gen = int(rl_obj.get('generation', getattr(self, '_rl_objective_generation', -1)))
+        if rl_gen < 0:
+            rl_recency = 0.0
+        else:
+            age = max(0, int(generation) - int(rl_gen))
+            horizon = float(getattr(self.spin, 'period_gens', 16) or 16)
+            rl_recency = float(np.clip(math.exp(-age / max(1.0, horizon * 0.5)), 0.0, 1.0))
+        align = float(np.clip(rl_obj.get('alignment', rl_obj.get('population_reward_alignment', 0.0)), -1.0, 1.0))
+        trend = float(np.clip(rl_obj.get('trend_norm', rl_obj.get('population_reward_trend_norm', 0.0)), -1.0, 1.0))
+        best_norm = float(np.clip(rl_obj.get('best_norm', rl_obj.get('population_reward_best_norm', 0.0)), 0.0, 1.0))
+        pressure = float(np.clip(rl_obj.get('pressure', rl_obj.get('population_reward_pressure', 0.0)), 0.0, 3.0))
+        spread = float(np.clip(rl_obj.get('spread', rl_obj.get('population_reward_spread', 0.0)), 0.0, 2.5))
+        delta = float(rl_obj.get('delta_mean', rl_obj.get('population_reward_delta', 0.0)))
+        mean_val = float(rl_obj.get('mean', rl_obj.get('reward_ema', 0.0)))
+        best_val = float(rl_obj.get('best', mean_val))
+        std_val = rl_obj.get('std')
+        if not isinstance(std_val, (int, float)):
+            reward_var = rl_obj.get('reward_var')
+            if isinstance(reward_var, (int, float)):
+                std_val = float(np.sqrt(max(0.0, reward_var)))
+            else:
+                std_val = 0.0
+        else:
+            std_val = float(std_val)
+        denom = max(1.0, abs(best_val) + std_val)
+        mean_norm = float(np.tanh(mean_val / denom))
+        delta_norm = float(np.tanh(delta / denom))
+        pressure_norm = float(np.clip(pressure / 2.0, 0.0, 1.5))
+        spread_norm = float(np.clip(spread / 2.0, 0.0, 1.5))
+        rl_features = [
+            align,
+            trend,
+            best_norm,
+            pressure_norm,
+            delta_norm,
+            mean_norm,
+            rl_recency,
+            spread_norm,
+        ]
+        rl_len = getattr(self, '_rl_feature_dim', len(rl_features))
+        if len(rl_features) < rl_len:
+            rl_features.extend([0.0] * (rl_len - len(rl_features)))
+        elif len(rl_features) > rl_len:
+            rl_features = rl_features[:rl_len]
+        base.extend(rl_features)
         vec = np.asarray(base, dtype=np.float32)
         if vec.size < self.feature_dim:
             vec = np.pad(vec, (0, self.feature_dim - vec.size))
@@ -12522,6 +12601,29 @@ class SelfReproducingEvaluator:
             if isinstance(val, (int, float)):
                 snapshot[key] = float(val)
         self._diversity_feedback = snapshot
+
+    def update_rl_objective(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            if getattr(self, '_rl_objective', None):
+                self._rl_objective = {}
+                self._rl_objective_generation = -1
+                self.rl_mode = False
+            return
+        merged: Dict[str, Any] = dict(getattr(self, '_rl_objective', {}))
+        for key, val in payload.items():
+            if key == 'generation':
+                try:
+                    merged['generation'] = int(val)
+                except Exception:
+                    continue
+            elif isinstance(val, (int, float)):
+                try:
+                    merged[key] = float(val)
+                except Exception:
+                    continue
+        self._rl_objective = merged
+        self._rl_objective_generation = int(merged.get('generation', getattr(self, '_rl_objective_generation', -1)))
+        self.rl_mode = bool(self._rl_objective)
 
     def _record_resilience(self, err: BaseException, generation: int) -> str:
         label = f'{type(err).__name__}@{generation}'
@@ -12734,30 +12836,88 @@ class SelfReproducingEvaluator:
         spread = float(np.clip(div_state.get('structural_spread', 0.0), 0.0, 4.0))
         entropy_norm = float(max(0.0, div_state.get('entropy_norm', div_state.get('entropy', 0.0))))
         entropy_raw = float(max(0.0, div_state.get('entropy', entropy_norm)))
+        rl_obj = getattr(self, '_rl_objective', {}) or {}
+        rl_gen = int(rl_obj.get('generation', getattr(self, '_rl_objective_generation', -1)))
+        if rl_gen < 0:
+            rl_recency = 0.0
+        else:
+            age = max(0, int(generation) - rl_gen)
+            horizon = float(getattr(self.spin, 'period_gens', 16) or 16)
+            rl_recency = float(np.clip(math.exp(-age / max(1.0, horizon * 0.5)), 0.0, 1.0))
+        reward_alignment = float(np.clip(rl_obj.get('alignment', rl_obj.get('population_reward_alignment', 0.0)), -1.0, 1.0))
+        reward_trend = float(np.clip(rl_obj.get('trend_norm', rl_obj.get('population_reward_trend_norm', 0.0)), -1.0, 1.0))
+        reward_best = float(np.clip(rl_obj.get('best_norm', rl_obj.get('population_reward_best_norm', 0.0)), 0.0, 1.0))
+        reward_pressure = float(np.clip(rl_obj.get('pressure', rl_obj.get('population_reward_pressure', 0.0)), 0.0, 3.0))
+        reward_spread = float(np.clip(rl_obj.get('spread', rl_obj.get('population_reward_spread', 0.0)), 0.0, 2.5))
+        reward_delta = float(rl_obj.get('delta_mean', rl_obj.get('population_reward_delta', 0.0)))
+        reward_mean = float(rl_obj.get('mean', rl_obj.get('reward_ema', 0.0)))
+        denom = max(1.0, abs(float(rl_obj.get('best', reward_mean))) + float(max(0.0, rl_obj.get('std', 0.0))) + reward_spread)
+        reward_mean_norm = float(np.tanh(reward_mean / denom))
+        reward_delta_norm = float(np.tanh(reward_delta / denom))
+        reward_pressure_norm = float(np.clip(reward_pressure / 2.0, 0.0, 1.5))
+        reward_drive = rl_recency * (0.5 + 0.4 * reward_pressure_norm + 0.3 * max(0.0, -reward_trend))
+        reward_focus = rl_recency * (0.4 + 0.6 * reward_best + 0.3 * max(0.0, reward_alignment))
+        self.rl_mode = rl_recency > 0.01 and bool(rl_obj)
+        self.last_reward_alignment = reward_alignment
+        self.last_reward_trend = reward_trend
+        self.last_reward_pressure = reward_pressure_norm
+        self.last_reward_mean = reward_mean_norm
+        try:
+            env.rl_mode = bool(self.rl_mode)
+            env.reward_pressure = reward_pressure
+        except Exception:
+            pass
         share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
-        lazy_pressure = float(np.clip(share * (1.0 + 0.5 * stasis + 0.25 * abs(gap)), 0.0, 1.6))
+        share *= float(np.clip(1.0 - 0.18 * reward_drive, 0.1, 1.0))
+        lazy_pressure = float(
+            np.clip(
+                share * (1.0 + 0.5 * stasis + 0.25 * abs(gap)) + reward_drive * 0.45,
+                0.0,
+                1.8,
+            )
+        )
         prev_noise = float(getattr(env, 'noise', 0.05))
         prev_turns = float(getattr(env, 'turns', 1.6))
         prev_rot = float(getattr(env, 'rot_bias', 0.0))
         scale_noise, scale_turns, scale_rot = self.output_scale
-        scale_noise *= float(1.0 + 0.35 * scarcity + 0.55 * lazy_pressure)
-        scale_turns *= float(1.0 + 0.2 * spread + 0.4 * lazy_pressure)
-        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy_norm) + 0.35 * lazy_pressure)
-        anchor_pull = float(np.clip(0.35 + 0.25 * lazy_pressure, 0.0, 0.85))
-        gap_pull = float(np.clip(0.45 + 0.25 * lazy_pressure, 0.0, 0.9))
-        mod_out0 = float(consensus[0] * (1.0 - anchor_pull) + anchor * anchor_pull)
-        mod_out1 = float(consensus[1] * (1.0 - anchor_pull) + (anchor + gap * 0.5) * anchor_pull)
-        mod_out2 = float(consensus[2] * (1.0 - gap_pull) + gap * gap_pull)
+        scale_noise *= float(1.0 + 0.35 * scarcity + 0.55 * lazy_pressure + 0.25 * reward_drive + 0.15 * abs(reward_alignment) * rl_recency)
+        scale_turns *= float(1.0 + 0.2 * spread + 0.4 * lazy_pressure + 0.2 * reward_focus + 0.12 * abs(reward_delta_norm))
+        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy_norm) + 0.35 * lazy_pressure + 0.2 * reward_drive + 0.1 * reward_spread * rl_recency)
+        anchor_pull = float(np.clip(0.35 + 0.25 * lazy_pressure + 0.15 * reward_focus, 0.0, 0.9))
+        gap_pull = float(np.clip(0.45 + 0.25 * lazy_pressure + 0.2 * reward_drive, 0.0, 0.95))
+        mod_out0 = float(consensus[0] * (1.0 - anchor_pull) + anchor * anchor_pull + reward_alignment * 0.2 * rl_recency)
+        mod_out1 = float(
+            consensus[1] * (1.0 - anchor_pull)
+            + (anchor + gap * 0.5) * anchor_pull
+            + reward_mean_norm * 0.3 * rl_recency
+        )
+        mod_out2 = float(consensus[2] * (1.0 - gap_pull) + gap * gap_pull + reward_delta_norm * 0.35 * rl_recency)
         target_noise = float(np.clip(0.05 + scale_noise * mod_out0, 0.0, 0.25))
         target_turns = float(np.clip(1.6 + scale_turns * mod_out1, 0.6, 3.2))
         rot_target = prev_rot + scale_rot * mod_out2
-        anchor_noise = float(np.clip(0.05 + scale_noise * (anchor + 0.2 * lazy_pressure), 0.0, 0.25))
-        anchor_turns = float(np.clip(1.6 + scale_turns * (anchor + gap * 0.25 + 0.15 * lazy_pressure), 0.6, 3.2))
-        rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6 + 0.2 * lazy_pressure)
-        inertia = float(np.clip(0.25 + 0.6 * share + 0.25 * stasis, 0.0, 0.92))
-        inertia *= float(np.clip(1.0 - 0.35 * scarcity + 0.25 * spread + 0.15 * lazy_pressure, 0.2, 1.1))
+        anchor_noise = float(
+            np.clip(0.05 + scale_noise * (anchor + 0.2 * lazy_pressure + 0.1 * reward_alignment * rl_recency), 0.0, 0.25)
+        )
+        anchor_turns = float(
+            np.clip(
+                1.6 + scale_turns * (anchor + gap * 0.25 + 0.15 * lazy_pressure + 0.2 * reward_mean_norm * rl_recency),
+                0.6,
+                3.2,
+            )
+        )
+        rot_anchor = prev_rot + scale_rot * (
+            anchor * 0.4 + gap * 0.6 + 0.2 * lazy_pressure + 0.25 * reward_delta_norm * rl_recency
+        )
+        inertia = float(np.clip(0.25 + 0.6 * share + 0.25 * stasis + 0.15 * reward_focus, 0.0, 0.92))
+        inertia *= float(
+            np.clip(
+                1.0 - 0.35 * scarcity + 0.25 * spread + 0.15 * lazy_pressure + 0.15 * reward_focus - 0.1 * reward_drive,
+                0.2,
+                1.1,
+            )
+        )
         slip = max(0.0, 1.0 - inertia)
-        anchor_ratio = float(np.clip(0.3 + 0.4 * stasis + 0.3 * lazy_pressure, 0.0, 0.95))
+        anchor_ratio = float(np.clip(0.3 + 0.4 * stasis + 0.3 * lazy_pressure + 0.2 * reward_focus - 0.15 * reward_drive, 0.0, 0.95))
         anchor_mix = min(slip, slip * anchor_ratio)
         leader_mix = slip - anchor_mix
         env.noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
@@ -12774,16 +12934,29 @@ class SelfReproducingEvaluator:
             + 0.5 * abs(rot_blend - prev_rot)
             + dispersion
             + 1.2 * lazy_pressure
+            + 0.8 * reward_drive
+            + 0.6 * abs(reward_delta_norm)
         )
-        selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - 0.6 * share))
+        selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - 0.6 * share) + 0.25 * reward_drive)
         advantage_score = float(
             np.clip(
-                selfish_drive * (max(0.0, gap) + 0.35 * scarcity + 0.25 * lazy_pressure) * (0.5 + env_shift),
+                selfish_drive
+                * (max(0.0, gap) + 0.35 * scarcity + 0.25 * lazy_pressure + 0.3 * reward_focus)
+                * (0.5 + env_shift + 0.7 * reward_drive),
                 0.0,
-                3.0,
+                3.5,
             )
         )
-        altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0))
+        altruism_signal = float(
+            np.clip(
+                1.0
+                - min(1.0, advantage_score)
+                + 0.15 * reward_alignment * rl_recency
+                - 0.1 * reward_pressure_norm,
+                0.0,
+                1.0,
+            )
+        )
         resilience_flag = ''
         if resilience_marks:
             uniq = list(dict.fromkeys(resilience_marks))
@@ -12831,6 +13004,11 @@ class SelfReproducingEvaluator:
             summary = f'{summary} | lazyP {lazy_pressure:.2f}'
         if advantage_score > 0.05:
             summary = f'{summary} | adv {advantage_score:.2f}'
+        if rl_recency > 0.0:
+            summary = (
+                f"{summary} | reward μ{reward_mean_norm:+.2f} trend {reward_trend:+.2f} "
+                f"P{reward_pressure_norm:.2f} align {reward_alignment:+.2f}"
+            )
         self.last_event = summary
         return {
             'genome_id': parent.id,
@@ -12842,6 +13020,11 @@ class SelfReproducingEvaluator:
             'altruism_signal': altruism_signal,
             'council_size': len(all_ids),
             'council_dispersion': dispersion,
+            'reward_alignment': reward_alignment,
+            'reward_trend': reward_trend,
+            'reward_pressure': reward_pressure,
+            'reward_recency': rl_recency,
+            'reward_mean_norm': reward_mean_norm,
         }
 
     def step(
@@ -13082,12 +13265,14 @@ class SpinorNomologyDatasetController:
         self.mandatory_mode = bool(mandatory_mode)
         embed_dim = self.spin.group.embed_dim if self.spin.group else 0
         self._context_dim = 7
+        self._rl_feature_dim = 8
         self.feature_dim = 5 + embed_dim + self._context_dim
-        self.evaluator_feature_dim = 12 + embed_dim
+        self.evaluator_feature_dim = 12 + embed_dim + self._rl_feature_dim
         self.last_bundle: Optional[Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]] = None
         self.lazy_feedback_smoothing = 0.4
         self._lazy_feedback: Dict[str, Any] = {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0}
         self._diversity_state: Dict[str, Any] = {'generation': -1}
+        self._rl_objective: Dict[str, Any] = {'generation': -1}
         self.last_evaluator_meta: Optional[Dict[str, Any]] = None
         try:
             self.env.lazy_share = 0.0
@@ -13245,6 +13430,38 @@ class SpinorNomologyDatasetController:
         if self.telemetry is not None and hasattr(self.telemetry, 'log_diversity'):
             try:
                 self.telemetry.log_diversity(generation, snapshot)
+            except Exception:
+                pass
+
+    def update_rl_objective(self, generation: int, snapshot: Dict[str, Any]) -> None:
+        if not isinstance(snapshot, dict):
+            self._rl_objective = {'generation': -1}
+            if self.evaluator is not None and hasattr(self.evaluator, 'update_rl_objective'):
+                try:
+                    self.evaluator.update_rl_objective({})
+                except Exception:
+                    pass
+            return
+        payload: Dict[str, Any] = {'generation': int(generation)}
+        keys = (
+            'alignment',
+            'trend_norm',
+            'best_norm',
+            'pressure',
+            'spread',
+            'delta_mean',
+            'mean',
+            'best',
+            'std',
+        )
+        for key in keys:
+            val = snapshot.get(key)
+            if isinstance(val, (int, float)):
+                payload[key] = float(val)
+        self._rl_objective = payload
+        if self.evaluator is not None and hasattr(self.evaluator, 'update_rl_objective'):
+            try:
+                self.evaluator.update_rl_objective(payload)
             except Exception:
                 pass
 
