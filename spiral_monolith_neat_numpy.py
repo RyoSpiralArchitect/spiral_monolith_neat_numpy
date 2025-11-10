@@ -311,6 +311,71 @@ gamma = clamp(
 _RL_SCHED_PROGRAM_CACHE: Dict[str, Any] = {}
 
 
+_MONODROMY_COEFF_DEFAULTS: Dict[str, float] = {
+    'growth_scale': 1.0,
+    'slump_scale': 1.0,
+    'relief_scale': 1.0,
+    'div_scale': 1.0,
+    'grace_scale': 1.0,
+    'noise_scale': 1.0,
+    'top3_scale': 1.0,
+    'family_share_scale': 1.0,
+    'family_share_cap': 3.5,
+    'family_trend_gain': 0.5,
+    'family_trend_low': 0.5,
+    'family_trend_high': 1.8,
+    'family_median_gain': 0.45,
+    'family_spread_gain': 0.25,
+    'family_cap': 6.0,
+}
+
+
+_MONODROMY_DSL_TEMPLATE = """
+// cpp-ish DSL for monodromy penalties.
+// Inputs: base, range_amp, osc, envelope, growth_weight, momentum,
+//         span_scale, slump_gain, relief_gain, div_factor, grace_factor,
+//         noise_factor, top3_multiplier, family_weight, surplus_ratio,
+//         share_delta, family_count, family_median, median, family_spread.
+span_scale = max(span_scale, 1e-9)
+target = (base + range_amp * osc) * envelope
+if growth_weight > 0.0:
+    grow = math.tanh(max(0.0, momentum) / span_scale)
+    target *= max(0.0, 1.0 - growth_weight * {growth_scale} * grow)
+else:
+    grow = 0.0
+if slump_gain > 0.0:
+    slump = math.tanh(max(0.0, -momentum) / span_scale)
+    target *= 1.0 + slump_gain * {slump_scale} * slump
+else:
+    slump = 0.0
+if relief_gain > 0.0:
+    target *= max(0.0, 1.0 - {relief_scale} * relief_gain)
+target *= div_factor * {div_scale}
+target *= grace_factor * {grace_scale}
+target *= noise_factor * {noise_scale}
+target *= top3_multiplier * {top3_scale}
+family_factor = 1.0
+if family_weight > 0.0:
+    share_factor = 1.0 + family_weight * {family_share_scale} * min({family_share_cap}, max(0.0, surplus_ratio))
+    trend_factor = clamp(
+        1.0 + {family_trend_gain} * family_weight * share_delta * max(1, family_count),
+        {family_trend_low},
+        {family_trend_high}
+    )
+    median_delta = max(0.0, (family_median - median) / span_scale)
+    median_factor = 1.0 + {family_median_gain} * family_weight * median_delta
+    spread_norm = 0.0
+    if span_scale > 0.0:
+        spread_norm = clamp(1.0 - min(1.0, family_spread / max(span_scale, 1e-9)), 0.0, 1.0)
+    spread_factor = 1.0 + {family_spread_gain} * family_weight * spread_norm
+    family_factor = clamp(share_factor * trend_factor * median_factor * spread_factor, 1.0, {family_cap})
+target *= family_factor
+"""
+
+
+_MONODROMY_PROGRAM_CACHE: Dict[str, Any] = {}
+
+
 def _rl_default_meta() -> Dict[str, Any]:
     return {
         'reward_ema': 0.0,
@@ -647,6 +712,115 @@ def _rl_run_scheduler_program(state: Dict[str, Any], program: str) -> Optional[D
         except Exception:
             return None
     return result
+
+
+def _monodromy_sanitise_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_MONODROMY_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _MONODROMY_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            if key.endswith('_cap'):
+                val = float(np.clip(val, 0.5, 64.0))
+            elif key.endswith('_low'):
+                val = float(np.clip(val, 0.0, 10.0))
+            elif key.endswith('_high'):
+                val = float(np.clip(val, 0.0, 16.0))
+            base[key] = val
+    low = base['family_trend_low']
+    high = base['family_trend_high']
+    if low > high:
+        base['family_trend_low'], base['family_trend_high'] = float(high), float(low)
+    return base
+
+
+def _monodromy_program_for(neat_inst: 'ReproPlanaNEATPlus') -> str:
+    template = getattr(neat_inst, 'monodromy_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _MONODROMY_DSL_TEMPLATE
+        neat_inst.monodromy_program_template = template
+    coeffs = getattr(neat_inst, 'monodromy_program_coeffs', None)
+    if not isinstance(coeffs, dict):
+        coeffs = dict(_MONODROMY_COEFF_DEFAULTS)
+        neat_inst.monodromy_program_coeffs = coeffs
+    else:
+        coeffs = _monodromy_sanitise_coeffs(coeffs)
+        neat_inst.monodromy_program_coeffs = coeffs
+    formatted = {}
+    for key, default in _MONODROMY_COEFF_DEFAULTS.items():
+        val = coeffs.get(key, default)
+        try:
+            val = float(val)
+        except Exception:
+            val = default
+        if not np.isfinite(val):
+            val = default
+        formatted[key] = repr(val)
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        program = _MONODROMY_DSL_TEMPLATE.format(
+            **{k: repr(v) for k, v in _MONODROMY_COEFF_DEFAULTS.items()}
+        )
+    return program
+
+
+def _monodromy_compile_program(program: str):
+    cached = _MONODROMY_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty monodromy program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<monodromy_program>', 'exec')
+    _MONODROMY_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _monodromy_prepare_executor(neat_inst: 'ReproPlanaNEATPlus') -> Optional[Any]:
+    dirty = bool(getattr(neat_inst, '_monodromy_program_dirty', True))
+    program = getattr(neat_inst, '_monodromy_program_source', None)
+    if dirty or not isinstance(program, str) or not program.strip():
+        program = _monodromy_program_for(neat_inst)
+        neat_inst._monodromy_program_source = program
+        neat_inst._monodromy_program_dirty = False
+    try:
+        compiled = _monodromy_compile_program(program)
+    except Exception:
+        return None
+    return compiled
+
+
+def _monodromy_run_program(compiled: Any, state: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    target = locals_dict.get('target')
+    family_factor = locals_dict.get('family_factor')
+    if target is None or family_factor is None:
+        return None
+    try:
+        return {
+            'target': float(target),
+            'family_factor': float(family_factor),
+        }
+    except Exception:
+        return None
 
 
 def _stack_replay_observations(obs_list: Sequence[np.ndarray]) -> np.ndarray:
@@ -3424,6 +3598,10 @@ class ReproPlanaNEATPlus:
         self.rl_param_mutation_rate = 0.35
         self._rl_collective_objective: Dict[str, float] = {}
         self._rl_collective_history: deque = deque(maxlen=64)
+        self.monodromy_program_template: str = _MONODROMY_DSL_TEMPLATE
+        self.monodromy_program_coeffs: Dict[str, float] = dict(_MONODROMY_COEFF_DEFAULTS)
+        self._monodromy_program_source: Optional[str] = None
+        self._monodromy_program_dirty: bool = True
         nodes = {}
         for i in range(num_inputs):
             nodes[i] = NodeGene(i, 'input', 'identity')
@@ -5682,6 +5860,7 @@ class ReproPlanaNEATPlus:
         if baseline_arr.size == 0:
             _reset_snapshot()
             return list(fitnesses)
+        monodromy_executor = _monodromy_prepare_executor(self)
         overrides = getattr(self, 'monodromy_noise_style_overrides', None)
         controller = getattr(self, 'spinor_controller', None)
         env_obj = getattr(controller, 'env', None) if controller is not None else None
@@ -5952,19 +6131,6 @@ class ReproPlanaNEATPlus:
             raw_envelope = (stasis + envelope_bias) / max(1.0, span)
             envelope = float(min(envelope_cap, max(envelope_floor, raw_envelope)))
             osc = 0.5 - 0.5 * math.cos(2.0 * math.pi * phase)
-            target = (base + rng * osc) * envelope
-            if growth_weight > 0.0:
-                grow = math.tanh(max(0.0, momentum) / span_scale_safe)
-                target *= max(0.0, 1.0 - growth_weight * grow)
-            if slump_gain > 0.0:
-                slump = math.tanh(max(0.0, -momentum) / span_scale_safe)
-                target *= 1.0 + slump_gain * slump
-            if relief_gain > 0.0:
-                target *= max(0.0, 1.0 - relief_gain)
-            target *= div_factor
-            target *= grace_factor
-            target *= noise_factor
-            target *= top3_multiplier
             info = family_metrics.get(family_id) if family_metrics else None
             members = family_members.get(family_id, tuple())
             if info:
@@ -6003,22 +6169,64 @@ class ReproPlanaNEATPlus:
             state['family_spread'] = float(family_spread)
             state['family_share_delta'] = float(share_delta)
             state['family_surplus_ratio'] = float(surplus_ratio)
-            family_factor = 1.0
-            if family_weight > 0.0:
-                share_factor = 1.0 + family_weight * min(3.5, max(0.0, surplus_ratio))
-                trend_factor = float(np.clip(1.0 + 0.5 * family_weight * share_delta * max(1, len(family_counts)), 0.5, 1.8))
-                median_factor = 1.0 + 0.45 * family_weight * max(0.0, (family_median - median) / span_scale_safe)
-                if span_scale_safe > 0.0:
-                    spread_norm = float(np.clip(1.0 - min(1.0, family_spread / max(span_scale_safe, 1e-9)), 0.0, 1.0))
-                else:
-                    spread_norm = 0.0
-                spread_factor = 1.0 + 0.25 * family_weight * spread_norm
-                family_factor = float(np.clip(share_factor * trend_factor * median_factor * spread_factor, 1.0, 6.0))
-            state['family_factor'] = family_factor
+            dsl_result: Optional[Dict[str, float]] = None
+            if monodromy_executor is not None:
+                dsl_state = {
+                    'base': float(base),
+                    'range_amp': float(rng),
+                    'osc': float(osc),
+                    'envelope': float(envelope),
+                    'growth_weight': float(growth_weight),
+                    'momentum': float(momentum),
+                    'span_scale': float(span_scale_safe),
+                    'slump_gain': float(slump_gain),
+                    'relief_gain': float(relief_gain),
+                    'div_factor': float(div_factor),
+                    'grace_factor': float(grace_factor),
+                    'noise_factor': float(noise_factor),
+                    'top3_multiplier': float(top3_multiplier),
+                    'family_weight': float(family_weight),
+                    'surplus_ratio': float(surplus_ratio),
+                    'share_delta': float(share_delta),
+                    'family_count': int(len(family_counts)),
+                    'family_median': float(family_median),
+                    'median': float(median),
+                    'family_spread': float(family_spread),
+                }
+                dsl_result = _monodromy_run_program(monodromy_executor, dsl_state)
+            if dsl_result is None:
+                target = (base + rng * osc) * envelope
+                if growth_weight > 0.0:
+                    grow = math.tanh(max(0.0, momentum) / span_scale_safe)
+                    target *= max(0.0, 1.0 - growth_weight * grow)
+                if slump_gain > 0.0:
+                    slump = math.tanh(max(0.0, -momentum) / span_scale_safe)
+                    target *= 1.0 + slump_gain * slump
+                if relief_gain > 0.0:
+                    target *= max(0.0, 1.0 - relief_gain)
+                target *= div_factor
+                target *= grace_factor
+                target *= noise_factor
+                target *= top3_multiplier
+                family_factor = 1.0
+                if family_weight > 0.0:
+                    share_factor = 1.0 + family_weight * min(3.5, max(0.0, surplus_ratio))
+                    trend_factor = float(np.clip(1.0 + 0.5 * family_weight * share_delta * max(1, len(family_counts)), 0.5, 1.8))
+                    median_factor = 1.0 + 0.45 * family_weight * max(0.0, (family_median - median) / span_scale_safe)
+                    if span_scale_safe > 0.0:
+                        spread_norm = float(np.clip(1.0 - min(1.0, family_spread / max(span_scale_safe, 1e-9)), 0.0, 1.0))
+                    else:
+                        spread_norm = 0.0
+                    spread_factor = 1.0 + 0.25 * family_weight * spread_norm
+                    family_factor = float(np.clip(share_factor * trend_factor * median_factor * spread_factor, 1.0, 6.0))
+                target *= family_factor
+            else:
+                target = float(dsl_result.get('target', 0.0))
+                family_factor = float(dsl_result.get('family_factor', 1.0))
+            state['family_factor'] = float(family_factor)
             family_factor_total += family_factor
             if family_factor > family_factor_max:
                 family_factor_max = family_factor
-            target *= family_factor
             pressure_prev = float(state.get('pressure', 0.0))
             pressure = pressure_prev * (1.0 - smoothing) + target * smoothing
             state['pressure'] = pressure
