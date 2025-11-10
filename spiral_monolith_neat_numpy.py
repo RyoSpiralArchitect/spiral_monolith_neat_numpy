@@ -7652,9 +7652,19 @@ class ReproPlanaNEATPlus:
                 lazy_share = float(lazy_payload.get('share', 0.0)) if isinstance(lazy_payload, dict) else 0.0
                 adaptive_multiplier = 1.0 + 0.65 * diversity_scarcity + 0.25 * env_noise + 0.18 * env_focus + 0.35 * structural_spread
                 adaptive_multiplier = float(np.clip(adaptive_multiplier, 0.5, 3.5))
-                div_bonus_scale = float(base_div_bonus * adaptive_multiplier)
+                scarcity_push = 1.0 + 1.5 * diversity_scarcity + 0.4 * max(0.0, env_entropy)
+                focus_push = 1.0 + 0.6 * max(0.0, env_focus)
+                div_bonus_scale = float(base_div_bonus * adaptive_multiplier * scarcity_push * focus_push)
+                if base_div_bonus > 0.0:
+                    upper_cap = float(max(base_div_bonus * 8.0, base_div_bonus + 0.5))
+                    div_bonus_scale = float(np.clip(div_bonus_scale, base_div_bonus * 0.2, upper_cap))
+                    if diversity_scarcity > 0.2:
+                        div_bonus_scale = float(max(div_bonus_scale, base_div_bonus * (0.6 + 1.4 * diversity_scarcity)))
                 div_power = float(np.clip(base_div_power * (1.0 + 0.5 * diversity_scarcity), 1.0, 3.5))
                 household_pressure = float(self._household_pressure())
+                div_bonus_total = 0.0
+                div_bonus_max = 0.0
+                div_bonus_count = 0
                 diversity_snapshot = {
                     'gen': int(gen),
                     'entropy': float(diversity_entropy_raw),
@@ -7664,6 +7674,7 @@ class ReproPlanaNEATPlus:
                     'complexity_std': float(complexity_std),
                     'structural_spread': float(structural_spread),
                     'diversity_bonus': float(div_bonus_scale),
+                    'diversity_bonus_scale': float(div_bonus_scale),
                     'diversity_power': float(div_power),
                     'env_noise': float(env_noise),
                     'env_focus': float(env_focus),
@@ -7772,7 +7783,12 @@ class ReproPlanaNEATPlus:
                             rarity = 1.0 / max(1.0, freq)
                             if div_power != 1.0:
                                 rarity = float(rarity ** div_power)
-                            f2 += div_bonus_scale * rarity
+                            bonus_contrib = float(div_bonus_scale * rarity)
+                            div_bonus_total += bonus_contrib
+                            if bonus_contrib > div_bonus_max:
+                                div_bonus_max = bonus_contrib
+                            div_bonus_count += 1
+                            f2 += bonus_contrib
                     if (
                         comp_bonus_scale > 0.0
                         and max_complexity_score > 0.0
@@ -7793,6 +7809,11 @@ class ReproPlanaNEATPlus:
                     if not np.isfinite(f2):
                         f2 = float(np.nan_to_num(f2, nan=-1000000.0, posinf=-1000000.0, neginf=-1000000.0))
                     fitnesses.append(f2)
+                div_bonus_mean = float(div_bonus_total / max(1, div_bonus_count)) if div_bonus_count else 0.0
+                diversity_snapshot['diversity_bonus_total'] = float(div_bonus_total)
+                diversity_snapshot['diversity_bonus_mean'] = float(div_bonus_mean)
+                diversity_snapshot['diversity_bonus_max'] = float(div_bonus_max)
+                diversity_snapshot['diversity_bonus_count'] = int(div_bonus_count)
                 baseline_fitnesses = list(fitnesses)
                 self._apply_selfish_leader_guard(fitnesses, baseline_fitnesses, gen)
                 family_metrics: Dict[int, Dict[str, Any]] = {}
@@ -13568,6 +13589,10 @@ class NomologyEnv:
     noise_style_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     fft_retention: int = 3
     last_fft_payload: Dict[str, Any] = field(default_factory=dict)
+    fft_events_total: int = 0
+    fft_idle_steps: int = 0
+    fft_idle_limit: int = 6
+    last_fft_reason: str = ''
     _noise_counter: float = field(default=0.0, init=False, repr=False)
     _last_weaver_error: Optional[str] = field(default=None, init=False, repr=False)
     _fft_decay: int = field(default=0, init=False, repr=False)
@@ -13606,6 +13631,9 @@ class NomologyEnv:
         self.last_advantage_penalty = False
         self._fft_decay = 0
         self.last_fft_payload = {}
+        self.fft_events_total = 0
+        self.fft_idle_steps = 0
+        self.last_fft_reason = ''
 
     def noise_style(self, kind: Optional[str]=None) -> Dict[str, Any]:
         target = kind or self.noise_kind
@@ -13693,6 +13721,16 @@ class NomologyEnv:
         spread = float(np.clip(payload.get('structural_spread', 0.0), 0.0, 4.0))
         self.intensity = float(np.clip(self.intensity * (0.94 + 0.32 * scarcity), 0.05, 1.1))
         self.noise_jitter = float(np.clip(self.noise_jitter * (1.0 + 0.2 * spread), 0.001, 0.065))
+        bonus_mean = float(max(payload.get('diversity_bonus_mean', 0.0), 0.0))
+        bonus_total = float(max(payload.get('diversity_bonus_total', 0.0), 0.0))
+        if bonus_mean > 0.0 or bonus_total > 0.0:
+            self.intensity = float(np.clip(self.intensity * (1.0 + 0.04 * bonus_mean) + 0.006 * bonus_total, 0.05, 1.2))
+        profile = getattr(self, 'noise_profile', None)
+        if isinstance(profile, dict):
+            profile['diversity_bonus'] = float(payload.get('diversity_bonus', 0.0))
+            profile['diversity_bonus_mean'] = bonus_mean
+            profile['diversity_bonus_total'] = bonus_total
+            profile['diversity_bonus_scale'] = float(payload.get('diversity_bonus_scale', payload.get('diversity_bonus', 0.0)))
 
     def _refresh_noise(self, advance: bool=False, surge: bool=False, allow_fft: bool=True) -> None:
         if advance:
@@ -13742,6 +13780,7 @@ class NomologyEnv:
         self.noise = std
         self.noise_kind = kind
         self.noise_profile = profile
+        fft_triggered = False
         if allow_fft:
             focus_term = float(np.clip(getattr(self, 'noise_focus', 0.0), 0.0, 2.5))
             entropy_term = float(np.clip(getattr(self, 'noise_entropy', 0.0), 0.0, 3.5))
@@ -13769,6 +13808,42 @@ class NomologyEnv:
                     ambient_strength *= 1.08
                 reason = 'ambient_fft_surge' if surge else 'ambient_fft'
                 self.trigger_fft_spike(strength=ambient_strength, reason=reason)
+                fft_triggered = True
+            idle_limit = int(max(2, getattr(self, 'fft_idle_limit', 6)))
+            if not fft_triggered:
+                self.fft_idle_steps = int(getattr(self, 'fft_idle_steps', 0)) + 1
+                if self.fft_idle_steps >= idle_limit:
+                    forced_strength = float(
+                        np.clip(
+                            0.65
+                            + 0.45 * float(self.intensity)
+                            + 0.18 * focus_term
+                            + 0.09 * entropy_term,
+                            0.5,
+                            2.8,
+                        )
+                    )
+                    reason = 'forced_fft_idle'
+                    self.trigger_fft_spike(strength=forced_strength, reason=reason)
+                    fft_triggered = True
+                    self.last_fft_reason = reason
+                    self.fft_idle_steps = 0
+            else:
+                self.fft_idle_steps = 0
+            profile_ref = self.noise_profile if isinstance(self.noise_profile, dict) else None
+            if profile_ref is not None:
+                profile_ref['fft_events_total'] = int(getattr(self, 'fft_events_total', 0))
+                profile_ref['fft_idle_steps'] = int(getattr(self, 'fft_idle_steps', 0))
+                if not fft_triggered:
+                    profile_ref.pop('fft_active', None)
+            if isinstance(self.last_fft_payload, dict) and self.last_fft_payload:
+                self.last_fft_payload['fft_idle_steps'] = int(getattr(self, 'fft_idle_steps', 0))
+                if not fft_triggered:
+                    self.last_fft_payload.pop('fft_active', None)
+        else:
+            self.fft_idle_steps = int(getattr(self, 'fft_idle_steps', 0))
+        if isinstance(self.noise_profile, dict):
+            profile = self.noise_profile
         style = self.noise_style(kind)
         self.noise_kind_label = style.get('label', kind)
         self.noise_kind_symbol = style.get('symbol', kind[:1].upper() if kind else '?')
@@ -13857,6 +13932,9 @@ class NomologyEnv:
         self.intensity = float(np.clip(self.intensity * (1.12 + 0.25 * strength) + 0.025, 0.05, 1.12))
         self.regime_id = int(self.regime_id + 1)
         self._refresh_noise(advance=True, surge=True, allow_fft=False)
+        self.fft_events_total = int(getattr(self, 'fft_events_total', 0)) + 1
+        self.fft_idle_steps = 0
+        self.last_fft_reason = reason
         payload = {
             'strength': float(strength),
             'peak': float(peak),
@@ -13864,15 +13942,21 @@ class NomologyEnv:
             'entropy': float(self.noise_entropy),
             'reason': reason,
             'regime_id': int(self.regime_id),
+            'events_total': int(self.fft_events_total),
         }
         self.noise_profile['fft_peak'] = float(peak)
         self.noise_profile['fft_entropy'] = float(self.noise_entropy)
         self.noise_profile['fft_reason'] = reason
         self.noise_profile['fft_stamp'] = time.time()
         self.noise_profile['fft_strength'] = float(strength)
+        self.noise_profile['fft_events_total'] = int(self.fft_events_total)
+        self.noise_profile['fft_idle_steps'] = int(self.fft_idle_steps)
+        self.noise_profile['fft_active'] = True
         retention = int(max(1, getattr(self, 'fft_retention', 1)))
         payload['timestamp'] = time.time()
         payload['steps_left'] = int(retention)
+        payload['fft_idle_steps'] = int(self.fft_idle_steps)
+        payload['fft_active'] = True
         self.last_fft_payload = dict(payload)
         self._fft_decay = int(retention)
         return payload
@@ -14651,7 +14735,7 @@ class Telemetry:
     def __init__(self, tel_csv: str, regime_csv: str) -> None:
         self.tel_csv = tel_csv
         self.reg_csv = regime_csv
-        expected_cols = 34
+        expected_cols = 38
         if os.path.exists(self.tel_csv):
             try:
                 with open(self.tel_csv, 'r', newline='') as f:
@@ -14690,6 +14774,10 @@ class Telemetry:
                     'fft_peak',
                     'fft_entropy',
                     'fft_reason',
+                    'fft_strength',
+                    'fft_active',
+                    'fft_events_total',
+                    'fft_idle_steps',
                     'turns',
                     'rot_bias',
                     'group_idx',
@@ -14718,12 +14806,23 @@ class Telemetry:
                     'complexity_std',
                     'structural_spread',
                     'diversity_bonus',
+                    'diversity_bonus_scale',
                     'diversity_power',
                     'env_noise',
                     'env_focus',
                     'env_entropy',
                     'lazy_share',
                     'unique_signatures',
+                    'family_entropy',
+                    'top_family_share',
+                    'family_count',
+                    'family_surplus_ratio_max',
+                    'family_surplus_ratio_mean',
+                    'household_pressure',
+                    'diversity_bonus_total',
+                    'diversity_bonus_mean',
+                    'diversity_bonus_max',
+                    'diversity_bonus_count',
                     'build_id',
                 ])
 
@@ -14770,6 +14869,10 @@ class Telemetry:
         fft_peak = float('nan')
         fft_entropy = float('nan')
         fft_reason = ''
+        fft_strength = float('nan')
+        fft_active_flag = False
+        fft_events_total = int(getattr(env, 'fft_events_total', 0))
+        fft_idle_steps = int(getattr(env, 'fft_idle_steps', 0))
         fft_source: Optional[Dict[str, Any]] = profile if isinstance(profile, dict) else None
         if not fft_source or (
             'fft_peak' not in fft_source
@@ -14796,11 +14899,31 @@ class Telemetry:
             strength_val = fft_source.get('fft_strength', fft_source.get('strength'))
             if strength_val is not None:
                 try:
+                    fft_strength = float(strength_val)
                     strength_str = f"s={float(strength_val):.2f}"
                 except Exception:
+                    fft_strength = float('nan')
                     strength_str = ''
                 if strength_str:
                     fft_reason = f"{fft_reason}|{strength_str}" if fft_reason else strength_str
+            events_val = fft_source.get('events_total')
+            if events_val is not None:
+                try:
+                    fft_events_total = int(events_val)
+                except Exception:
+                    pass
+            idle_val = fft_source.get('fft_idle_steps', fft_source.get('idle_steps'))
+            if idle_val is not None:
+                try:
+                    fft_idle_steps = int(idle_val)
+                except Exception:
+                    pass
+            if fft_source.get('fft_active'):
+                fft_active_flag = True
+            if not fft_active_flag and fft_source.get('steps_left', 0):
+                fft_active_flag = True
+        if not fft_active_flag and getattr(env, '_fft_decay', 0):
+            fft_active_flag = True
         lazy_share = float(getattr(env, 'lazy_share', 0.0))
         lazy_anchor = float(getattr(env, 'lazy_anchor', 0.0))
         lazy_gap = float(getattr(env, 'lazy_gap', 0.0))
@@ -14829,6 +14952,10 @@ class Telemetry:
                 fft_peak,
                 fft_entropy,
                 fft_reason,
+                fft_strength,
+                int(1 if fft_active_flag else 0),
+                fft_events_total,
+                fft_idle_steps,
                 env.turns,
                 env.rot_bias,
                 '' if group_idx is None else int(group_idx),
@@ -14858,12 +14985,23 @@ class Telemetry:
             float(metrics.get('complexity_std', float('nan'))),
             float(metrics.get('structural_spread', float('nan'))),
             float(metrics.get('diversity_bonus', float('nan'))),
+            float(metrics.get('diversity_bonus_scale', metrics.get('diversity_bonus', float('nan')))),
             float(metrics.get('diversity_power', float('nan'))),
             float(metrics.get('env_noise', float('nan'))),
             float(metrics.get('env_focus', float('nan'))),
             float(metrics.get('env_entropy', float('nan'))),
             float(metrics.get('lazy_share', float('nan'))),
             int(metrics.get('unique_signatures', -1)),
+            float(metrics.get('family_entropy', float('nan'))),
+            float(metrics.get('top_family_share', float('nan'))),
+            int(metrics.get('family_count', -1)),
+            float(metrics.get('family_surplus_ratio_max', float('nan'))),
+            float(metrics.get('family_surplus_ratio_mean', float('nan'))),
+            float(metrics.get('household_pressure', float('nan'))),
+            float(metrics.get('diversity_bonus_total', float('nan'))),
+            float(metrics.get('diversity_bonus_mean', float('nan'))),
+            float(metrics.get('diversity_bonus_max', float('nan'))),
+            int(metrics.get('diversity_bonus_count', -1)),
             _build_stamp_short(),
         ]
         with open(self.div_csv, 'a', newline='') as f:
