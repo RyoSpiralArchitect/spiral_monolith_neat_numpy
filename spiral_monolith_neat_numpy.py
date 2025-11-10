@@ -16,6 +16,20 @@
 # • Tunable: tweak council weights, lazy pressure, or mandatory policies inline and re-run instantly.
 #   調整容易: 合議制ウェイトや怠惰個体圧、mandatory ポリシーをその場で書き換えすぐ検証できます。
 #
+# Reinforcement learning & DSL accelerations / RL 強化と DSL 高速化
+# • Meta-RL: genomes evolve learning rates, discount factors, entropy pushes, replay limits,
+#   and cooperative retirement heuristics that react to team-wide reward telemetry.
+#   メタ RL: ゲノムが学習率・割引率・エントロピー押し・リプレイ上限・協調的リタイア判定を
+#   集団全体の報酬テレメトリに連動させて進化させます。
+# • Replay DSL: cpp 風 DSL で優先度付き経験リプレイや集団利他シグナル、スケジューラを
+#   一度コンパイルして NumPy で高速評価します。
+#   リプレイ DSL: cpp ライクな DSL で優先度付きリプレイ／利他シグナル／スケジューラを
+#   事前コンパイルし NumPy と共に実行して高速化します。
+# • Advantage-weighted replay: GAE-smoothed returns feed sample-weighted policy cloning
+#   so agents improve under harsh council pressure without collapsing exploration.
+#   アドバンテージ重み付きリプレイ: GAE 平滑化報酬とサンプル重み学習で、過酷な評議会圧の下でも
+#   探索を維持したまま方策を強化します。
+#
 # Systems overview / システム概要
 # 1. Genome & caches / ゲノムとキャッシュ
 #    • `NodeGene` / `ConnectionGene` / `Genome` encode graph-structured policies with
@@ -153,6 +167,1767 @@ _MONODROMY_TOGGLE_PARAMS: Tuple[str, ...] = (
     'monodromy_noise_weight',
     'monodromy_family_weight',
 )
+
+_DEFAULT_RL_MEMORY_LIMIT = 2048
+_RL_MEMORY_LIMIT_MIN = 128
+_RL_MEMORY_LIMIT_MAX = 16384
+_RL_META_ALPHA = 0.3
+_RL_META_VAR_ALPHA = 0.18
+_RL_SUCCESS_ARCHIVE_LIMIT = 512
+_RL_SUCCESS_ALPHA = 0.3
+
+_RL_WEIGHT_COEFF_DEFAULTS: Dict[str, float] = {
+    'novel_bias': 0.5,
+    'novel_scale': 1.0,
+    'priority_gain': 0.35,
+    'recency_scale': 1.0,
+    'entropy_gain': 0.05,
+    'stability_gain': 0.1,
+    'advantage_gain': 0.45,
+    'success_gain': 0.2,
+}
+
+_RL_WEIGHT_DSL_TEMPLATE = """
+// cpp-ish DSL: statements end with ';', clamp(x, lo, hi) is available.
+weights = ret_weights.copy();
+weights += novelty_gain * ({novel_bias} + novelty * {novel_scale});
+weights += priority * {priority_gain};
+weights += recency_gain * recency * {recency_scale};
+weights += entropy * {entropy_gain};
+weights += (1.0 - stability) * {stability_gain};
+weights += advantage * {advantage_gain};
+weights += success_rate * {success_gain};
+weights = clamp(weights, 1e-8, None);
+"""
+
+_RL_WEIGHT_PROGRAM_CACHE: Dict[str, Any] = {}
+
+_RL_SIGNAL_COEFF_DEFAULTS: Dict[str, float] = {
+    'stress_bias': 0.35,
+    'stress_instability': 0.45,
+    'stress_trend': 0.2,
+    'stress_done': 0.15,
+    'stress_team': 0.25,
+    'stress_success': 0.3,
+    'altruism_base': 0.4,
+    'altruism_stability': 0.4,
+    'altruism_relief': 0.2,
+    'altruism_novelty': 0.15,
+    'altruism_team': 0.25,
+    'altruism_success': 0.25,
+    'solidarity_base': 0.3,
+    'solidarity_stability': 0.4,
+    'solidarity_lazy': 0.15,
+    'solidarity_done_relief': 0.15,
+    'solidarity_team': 0.2,
+    'solidarity_success': 0.2,
+    'advantage_base': 0.45,
+    'advantage_trend': 0.35,
+    'advantage_span': 0.25,
+    'advantage_novelty': 0.1,
+    'advantage_team': 0.2,
+    'advantage_best': 0.12,
+    'team_objective_bias': 0.1,
+    'team_objective_alignment': 0.45,
+    'team_objective_trend': 0.28,
+    'team_objective_pressure': 0.5,
+    'team_objective_best': 0.26,
+    'team_objective_span': 0.22,
+    'team_objective_success': 0.25,
+}
+
+_RL_SIGNAL_DSL_TEMPLATE = """
+// cpp-ish DSL for collective signal synthesis.
+stress = clamp(
+    {stress_bias}
+    + {stress_instability} * (1.0 - stability)
+    + {stress_trend} * abs(trend_norm)
+    + {stress_done} * done_ratio
+    + {stress_team} * team_pressure
+    - {stress_success} * success_rate,
+    0.0,
+    1.0
+);
+altruism_target = clamp(
+    {altruism_base}
+    + {altruism_stability} * stability
+    + {altruism_relief} * (1.0 - stress)
+    + {altruism_novelty} * novelty_scale
+    + {altruism_team} * team_alignment
+    + {altruism_success} * success_rate,
+    0.0,
+    1.0
+);
+solidarity = clamp(
+    {solidarity_base}
+    + {solidarity_stability} * stability
+    + {solidarity_lazy} * lazy_share
+    + {solidarity_done_relief} * (1.0 - done_ratio)
+    + {solidarity_team} * team_alignment
+    + {solidarity_success} * success_rate,
+    0.0,
+    1.0
+);
+span_component = np.tanh((reward_span + reward_std) / denom);
+advantage = clamp(
+    {advantage_base}
+    + {advantage_trend} * trend_norm
+    + {advantage_span} * span_component
+    + {advantage_novelty} * novelty_scale
+    + {advantage_team} * team_trend
+    + {advantage_best} * team_best,
+    0.0,
+    1.0
+);
+team_objective = clamp(
+    {team_objective_bias}
+    + {team_objective_alignment} * team_alignment
+    + {team_objective_trend} * trend_norm
+    - {team_objective_pressure} * team_pressure
+    + {team_objective_best} * team_best
+    + {team_objective_span} * span_component
+    + {team_objective_success} * success_rate,
+    -3.0,
+    3.0
+);
+"""
+
+_RL_SIGNAL_PROGRAM_CACHE: Dict[str, Any] = {}
+
+_RL_SCHED_COEFF_DEFAULTS: Dict[str, float] = {
+    'entropy_bias': 0.02,
+    'entropy_norm_gain': 0.35,
+    'entropy_instability': 0.3,
+    'entropy_novelty': 0.25,
+    'entropy_team': 0.18,
+    'entropy_span': 0.12,
+    'entropy_success': 0.2,
+    'lr_bias': 0.0,
+    'lr_norm_gain': 0.55,
+    'lr_instability': 0.25,
+    'lr_memory': -0.35,
+    'lr_team': 0.18,
+    'lr_span': 0.1,
+    'lr_success': 0.25,
+    'gamma_bias': 0.0,
+    'gamma_norm_gain': 0.12,
+    'gamma_stability': 0.08,
+    'gamma_novelty': 0.18,
+    'gamma_team': 0.1,
+    'gamma_span': 0.05,
+    'gamma_success': 0.15,
+    'lambda_bias': 0.02,
+    'lambda_norm_gain': 0.18,
+    'lambda_instability': 0.22,
+    'lambda_novelty': 0.12,
+    'lambda_team': 0.14,
+    'lambda_success': 0.2,
+    'lambda_span': 0.08,
+}
+
+_RL_SCHED_DSL_TEMPLATE = """
+// cpp-ish DSL for RL hyperparameter scheduling.
+instability = (1.0 - stability);
+entropy = clamp(
+    entropy
+    + {entropy_bias}
+    + {entropy_norm_gain} * norm_delta
+    + {entropy_instability} * instability
+    + {entropy_novelty} * novelty_scale
+    + {entropy_team} * team_alignment
+    + {entropy_success} * success_rate
+    + {entropy_span} * reward_span_norm,
+    1e-5,
+    0.5
+);
+lr = clamp(
+    lr * (1.0 + {lr_norm_gain} * norm_delta)
+    + {lr_bias}
+    + {lr_instability} * instability
+    + {lr_memory} * (1.0 - memory_util)
+    + {lr_team} * team_alignment
+    + {lr_success} * success_rate
+    + {lr_span} * reward_span_norm,
+    1e-5,
+    0.2
+);
+gamma = clamp(
+    gamma
+    + {gamma_bias}
+    + {gamma_norm_gain} * norm_delta
+    + {gamma_stability} * stability
+    + {gamma_novelty} * novelty_scale
+    + {gamma_team} * team_alignment
+    + {gamma_success} * success_rate
+    + {gamma_span} * reward_span_norm,
+    0.4,
+    0.9995
+);
+gae_lambda = clamp(
+    gae_lambda
+    + {lambda_bias}
+    + {lambda_norm_gain} * norm_delta
+    - {lambda_instability} * instability
+    + {lambda_novelty} * novelty_scale
+    + {lambda_team} * team_alignment
+    + {lambda_success} * success_rate
+    - {lambda_span} * reward_span_norm,
+    0.2,
+    0.9995
+);
+"""
+
+_RL_SCHED_PROGRAM_CACHE: Dict[str, Any] = {}
+
+
+def _dsl_coeff_signature(
+    template: str,
+    coeffs: Dict[str, float],
+    defaults: Dict[str, float],
+) -> Tuple[str, Tuple[Tuple[str, float], ...]]:
+    template_key = template.strip() if isinstance(template, str) else ''
+    keys = sorted(set(defaults.keys()) | set(coeffs.keys()))
+    pairs: List[Tuple[str, float]] = []
+    for key in keys:
+        default = defaults.get(key, 0.0)
+        try:
+            val = float(coeffs.get(key, default))
+        except Exception:
+            val = float(default)
+        if not np.isfinite(val):
+            val = float(default)
+        pairs.append((key, round(val, 12)))
+    return template_key, tuple(pairs)
+
+
+_MONODROMY_COEFF_DEFAULTS: Dict[str, float] = {
+    'growth_scale': 1.0,
+    'slump_scale': 1.0,
+    'relief_scale': 1.0,
+    'div_scale': 1.0,
+    'grace_scale': 1.0,
+    'noise_scale': 1.0,
+    'top3_scale': 1.0,
+    'family_share_scale': 1.0,
+    'family_share_cap': 3.5,
+    'family_trend_gain': 0.5,
+    'family_trend_low': 0.5,
+    'family_trend_high': 1.8,
+    'family_median_gain': 0.45,
+    'family_spread_gain': 0.25,
+    'family_cap': 6.0,
+}
+
+
+_MONODROMY_DSL_TEMPLATE = """
+// cpp-ish DSL for monodromy penalties.
+// Inputs: base, range_amp, osc, envelope, growth_weight, momentum,
+//         span_scale, slump_gain, relief_gain, div_factor, grace_factor,
+//         noise_factor, top3_multiplier, family_weight, surplus_ratio,
+//         share_delta, family_count, family_median, median, family_spread.
+span_scale = max(span_scale, 1e-9)
+target = (base + range_amp * osc) * envelope
+if growth_weight > 0.0:
+    grow = math.tanh(max(0.0, momentum) / span_scale)
+    target *= max(0.0, 1.0 - growth_weight * {growth_scale} * grow)
+else:
+    grow = 0.0
+if slump_gain > 0.0:
+    slump = math.tanh(max(0.0, -momentum) / span_scale)
+    target *= 1.0 + slump_gain * {slump_scale} * slump
+else:
+    slump = 0.0
+if relief_gain > 0.0:
+    target *= max(0.0, 1.0 - {relief_scale} * relief_gain)
+target *= div_factor * {div_scale}
+target *= grace_factor * {grace_scale}
+target *= noise_factor * {noise_scale}
+target *= top3_multiplier * {top3_scale}
+family_factor = 1.0
+if family_weight > 0.0:
+    share_factor = 1.0 + family_weight * {family_share_scale} * min({family_share_cap}, max(0.0, surplus_ratio))
+    trend_factor = clamp(
+        1.0 + {family_trend_gain} * family_weight * share_delta * max(1, family_count),
+        {family_trend_low},
+        {family_trend_high}
+    )
+    median_delta = max(0.0, (family_median - median) / span_scale)
+    median_factor = 1.0 + {family_median_gain} * family_weight * median_delta
+    spread_norm = 0.0
+    if span_scale > 0.0:
+        spread_norm = clamp(1.0 - min(1.0, family_spread / max(span_scale, 1e-9)), 0.0, 1.0)
+    spread_factor = 1.0 + {family_spread_gain} * family_weight * spread_norm
+    family_factor = clamp(share_factor * trend_factor * median_factor * spread_factor, 1.0, {family_cap})
+target *= family_factor
+"""
+
+
+_MONODROMY_PROGRAM_CACHE: Dict[str, Any] = {}
+
+
+_ENV_LEADER_COEFF_DEFAULTS: Dict[str, float] = {
+    'share_scarcity_penalty': 0.25,
+    'share_scarcity_lo': 0.2,
+    'share_scarcity_hi': 1.0,
+    'share_pressure_penalty': 0.18,
+    'share_objective_gain': 0.12,
+    'share_pressure_lo': 0.15,
+    'share_pressure_hi': 1.0,
+    'mod0_share': 0.35,
+    'mod0_anchor': 0.35,
+    'mod1_share': 0.3,
+    'mod1_anchor': 0.3,
+    'mod1_gap': 0.5,
+    'mod2_share': 0.3,
+    'mod2_gap': 0.6,
+    'noise_base': 0.05,
+    'noise_trend_gain': 0.12,
+    'noise_align_penalty': 0.1,
+    'noise_pressure_gain': 0.02,
+    'noise_objective_penalty': 0.015,
+    'noise_cap': 0.25,
+    'turns_base': 1.6,
+    'turns_objective_gain': 0.1,
+    'turns_spread_gain': 0.05,
+    'turns_cap_low': 0.6,
+    'turns_cap_high': 3.2,
+    'rot_align_gain': 0.25,
+    'anchor_noise_trend': 0.06,
+    'anchor_noise_align': 0.02,
+    'anchor_turns_gap': 0.25,
+    'anchor_turns_objective': 0.08,
+    'rot_anchor_anchor': 0.4,
+    'rot_anchor_gap': 0.6,
+    'rot_anchor_align': 0.25,
+    'inertia_base': 0.25,
+    'inertia_share_gain': 0.5,
+    'inertia_stasis_gain': 0.25,
+    'inertia_cap': 0.9,
+    'inertia_scarcity_penalty': 0.4,
+    'inertia_spread_gain': 0.15,
+    'inertia_drive_penalty': 0.2,
+    'inertia_obj_gain': 0.28,
+    'inertia_stage_lo': 0.2,
+    'inertia_stage_hi': 1.05,
+    'inertia_final_lo': 0.05,
+    'inertia_final_hi': 1.0,
+    'anchor_mix_ratio': 0.5,
+    'env_shift_noise_gain': 4.0,
+    'env_shift_turn_gain': 1.0,
+    'env_shift_rot_gain': 0.5,
+    'advantage_scarcity_gain': 0.35,
+    'advantage_env_bias': 0.5,
+    'advantage_cap': 3.5,
+    'advantage_pressure_gain': 0.2,
+    'advantage_objective_penalty': 0.25,
+    'advantage_alignment_gain': 0.1,
+}
+
+
+_ENV_LEADER_DSL_TEMPLATE = """
+// DSL for leader-mode environment steering.
+share = float(np.clip(share * (1.0 - {share_scarcity_penalty} * scarcity), {share_scarcity_lo}, {share_scarcity_hi}));
+share = float(np.clip(
+    share * (1.0 - {share_pressure_penalty} * reward_pressure + {share_objective_gain} * max(0.0, reward_objective)),
+    {share_pressure_lo},
+    {share_pressure_hi}
+));
+mod_out0 = output0 * (1.0 - {mod0_share} * share) + anchor * {mod0_anchor};
+mod_out1 = output1 * (1.0 - {mod1_share} * share) + (anchor + gap * {mod1_gap}) * {mod1_anchor};
+mod_out2 = output2 * (1.0 - {mod2_share} * share) + gap * {mod2_gap};
+target_noise = float(np.clip(
+    {noise_base}
+    + scale_noise * (mod_out0 + {noise_trend_gain} * reward_trend - {noise_align_penalty} * reward_alignment)
+    + {noise_pressure_gain} * reward_pressure
+    - {noise_objective_penalty} * reward_objective,
+    0.0,
+    {noise_cap}
+));
+target_turns = float(np.clip(
+    {turns_base}
+    + scale_turns * (mod_out1 + {turns_objective_gain} * reward_objective)
+    + {turns_spread_gain} * reward_spread,
+    {turns_cap_low},
+    {turns_cap_high}
+));
+rot_target = prev_rot + scale_rot * (mod_out2 + {rot_align_gain} * reward_alignment);
+anchor_noise = float(np.clip(
+    {noise_base}
+    + scale_noise * (anchor + {anchor_noise_trend} * reward_trend)
+    - {anchor_noise_align} * reward_alignment,
+    0.0,
+    {noise_cap}
+));
+anchor_turns = float(np.clip(
+    {turns_base}
+    + scale_turns * (anchor + gap * {anchor_turns_gap} + {anchor_turns_objective} * reward_objective),
+    {turns_cap_low},
+    {turns_cap_high}
+));
+rot_anchor = prev_rot + scale_rot * (
+    anchor * {rot_anchor_anchor} + gap * {rot_anchor_gap} + {rot_anchor_align} * reward_alignment
+);
+inertia = float(np.clip(
+    {inertia_base} + {inertia_share_gain} * share + {inertia_stasis_gain} * stasis,
+    0.0,
+    {inertia_cap}
+));
+inertia *= float(np.clip(
+    1.0 - {inertia_scarcity_penalty} * scarcity + {inertia_spread_gain} * spread,
+    {inertia_stage_lo},
+    {inertia_stage_hi}
+));
+inertia *= float(np.clip(
+    0.65 + {inertia_obj_gain} * max(0.0, reward_objective) - {inertia_drive_penalty} * reward_drive,
+    {inertia_final_lo},
+    {inertia_final_hi}
+));
+slip = max(0.0, 1.0 - inertia);
+anchor_mix = slip * {anchor_mix_ratio} * stasis;
+leader_mix = max(0.0, slip - anchor_mix);
+noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, {noise_cap}));
+turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, {turns_cap_low}, {turns_cap_high}));
+rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix;
+rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi);
+env_shift = (
+    abs(noise - prev_noise) * {env_shift_noise_gain}
+    + abs(turns - prev_turns) * {env_shift_turn_gain}
+    + abs(rot_blend - prev_rot) * {env_shift_rot_gain}
+);
+selfish_drive = max(0.0, leader_mix - anchor_mix) * (1.0 - share);
+advantage_score = float(np.clip(
+    selfish_drive * (max(0.0, gap) + {advantage_scarcity_gain} * scarcity) * ({advantage_env_bias} + env_shift)
+    + {advantage_pressure_gain} * reward_pressure
+    - {advantage_objective_penalty} * reward_objective
+    + {advantage_alignment_gain} * max(0.0, -reward_alignment),
+    0.0,
+    {advantage_cap}
+));
+altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0));
+share = float(share);
+stasis = float(stasis);
+gap = float(gap);
+anchor = float(anchor);
+reward_alignment = float(reward_alignment);
+reward_trend = float(reward_trend);
+reward_spread = float(reward_spread);
+reward_pressure = float(reward_pressure);
+reward_objective = float(reward_objective);
+reward_drive = float(reward_drive);
+scarcity = float(scarcity);
+spread = float(spread);
+prev_noise = float(prev_noise);
+prev_turns = float(prev_turns);
+prev_rot = float(prev_rot);
+output0 = float(output0);
+output1 = float(output1);
+output2 = float(output2);
+scale_noise = float(scale_noise);
+scale_turns = float(scale_turns);
+scale_rot = float(scale_rot);
+reward_trend = float(reward_trend);
+reward_alignment = float(reward_alignment);
+reward_spread = float(reward_spread);
+reward_pressure = float(reward_pressure);
+reward_objective = float(reward_objective);
+reward_drive = float(reward_drive);
+"""
+
+
+_ENV_LEADER_PROGRAM_CACHE: Dict[str, Any] = {}
+
+
+_ENV_COUNCIL_COEFF_DEFAULTS: Dict[str, float] = {
+    'noise_base': 0.05,
+    'noise_cap': 0.25,
+    'turns_base': 1.6,
+    'turns_cap_low': 0.6,
+    'turns_cap_high': 3.2,
+    'rot_anchor_anchor': 0.4,
+    'rot_anchor_gap': 0.6,
+    'anchor_pull_base': 0.35,
+    'anchor_pull_lazy': 0.25,
+    'anchor_pull_focus': 0.15,
+    'gap_pull_base': 0.45,
+    'gap_pull_lazy': 0.25,
+    'gap_pull_drive': 0.2,
+    'mod0_align_gain': 0.2,
+    'mod1_gap': 0.5,
+    'mod1_focus_gain': 0.3,
+    'mod2_delta_gain': 0.35,
+    'anchor_noise_lazy': 0.2,
+    'anchor_noise_align': 0.1,
+    'anchor_turns_gap': 0.25,
+    'anchor_turns_lazy': 0.15,
+    'anchor_turns_mean': 0.2,
+    'rot_anchor_lazy': 0.2,
+    'rot_anchor_delta': 0.25,
+    'inertia_base': 0.25,
+    'inertia_share_gain': 0.6,
+    'inertia_stasis_gain': 0.25,
+    'inertia_focus_gain': 0.15,
+    'inertia_cap': 0.92,
+    'inertia_stage_scarcity': 0.35,
+    'inertia_stage_spread': 0.25,
+    'inertia_stage_lazy': 0.15,
+    'inertia_stage_focus': 0.15,
+    'inertia_stage_drive': 0.1,
+    'inertia_stage_lo': 0.2,
+    'inertia_stage_hi': 1.1,
+    'anchor_ratio_base': 0.3,
+    'anchor_ratio_stasis': 0.4,
+    'anchor_ratio_lazy': 0.3,
+    'anchor_ratio_focus': 0.2,
+    'anchor_ratio_drive': 0.15,
+    'anchor_ratio_cap': 0.95,
+    'env_shift_noise_gain': 4.0,
+    'env_shift_turn_gain': 1.0,
+    'env_shift_rot_gain': 0.5,
+    'env_shift_dispersion_gain': 1.0,
+    'env_shift_lazy_gain': 1.2,
+    'env_shift_drive_gain': 0.8,
+    'env_shift_delta_gain': 0.6,
+    'advantage_scarcity_gain': 0.35,
+    'advantage_lazy_gain': 0.25,
+    'advantage_focus_gain': 0.3,
+    'advantage_env_bias': 0.5,
+    'advantage_drive_gain': 0.7,
+    'advantage_cap': 3.5,
+    'selfish_share_penalty': 0.6,
+    'selfish_drive_bonus': 0.25,
+    'altruism_align_gain': 0.15,
+    'altruism_pressure_penalty': 0.1,
+}
+
+
+_ENV_COUNCIL_DSL_TEMPLATE = """
+// DSL for council-mode environment steering.
+anchor_pull = float(np.clip(
+    {anchor_pull_base} + {anchor_pull_lazy} * lazy_pressure + {anchor_pull_focus} * reward_focus,
+    0.0,
+    0.9
+));
+gap_pull = float(np.clip(
+    {gap_pull_base} + {gap_pull_lazy} * lazy_pressure + {gap_pull_drive} * reward_drive,
+    0.0,
+    0.95
+));
+mod_out0 = consensus0 * (1.0 - anchor_pull) + anchor * anchor_pull + {mod0_align_gain} * reward_alignment * rl_recency;
+mod_out1 = consensus1 * (1.0 - anchor_pull) + (anchor + gap * {mod1_gap}) * anchor_pull + {mod1_focus_gain} * reward_mean_norm * rl_recency;
+mod_out2 = consensus2 * (1.0 - gap_pull) + gap * gap_pull + {mod2_delta_gain} * reward_delta_norm * rl_recency;
+target_noise = float(np.clip({noise_base} + scale_noise * mod_out0, 0.0, {noise_cap}));
+target_turns = float(np.clip({turns_base} + scale_turns * mod_out1, {turns_cap_low}, {turns_cap_high}));
+rot_target = prev_rot + scale_rot * mod_out2;
+anchor_noise = float(np.clip(
+    {noise_base} + scale_noise * (anchor + {anchor_noise_lazy} * lazy_pressure + {anchor_noise_align} * reward_alignment * rl_recency),
+    0.0,
+    {noise_cap}
+));
+anchor_turns = float(np.clip(
+    {turns_base}
+    + scale_turns * (anchor + gap * {anchor_turns_gap} + {anchor_turns_lazy} * lazy_pressure + {anchor_turns_mean} * reward_mean_norm * rl_recency),
+    {turns_cap_low},
+    {turns_cap_high}
+));
+rot_anchor = prev_rot + scale_rot * (
+    anchor * {rot_anchor_anchor} + gap * {rot_anchor_gap} + {rot_anchor_lazy} * lazy_pressure + {rot_anchor_delta} * reward_delta_norm * rl_recency
+);
+inertia = float(np.clip(
+    {inertia_base} + {inertia_share_gain} * share + {inertia_stasis_gain} * stasis + {inertia_focus_gain} * reward_focus,
+    0.0,
+    {inertia_cap}
+));
+inertia *= float(np.clip(
+    1.0
+    - {inertia_stage_scarcity} * scarcity
+    + {inertia_stage_spread} * spread
+    + {inertia_stage_lazy} * lazy_pressure
+    + {inertia_stage_focus} * reward_focus
+    - {inertia_stage_drive} * reward_drive,
+    {inertia_stage_lo},
+    {inertia_stage_hi}
+));
+slip = max(0.0, 1.0 - inertia);
+anchor_ratio = float(np.clip(
+    {anchor_ratio_base}
+    + {anchor_ratio_stasis} * stasis
+    + {anchor_ratio_lazy} * lazy_pressure
+    + {anchor_ratio_focus} * reward_focus
+    - {anchor_ratio_drive} * reward_drive,
+    0.0,
+    {anchor_ratio_cap}
+));
+anchor_mix = min(slip, slip * anchor_ratio);
+leader_mix = max(0.0, slip - anchor_mix);
+noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, {noise_cap}));
+turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, {turns_cap_low}, {turns_cap_high}));
+rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix;
+rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi);
+env_shift = (
+    abs(noise - prev_noise) * {env_shift_noise_gain}
+    + abs(turns - prev_turns) * {env_shift_turn_gain}
+    + abs(rot_blend - prev_rot) * {env_shift_rot_gain}
+    + dispersion * {env_shift_dispersion_gain}
+    + lazy_pressure * {env_shift_lazy_gain}
+    + reward_drive * {env_shift_drive_gain}
+    + abs(reward_delta_norm) * {env_shift_delta_gain}
+);
+selfish_drive = max(0.0, leader_mix - anchor_mix) * (1.0 - {selfish_share_penalty} * share) + {selfish_drive_bonus} * reward_drive;
+advantage_score = float(np.clip(
+    selfish_drive
+    * (max(0.0, gap) + {advantage_scarcity_gain} * scarcity + {advantage_lazy_gain} * lazy_pressure + {advantage_focus_gain} * reward_focus)
+    * ({advantage_env_bias} + env_shift + {advantage_drive_gain} * reward_drive),
+    0.0,
+    {advantage_cap}
+));
+altruism_signal = float(np.clip(
+    1.0 - min(1.0, advantage_score) + {altruism_align_gain} * reward_alignment * rl_recency - {altruism_pressure_penalty} * reward_pressure_norm,
+    0.0,
+    1.0
+));
+share = float(share);
+stasis = float(stasis);
+gap = float(gap);
+anchor = float(anchor);
+scarcity = float(scarcity);
+spread = float(spread);
+lazy_pressure = float(lazy_pressure);
+reward_alignment = float(reward_alignment);
+reward_mean_norm = float(reward_mean_norm);
+reward_delta_norm = float(reward_delta_norm);
+reward_focus = float(reward_focus);
+reward_drive = float(reward_drive);
+reward_pressure_norm = float(reward_pressure_norm);
+rl_recency = float(rl_recency);
+dispersion = float(dispersion);
+prev_noise = float(prev_noise);
+prev_turns = float(prev_turns);
+prev_rot = float(prev_rot);
+scale_noise = float(scale_noise);
+scale_turns = float(scale_turns);
+scale_rot = float(scale_rot);
+consensus0 = float(consensus0);
+consensus1 = float(consensus1);
+consensus2 = float(consensus2);
+"""
+
+
+_ENV_COUNCIL_PROGRAM_CACHE: Dict[str, Any] = {}
+
+def _env_leader_sanitise_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_ENV_LEADER_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _ENV_LEADER_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            base[key] = val
+    return base
+
+
+def _env_council_sanitise_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_ENV_COUNCIL_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _ENV_COUNCIL_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            base[key] = val
+    return base
+
+
+def _env_leader_program_for(evaluator: 'SelfReproducingEvaluator') -> str:
+    template = getattr(evaluator, 'env_leader_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _ENV_LEADER_DSL_TEMPLATE
+        evaluator.env_leader_program_template = template
+    coeffs = getattr(evaluator, 'env_leader_program_coeffs', None)
+    if not isinstance(coeffs, dict):
+        coeffs = dict(_ENV_LEADER_COEFF_DEFAULTS)
+        evaluator.env_leader_program_coeffs = coeffs
+    else:
+        coeffs = _env_leader_sanitise_coeffs(coeffs)
+        evaluator.env_leader_program_coeffs = coeffs
+    signature = _dsl_coeff_signature(template, coeffs, _ENV_LEADER_COEFF_DEFAULTS)
+    cache = getattr(evaluator, '_env_leader_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {}
+    for key, default in _ENV_LEADER_COEFF_DEFAULTS.items():
+        val = coeffs.get(key, default)
+        try:
+            val = float(val)
+        except Exception:
+            val = default
+        if not np.isfinite(val):
+            val = default
+        formatted[key] = repr(val)
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        template = _ENV_LEADER_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _ENV_LEADER_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _ENV_LEADER_COEFF_DEFAULTS, _ENV_LEADER_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+        evaluator.env_leader_program_template = template
+        evaluator.env_leader_program_coeffs = dict(_ENV_LEADER_COEFF_DEFAULTS)
+    evaluator._env_leader_program_cache = (signature, program)
+    return program
+
+
+def _env_council_program_for(evaluator: 'SelfReproducingEvaluator') -> str:
+    template = getattr(evaluator, 'env_council_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _ENV_COUNCIL_DSL_TEMPLATE
+        evaluator.env_council_program_template = template
+    coeffs = getattr(evaluator, 'env_council_program_coeffs', None)
+    if not isinstance(coeffs, dict):
+        coeffs = dict(_ENV_COUNCIL_COEFF_DEFAULTS)
+        evaluator.env_council_program_coeffs = coeffs
+    else:
+        coeffs = _env_council_sanitise_coeffs(coeffs)
+        evaluator.env_council_program_coeffs = coeffs
+    signature = _dsl_coeff_signature(template, coeffs, _ENV_COUNCIL_COEFF_DEFAULTS)
+    cache = getattr(evaluator, '_env_council_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {}
+    for key, default in _ENV_COUNCIL_COEFF_DEFAULTS.items():
+        val = coeffs.get(key, default)
+        try:
+            val = float(val)
+        except Exception:
+            val = default
+        if not np.isfinite(val):
+            val = default
+        formatted[key] = repr(val)
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        template = _ENV_COUNCIL_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _ENV_COUNCIL_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _ENV_COUNCIL_COEFF_DEFAULTS, _ENV_COUNCIL_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+        evaluator.env_council_program_template = template
+        evaluator.env_council_program_coeffs = dict(_ENV_COUNCIL_COEFF_DEFAULTS)
+    evaluator._env_council_program_cache = (signature, program)
+    return program
+
+
+def _env_leader_compile_program(program: str):
+    cached = _ENV_LEADER_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty leader env program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<env_leader_program>', 'exec')
+    _ENV_LEADER_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _env_council_compile_program(program: str):
+    cached = _ENV_COUNCIL_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty council env program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<env_council_program>', 'exec')
+    _ENV_COUNCIL_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _env_leader_python(state: Dict[str, float]) -> Dict[str, float]:
+    share = float(state['share'])
+    stasis = float(state['stasis'])
+    anchor = float(state['anchor'])
+    gap = float(state['gap'])
+    scarcity = float(state['scarcity'])
+    spread = float(state['spread'])
+    reward_pressure = float(state['reward_pressure'])
+    reward_objective = float(state['reward_objective'])
+    scale_noise = float(state['scale_noise'])
+    scale_turns = float(state['scale_turns'])
+    scale_rot = float(state['scale_rot'])
+    output0 = float(state['output0'])
+    output1 = float(state['output1'])
+    output2 = float(state['output2'])
+    prev_noise = float(state['prev_noise'])
+    prev_turns = float(state['prev_turns'])
+    prev_rot = float(state['prev_rot'])
+    reward_trend = float(state['reward_trend'])
+    reward_alignment = float(state['reward_alignment'])
+    reward_spread = float(state['reward_spread'])
+    reward_drive = float(state['reward_drive'])
+    share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
+    share *= float(np.clip(1.0 - 0.18 * reward_pressure + 0.12 * max(0.0, reward_objective), 0.15, 1.0))
+    mod_out0 = output0 * (1.0 - 0.35 * share) + anchor * 0.35
+    mod_out1 = output1 * (1.0 - 0.3 * share) + (anchor + gap * 0.5) * 0.3
+    mod_out2 = output2 * (1.0 - 0.3 * share) + gap * 0.6
+    target_noise = float(
+        np.clip(
+            0.05
+            + scale_noise * (mod_out0 + 0.12 * reward_trend - 0.1 * reward_alignment)
+            + 0.02 * reward_pressure
+            - 0.015 * reward_objective,
+            0.0,
+            0.25,
+        )
+    )
+    target_turns = float(
+        np.clip(
+            1.6 + scale_turns * (mod_out1 + 0.1 * reward_objective) + 0.05 * reward_spread,
+            0.6,
+            3.2,
+        )
+    )
+    rot_target = prev_rot + scale_rot * (mod_out2 + 0.25 * reward_alignment)
+    anchor_noise = float(
+        np.clip(
+            0.05 + scale_noise * (anchor + 0.06 * reward_trend) - 0.02 * reward_alignment,
+            0.0,
+            0.25,
+        )
+    )
+    anchor_turns = float(
+        np.clip(
+            1.6 + scale_turns * (anchor + gap * 0.25 + 0.08 * reward_objective),
+            0.6,
+            3.2,
+        )
+    )
+    rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6 + 0.25 * reward_alignment)
+    inertia = float(np.clip(0.25 + 0.5 * share + 0.25 * stasis, 0.0, 0.9))
+    inertia *= float(np.clip(1.0 - 0.4 * scarcity + 0.15 * spread, 0.2, 1.05))
+    inertia *= float(np.clip(0.65 + 0.28 * max(0.0, reward_objective) - 0.2 * reward_drive, 0.05, 1.0))
+    slip = max(0.0, 1.0 - inertia)
+    anchor_mix = slip * 0.5 * stasis
+    leader_mix = max(0.0, slip - anchor_mix)
+    noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
+    turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
+    rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
+    rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+    env_shift = (
+        abs(noise - prev_noise) * 4.0
+        + abs(turns - prev_turns)
+        + 0.5 * abs(rot_blend - prev_rot)
+    )
+    selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - share))
+    advantage_score = float(
+        np.clip(
+            selfish_drive * (max(0.0, gap) + 0.35 * scarcity) * (0.5 + env_shift),
+            0.0,
+            3.5,
+        )
+    )
+    altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0))
+    return {
+        'share': share,
+        'noise': noise,
+        'turns': turns,
+        'rot_blend': rot_blend,
+        'rot_bias': rot_bias,
+        'anchor_mix': anchor_mix,
+        'leader_mix': leader_mix,
+        'inertia': inertia,
+        'selfish_drive': selfish_drive,
+        'advantage_score': advantage_score,
+        'altruism_signal': altruism_signal,
+        'env_shift': env_shift,
+    }
+
+
+def _env_council_python(state: Dict[str, float]) -> Dict[str, float]:
+    share = float(state['share'])
+    stasis = float(state['stasis'])
+    anchor = float(state['anchor'])
+    gap = float(state['gap'])
+    scarcity = float(state['scarcity'])
+    spread = float(state['spread'])
+    lazy_pressure = float(state['lazy_pressure'])
+    reward_alignment = float(state['reward_alignment'])
+    reward_mean_norm = float(state['reward_mean_norm'])
+    reward_delta_norm = float(state['reward_delta_norm'])
+    reward_focus = float(state['reward_focus'])
+    reward_drive = float(state['reward_drive'])
+    reward_pressure_norm = float(state['reward_pressure_norm'])
+    rl_recency = float(state['rl_recency'])
+    dispersion = float(state['dispersion'])
+    prev_noise = float(state['prev_noise'])
+    prev_turns = float(state['prev_turns'])
+    prev_rot = float(state['prev_rot'])
+    scale_noise = float(state['scale_noise'])
+    scale_turns = float(state['scale_turns'])
+    scale_rot = float(state['scale_rot'])
+    consensus0 = float(state['consensus0'])
+    consensus1 = float(state['consensus1'])
+    consensus2 = float(state['consensus2'])
+    reward_spread = float(state.get('reward_spread', 0.0))
+    entropy_norm = float(state.get('entropy_norm', 0.0))
+    anchor_pull = float(np.clip(0.35 + 0.25 * lazy_pressure + 0.15 * reward_focus, 0.0, 0.9))
+    gap_pull = float(np.clip(0.45 + 0.25 * lazy_pressure + 0.2 * reward_drive, 0.0, 0.95))
+    mod_out0 = consensus0 * (1.0 - anchor_pull) + anchor * anchor_pull + reward_alignment * 0.2 * rl_recency
+    mod_out1 = consensus1 * (1.0 - anchor_pull) + (anchor + gap * 0.5) * anchor_pull + reward_mean_norm * 0.3 * rl_recency
+    mod_out2 = consensus2 * (1.0 - gap_pull) + gap * gap_pull + reward_delta_norm * 0.35 * rl_recency
+    target_noise = float(np.clip(0.05 + scale_noise * mod_out0, 0.0, 0.25))
+    target_turns = float(np.clip(1.6 + scale_turns * mod_out1, 0.6, 3.2))
+    rot_target = prev_rot + scale_rot * mod_out2
+    anchor_noise = float(np.clip(0.05 + scale_noise * (anchor + 0.2 * lazy_pressure + 0.1 * reward_alignment * rl_recency), 0.0, 0.25))
+    anchor_turns = float(
+        np.clip(
+            1.6 + scale_turns * (anchor + gap * 0.25 + 0.15 * lazy_pressure + 0.2 * reward_mean_norm * rl_recency),
+            0.6,
+            3.2,
+        )
+    )
+    rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6 + 0.2 * lazy_pressure + 0.25 * reward_delta_norm * rl_recency)
+    inertia = float(np.clip(0.25 + 0.6 * share + 0.25 * stasis + 0.15 * reward_focus, 0.0, 0.92))
+    inertia *= float(
+        np.clip(
+            1.0 - 0.35 * scarcity + 0.25 * spread + 0.15 * lazy_pressure + 0.15 * reward_focus - 0.1 * reward_drive,
+            0.2,
+            1.1,
+        )
+    )
+    slip = max(0.0, 1.0 - inertia)
+    anchor_ratio = float(np.clip(0.3 + 0.4 * stasis + 0.3 * lazy_pressure + 0.2 * reward_focus - 0.15 * reward_drive, 0.0, 0.95))
+    anchor_mix = min(slip, slip * anchor_ratio)
+    leader_mix = max(0.0, slip - anchor_mix)
+    noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
+    turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
+    rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
+    rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+    env_shift = (
+        abs(noise - prev_noise) * 4.0
+        + abs(turns - prev_turns)
+        + 0.5 * abs(rot_blend - prev_rot)
+        + dispersion
+        + 1.2 * lazy_pressure
+        + 0.8 * reward_drive
+        + 0.6 * abs(reward_delta_norm)
+    )
+    selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - 0.6 * share) + 0.25 * reward_drive)
+    advantage_score = float(
+        np.clip(
+            selfish_drive
+            * (max(0.0, gap) + 0.35 * scarcity + 0.25 * lazy_pressure + 0.3 * reward_focus)
+            * (0.5 + env_shift + 0.7 * reward_drive),
+            0.0,
+            3.5,
+        )
+    )
+    altruism_signal = float(
+        np.clip(
+            1.0 - min(1.0, advantage_score) + 0.15 * reward_alignment * rl_recency - 0.1 * reward_pressure_norm,
+            0.0,
+            1.0,
+        )
+    )
+    return {
+        'share': share,
+        'lazy_pressure': lazy_pressure,
+        'noise': noise,
+        'turns': turns,
+        'rot_blend': rot_blend,
+        'rot_bias': rot_bias,
+        'anchor_mix': anchor_mix,
+        'leader_mix': leader_mix,
+        'inertia': inertia,
+        'selfish_drive': selfish_drive,
+        'advantage_score': advantage_score,
+        'altruism_signal': altruism_signal,
+        'env_shift': env_shift,
+    }
+
+
+def _env_run_leader_program(state: Dict[str, Any], program: str) -> Optional[Dict[str, float]]:
+    try:
+        compiled = _env_leader_compile_program(program)
+    except Exception:
+        return None
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    required = (
+        'share',
+        'noise',
+        'turns',
+        'rot_blend',
+        'rot_bias',
+        'anchor_mix',
+        'leader_mix',
+        'inertia',
+        'selfish_drive',
+        'advantage_score',
+        'altruism_signal',
+        'env_shift',
+    )
+    result: Dict[str, float] = {}
+    for key in required:
+        val = locals_dict.get(key)
+        if val is None:
+            return None
+        try:
+            result[key] = float(val)
+        except Exception:
+            return None
+    return result
+
+
+def _env_run_council_program(state: Dict[str, Any], program: str) -> Optional[Dict[str, float]]:
+    try:
+        compiled = _env_council_compile_program(program)
+    except Exception:
+        return None
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    required = (
+        'share',
+        'noise',
+        'turns',
+        'rot_blend',
+        'rot_bias',
+        'anchor_mix',
+        'leader_mix',
+        'inertia',
+        'selfish_drive',
+        'advantage_score',
+        'altruism_signal',
+        'env_shift',
+    )
+    result: Dict[str, float] = {}
+    for key in required:
+        val = locals_dict.get(key)
+        if val is None:
+            return None
+        try:
+            result[key] = float(val)
+        except Exception:
+            return None
+    if 'lazy_pressure' in locals_dict:
+        try:
+            result['lazy_pressure'] = float(locals_dict['lazy_pressure'])
+        except Exception:
+            return None
+    return result
+
+
+def _rl_default_meta() -> Dict[str, Any]:
+    return {
+        'reward_ema': 0.0,
+        'reward_var': 0.0,
+        'episodes': 0,
+        'best_reward': float('-inf'),
+        'last_reward': 0.0,
+        'trend': 0.0,
+        'stability': 0.0,
+        'novelty_ema': 0.0,
+        'memory_util': 0.0,
+        'entropy_push': 0.0,
+        'lr_push': 0.0,
+        'gamma_push': 0.0,
+        'success_rate': 0.0,
+        'success_window': 0.0,
+        'advantage_ema': 0.0,
+        'advantage_span': 0.0,
+        'advantage_peak': 0.0,
+        'lambda_push': 0.95,
+    }
+
+
+def _rl_prepare_meta(genome: 'Genome') -> Dict[str, Any]:
+    base = _rl_default_meta()
+    meta = getattr(genome, 'rl_meta', None)
+    if isinstance(meta, dict):
+        merged = dict(base)
+        merged.update(meta)
+        meta = merged
+    else:
+        meta = dict(base)
+    genome.rl_meta = meta
+    return meta
+
+
+def _rl_merge_meta(meta_a: Optional[Dict[str, Any]], meta_b: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    metas = []
+    if isinstance(meta_a, dict):
+        metas.append(meta_a)
+    if isinstance(meta_b, dict):
+        metas.append(meta_b)
+    if not metas:
+        return _rl_default_meta()
+    merged = _rl_default_meta()
+
+    def _avg(key: str, default: float=0.0) -> float:
+        vals = [float(m.get(key, default)) for m in metas if key in m]
+        if not vals:
+            return float(default)
+        return float(sum(vals) / len(vals))
+
+    merged['reward_ema'] = _avg('reward_ema', merged['reward_ema'])
+    merged['reward_var'] = _avg('reward_var', merged['reward_var'])
+    merged['episodes'] = int(round(_avg('episodes', merged['episodes'])))
+    merged['last_reward'] = _avg('last_reward', merged['last_reward'])
+    merged['trend'] = _avg('trend', merged['trend'])
+    merged['stability'] = _avg('stability', merged['stability'])
+    merged['novelty_ema'] = _avg('novelty_ema', merged['novelty_ema'])
+    merged['memory_util'] = _avg('memory_util', merged['memory_util'])
+    merged['entropy_push'] = _avg('entropy_push', merged['entropy_push'])
+    merged['success_rate'] = _avg('success_rate', merged['success_rate'])
+    merged['success_window'] = _avg('success_window', merged['success_window'])
+    merged['advantage_ema'] = _avg('advantage_ema', merged['advantage_ema'])
+    merged['advantage_span'] = _avg('advantage_span', merged['advantage_span'])
+    best_vals = [float(m.get('best_reward', float('-inf'))) for m in metas]
+    if best_vals:
+        merged['best_reward'] = float(max(best_vals))
+    peak_vals = [float(m.get('advantage_peak', merged['advantage_peak'])) for m in metas if 'advantage_peak' in m]
+    if peak_vals:
+        merged['advantage_peak'] = float(max(peak_vals))
+    extras: Dict[str, Any] = {}
+    for meta in metas:
+        for key, value in meta.items():
+            if key not in merged:
+                extras[key] = value
+    if extras:
+        merged.update(extras)
+    return merged
+
+
+def _rl_sanitise_weight_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_RL_WEIGHT_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _RL_WEIGHT_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            if key in ('novel_bias',):
+                val = float(np.clip(val, -2.0, 4.0))
+            elif key in ('novel_scale', 'priority_gain', 'recency_scale'):
+                val = float(np.clip(val, 0.0, 6.0))
+            elif key == 'entropy_gain':
+                val = float(np.clip(val, -2.0, 2.0))
+            elif key == 'stability_gain':
+                val = float(np.clip(val, -2.0, 3.0))
+            base[key] = val
+    return base
+
+
+def _ensure_rl_weight_coeffs(genome: 'Genome') -> Dict[str, float]:
+    coeffs = getattr(genome, 'rl_weight_coeffs', None)
+    coeffs = _rl_sanitise_weight_coeffs(coeffs)
+    genome.rl_weight_coeffs = coeffs
+    return coeffs
+
+
+def _rl_sanitise_signal_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_RL_SIGNAL_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _RL_SIGNAL_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            if key.startswith('stress_'):
+                val = float(np.clip(val, -0.5, 1.5))
+            elif key.startswith('altruism_'):
+                val = float(np.clip(val, -0.5, 1.5))
+            elif key.startswith('solidarity_'):
+                val = float(np.clip(val, -0.5, 1.5))
+            elif key.startswith('advantage_'):
+                val = float(np.clip(val, -0.5, 1.5))
+            base[key] = val
+    return base
+
+
+def _ensure_rl_signal_coeffs(genome: 'Genome') -> Dict[str, float]:
+    coeffs = getattr(genome, 'rl_signal_coeffs', None)
+    coeffs = _rl_sanitise_signal_coeffs(coeffs)
+    genome.rl_signal_coeffs = coeffs
+    return coeffs
+
+
+def _rl_sanitise_scheduler_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_RL_SCHED_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _RL_SCHED_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            if key.endswith('_bias'):
+                val = float(np.clip(val, -0.5, 0.5))
+            elif key.endswith('_memory'):
+                val = float(np.clip(val, -1.5, 0.0))
+            else:
+                val = float(np.clip(val, -1.5, 1.5))
+            base[key] = val
+    return base
+
+
+def _ensure_rl_scheduler_coeffs(genome: 'Genome') -> Dict[str, float]:
+    coeffs = getattr(genome, 'rl_scheduler_coeffs', None)
+    coeffs = _rl_sanitise_scheduler_coeffs(coeffs)
+    genome.rl_scheduler_coeffs = coeffs
+    return coeffs
+
+
+def _rl_weight_program_for(genome: 'Genome') -> str:
+    template = getattr(genome, 'rl_weight_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _RL_WEIGHT_DSL_TEMPLATE
+        genome.rl_weight_program_template = template
+    coeffs = _ensure_rl_weight_coeffs(genome)
+    signature = _dsl_coeff_signature(template, coeffs, _RL_WEIGHT_COEFF_DEFAULTS)
+    cache = getattr(genome, '_rl_weight_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {
+        key: repr(float(coeffs.get(key, _RL_WEIGHT_COEFF_DEFAULTS.get(key, 0.0))))
+        for key in _RL_WEIGHT_COEFF_DEFAULTS
+    }
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        template = _RL_WEIGHT_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _RL_WEIGHT_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _RL_WEIGHT_COEFF_DEFAULTS, _RL_WEIGHT_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+    genome._rl_weight_program_cache = (signature, program)
+    return program
+
+
+def _rl_signal_program_for(genome: 'Genome') -> str:
+    template = getattr(genome, 'rl_signal_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _RL_SIGNAL_DSL_TEMPLATE
+        genome.rl_signal_program_template = template
+    coeffs = _ensure_rl_signal_coeffs(genome)
+    signature = _dsl_coeff_signature(template, coeffs, _RL_SIGNAL_COEFF_DEFAULTS)
+    cache = getattr(genome, '_rl_signal_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {
+        key: repr(float(coeffs.get(key, _RL_SIGNAL_COEFF_DEFAULTS.get(key, 0.0))))
+        for key in _RL_SIGNAL_COEFF_DEFAULTS
+    }
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        template = _RL_SIGNAL_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _RL_SIGNAL_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _RL_SIGNAL_COEFF_DEFAULTS, _RL_SIGNAL_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+    genome._rl_signal_program_cache = (signature, program)
+    return program
+
+
+def _rl_scheduler_program_for(genome: 'Genome') -> str:
+    template = getattr(genome, 'rl_scheduler_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _RL_SCHED_DSL_TEMPLATE
+        genome.rl_scheduler_program_template = template
+    coeffs = _ensure_rl_scheduler_coeffs(genome)
+    signature = _dsl_coeff_signature(template, coeffs, _RL_SCHED_COEFF_DEFAULTS)
+    cache = getattr(genome, '_rl_scheduler_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {
+        key: repr(float(coeffs.get(key, _RL_SCHED_COEFF_DEFAULTS.get(key, 0.0))))
+        for key in _RL_SCHED_COEFF_DEFAULTS
+    }
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        template = _RL_SCHED_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _RL_SCHED_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _RL_SCHED_COEFF_DEFAULTS, _RL_SCHED_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+    genome._rl_scheduler_program_cache = (signature, program)
+    return program
+
+
+def _rl_compile_weight_program(program: str):
+    cached = _RL_WEIGHT_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty RL weight program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<rl_weight_program>', 'exec')
+    _RL_WEIGHT_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _rl_compile_signal_program(program: str):
+    cached = _RL_SIGNAL_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty RL signal program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<rl_signal_program>', 'exec')
+    _RL_SIGNAL_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _rl_compile_scheduler_program(program: str):
+    cached = _RL_SCHED_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty RL scheduler program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<rl_scheduler_program>', 'exec')
+    _RL_SCHED_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _dsl_clamp(arr: Any, low: Optional[float], high: Optional[float]):
+    data = np.asarray(arr, dtype=np.float64)
+    if low is None and high is None:
+        return data
+    if low is None:
+        return np.minimum(data, high)
+    if high is None:
+        return np.maximum(data, low)
+    return np.clip(data, low, high)
+
+
+def _rl_run_weight_program(state: Dict[str, Any], program: str) -> Optional[np.ndarray]:
+    try:
+        compiled = _rl_compile_weight_program(program)
+    except Exception:
+        return None
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    weights = locals_dict.get('weights')
+    if weights is None:
+        return None
+    try:
+        return np.asarray(weights, dtype=np.float64)
+    except Exception:
+        return None
+
+
+def _rl_run_signal_program(state: Dict[str, Any], program: str) -> Optional[Dict[str, float]]:
+    try:
+        compiled = _rl_compile_signal_program(program)
+    except Exception:
+        return None
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    result: Dict[str, float] = {}
+    for key in ('altruism_target', 'solidarity', 'stress', 'lazy_share', 'advantage', 'team_objective'):
+        val = locals_dict.get(key, state.get(key))
+        if val is None:
+            return None
+        try:
+            result[key] = float(val)
+        except Exception:
+            return None
+    return result
+
+
+def _rl_run_scheduler_program(state: Dict[str, Any], program: str) -> Optional[Dict[str, float]]:
+    try:
+        compiled = _rl_compile_scheduler_program(program)
+    except Exception:
+        return None
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    result: Dict[str, float] = {}
+    for key in ('entropy', 'lr', 'gamma', 'gae_lambda'):
+        val = locals_dict.get(key, state.get(key))
+        if val is None:
+            return None
+        try:
+            result[key] = float(val)
+        except Exception:
+            return None
+    return result
+
+
+def _monodromy_sanitise_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_MONODROMY_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _MONODROMY_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            if key.endswith('_cap'):
+                val = float(np.clip(val, 0.5, 64.0))
+            elif key.endswith('_low'):
+                val = float(np.clip(val, 0.0, 10.0))
+            elif key.endswith('_high'):
+                val = float(np.clip(val, 0.0, 16.0))
+            base[key] = val
+    low = base['family_trend_low']
+    high = base['family_trend_high']
+    if low > high:
+        base['family_trend_low'], base['family_trend_high'] = float(high), float(low)
+    return base
+
+
+def _monodromy_program_for(neat_inst: 'ReproPlanaNEATPlus') -> str:
+    template = getattr(neat_inst, 'monodromy_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _MONODROMY_DSL_TEMPLATE
+        neat_inst.monodromy_program_template = template
+    coeffs = getattr(neat_inst, 'monodromy_program_coeffs', None)
+    if not isinstance(coeffs, dict):
+        coeffs = dict(_MONODROMY_COEFF_DEFAULTS)
+        neat_inst.monodromy_program_coeffs = coeffs
+    else:
+        coeffs = _monodromy_sanitise_coeffs(coeffs)
+        neat_inst.monodromy_program_coeffs = coeffs
+    signature = _dsl_coeff_signature(template, coeffs, _MONODROMY_COEFF_DEFAULTS)
+    cache = getattr(neat_inst, '_monodromy_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {}
+    for key, default in _MONODROMY_COEFF_DEFAULTS.items():
+        val = coeffs.get(key, default)
+        try:
+            val = float(val)
+        except Exception:
+            val = default
+        if not np.isfinite(val):
+            val = default
+        formatted[key] = repr(val)
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        template = _MONODROMY_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _MONODROMY_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _MONODROMY_COEFF_DEFAULTS, _MONODROMY_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+    neat_inst._monodromy_program_cache = (signature, program)
+    return program
+
+
+def _monodromy_compile_program(program: str):
+    cached = _MONODROMY_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty monodromy program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<monodromy_program>', 'exec')
+    _MONODROMY_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _monodromy_prepare_executor(neat_inst: 'ReproPlanaNEATPlus') -> Optional[Any]:
+    dirty = bool(getattr(neat_inst, '_monodromy_program_dirty', True))
+    program = getattr(neat_inst, '_monodromy_program_source', None)
+    if dirty or not isinstance(program, str) or not program.strip():
+        program = _monodromy_program_for(neat_inst)
+        neat_inst._monodromy_program_source = program
+        neat_inst._monodromy_program_dirty = False
+    try:
+        compiled = _monodromy_compile_program(program)
+    except Exception:
+        return None
+    return compiled
+
+
+def _monodromy_run_program(compiled: Any, state: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    target = locals_dict.get('target')
+    family_factor = locals_dict.get('family_factor')
+    if target is None or family_factor is None:
+        return None
+    try:
+        return {
+            'target': float(target),
+            'family_factor': float(family_factor),
+        }
+    except Exception:
+        return None
+
+
+def _stack_replay_observations(obs_list: Sequence[np.ndarray]) -> np.ndarray:
+    if not obs_list:
+        raise ValueError('empty observation list')
+    shapes = [tuple(obs.shape) for obs in obs_list]
+    first_shape = shapes[0]
+    if all(shape == first_shape for shape in shapes):
+        return np.stack(obs_list, axis=0).astype(np.float64, copy=False)
+    widths = [obs.size for obs in obs_list]
+    width = max(widths)
+    mat = np.zeros((len(obs_list), width), dtype=np.float64)
+    for idx, obs in enumerate(obs_list):
+        flat = np.asarray(obs, dtype=np.float64).ravel()
+        limit = min(flat.size, width)
+        if limit:
+            mat[idx, :limit] = flat[:limit]
+    return mat
+
+
+def _mutate_rl_weight_kernel(genome: 'Genome', rng: np.random.Generator) -> None:
+    coeffs = _ensure_rl_weight_coeffs(genome)
+    key = rng.choice(list(_RL_WEIGHT_COEFF_DEFAULTS.keys()))
+    current = float(coeffs.get(key, _RL_WEIGHT_COEFF_DEFAULTS[key]))
+    if key in ('novel_bias',):
+        current = float(np.clip(current + rng.normal(0.0, 0.25), -2.0, 4.0))
+    elif key in ('novel_scale', 'priority_gain', 'recency_scale'):
+        current = float(np.clip(current * math.exp(rng.normal(0.0, 0.3)), 0.0, 6.0))
+    elif key == 'entropy_gain':
+        current = float(np.clip(current + rng.normal(0.0, 0.12), -2.0, 2.0))
+    elif key == 'stability_gain':
+        current = float(np.clip(current + rng.normal(0.0, 0.18), -2.0, 3.0))
+    coeffs[key] = current
+    genome.rl_weight_coeffs = coeffs
+    setattr(genome, '_rl_weight_program_cache', None)
+
+
+def _mutate_rl_signal_kernel(genome: 'Genome', rng: np.random.Generator) -> None:
+    coeffs = _ensure_rl_signal_coeffs(genome)
+    key = rng.choice(list(_RL_SIGNAL_COEFF_DEFAULTS.keys()))
+    current = float(coeffs.get(key, _RL_SIGNAL_COEFF_DEFAULTS[key]))
+    if key.endswith('_base'):
+        current = float(np.clip(current + rng.normal(0.0, 0.08), -0.5, 1.5))
+    elif key.startswith('stress_'):
+        current = float(np.clip(current + rng.normal(0.0, 0.1), -0.5, 1.5))
+    else:
+        current = float(np.clip(current + rng.normal(0.0, 0.12), -0.5, 1.5))
+    coeffs[key] = current
+    genome.rl_signal_coeffs = coeffs
+    setattr(genome, '_rl_signal_program_cache', None)
+
+
+def _mutate_rl_scheduler_kernel(genome: 'Genome', rng: np.random.Generator) -> None:
+    coeffs = _ensure_rl_scheduler_coeffs(genome)
+    key = rng.choice(list(_RL_SCHED_COEFF_DEFAULTS.keys()))
+    current = float(coeffs.get(key, _RL_SCHED_COEFF_DEFAULTS[key]))
+    if key.endswith('_bias'):
+        current = float(np.clip(current + rng.normal(0.0, 0.05), -0.5, 0.5))
+    elif key.endswith('_memory'):
+        current = float(np.clip(current + rng.normal(0.0, 0.08), -1.5, 0.0))
+    else:
+        current = float(np.clip(current + rng.normal(0.0, 0.12), -1.5, 1.5))
+    coeffs[key] = current
+    genome.rl_scheduler_coeffs = coeffs
+    setattr(genome, '_rl_scheduler_program_cache', None)
+
+
+def _rl_collective_signal(
+    genome: 'Genome',
+    meta: Dict[str, Any],
+    *,
+    rewards: Optional[Sequence[float]]=None,
+    experiences: Optional[Sequence[Dict[str, Any]]]=None,
+) -> Dict[str, float]:
+    rewards_arr = None
+    if rewards:
+        try:
+            rewards_arr = np.asarray(rewards, dtype=np.float64)
+        except Exception:
+            rewards_arr = None
+    reward_mean = float(np.mean(rewards_arr)) if (rewards_arr is not None and rewards_arr.size) else float(meta.get('reward_ema', 0.0))
+    reward_std = float(np.std(rewards_arr)) if (rewards_arr is not None and rewards_arr.size) else 0.0
+    reward_span = float(np.ptp(rewards_arr)) if (rewards_arr is not None and rewards_arr.size) else 0.0
+    stability = float(np.clip(meta.get('stability', 0.0), 0.0, 1.0))
+    novelty_raw = float(meta.get('novelty_ema', 0.0))
+    novelty_scale = float(np.tanh(novelty_raw / (1.0 + abs(reward_mean) + reward_std + 1e-6)))
+    trend = float(meta.get('trend', 0.0))
+    denom = max(1.0, abs(reward_mean) + reward_std + 1e-6)
+    trend_norm = float(np.tanh(trend / denom))
+    memory_util = float(np.clip(meta.get('memory_util', 0.0), 0.0, 1.0))
+    lazy_strength = float(np.clip(getattr(genome, 'lazy_lineage_strength', 0.0), 0.0, 4.0))
+    lazy_share_base = lazy_strength / (lazy_strength + 1.5) if lazy_strength > 0 else 0.0
+    lazy_share = float(np.clip(0.2 + 0.45 * lazy_share_base + 0.35 * memory_util, 0.0, 1.0))
+    team_alignment = float(np.clip(meta.get('population_reward_alignment', 0.0), -1.0, 1.0))
+    team_trend = float(np.clip(meta.get('population_reward_trend_norm', 0.0), -1.0, 1.0))
+    team_best = float(np.clip(meta.get('population_reward_best_norm', 0.0), 0.0, 1.0))
+    team_pressure = float(max(0.0, meta.get('population_reward_pressure', 0.0)))
+    span_component = float(np.tanh((reward_span + reward_std) / denom)) if denom > 0 else 0.0
+    success_rate = float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+    success_window = float(np.clip(meta.get('success_window', success_rate), 0.0, 1.0))
+    advantage_span = float(np.clip(meta.get('advantage_span', 0.0), 0.0, 10.0))
+    advantage_peak = float(meta.get('advantage_peak', 0.0))
+    objective_default = float(
+        np.clip(
+            _RL_SIGNAL_COEFF_DEFAULTS['team_objective_bias']
+            + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_alignment'] * team_alignment
+            + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_trend'] * trend_norm
+            - _RL_SIGNAL_COEFF_DEFAULTS['team_objective_pressure'] * team_pressure
+            + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_best'] * team_best
+            + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_span'] * span_component,
+            -3.0,
+            3.0,
+        )
+    )
+    done_ratio = 0.0
+    if experiences:
+        done_flags = [1.0 if bool(exp.get('done')) else 0.0 for exp in experiences]
+        if done_flags:
+            done_ratio = float(sum(done_flags) / len(done_flags))
+    coeffs = _ensure_rl_signal_coeffs(genome)
+    requested_program = _rl_signal_program_for(genome)
+    default_program = _RL_SIGNAL_DSL_TEMPLATE.format(
+        **{k: repr(v) for k, v in _RL_SIGNAL_COEFF_DEFAULTS.items()}
+    )
+    program = requested_program
+    state = {
+        'stability': stability,
+        'trend_norm': trend_norm,
+        'done_ratio': done_ratio,
+        'novelty_scale': novelty_scale,
+        'lazy_share': lazy_share,
+        'reward_span': reward_span,
+        'reward_std': reward_std,
+        'denom': denom,
+        'team_alignment': team_alignment,
+        'team_trend': team_trend,
+        'team_best': team_best,
+        'team_pressure': team_pressure,
+        'span_component': span_component,
+        'success_rate': success_rate,
+        'success_window': success_window,
+        'advantage_span': advantage_span,
+        'advantage_peak': advantage_peak,
+    }
+    signal = _rl_run_signal_program(state, program)
+    if signal is None:
+        program = default_program
+        signal = _rl_run_signal_program(state, program)
+    if signal is None:
+        signal = {
+            'altruism_target': float(np.clip(coeffs.get('altruism_base', 0.4), 0.0, 1.0)),
+            'solidarity': float(np.clip(coeffs.get('solidarity_base', 0.3), 0.0, 1.0)),
+            'stress': float(np.clip(coeffs.get('stress_bias', 0.35), 0.0, 1.0)),
+            'lazy_share': float(np.clip(lazy_share, 0.0, 1.0)),
+            'advantage': float(np.clip(coeffs.get('advantage_base', 0.45), 0.0, 1.0)),
+            'group_reward_alignment': float(team_alignment),
+            'group_reward_trend': float(team_trend),
+            'group_reward_best': float(team_best),
+            'group_reward_pressure': float(team_pressure),
+            'group_reward_delta': float(meta.get('population_reward_delta', 0.0)),
+            'team_objective': objective_default,
+            'group_reward_objective': objective_default,
+            'success_rate': success_rate,
+            'success_window': success_window,
+            'advantage_span': advantage_span,
+            'advantage_peak': advantage_peak,
+        }
+    else:
+        signal = {
+            'altruism_target': float(np.clip(signal.get('altruism_target', 0.5), 0.0, 1.0)),
+            'solidarity': float(np.clip(signal.get('solidarity', 0.5), 0.0, 1.0)),
+            'stress': float(np.clip(signal.get('stress', 0.0), 0.0, 1.0)),
+            'lazy_share': float(np.clip(signal.get('lazy_share', lazy_share), 0.0, 1.0)),
+            'advantage': float(np.clip(signal.get('advantage', 0.0), 0.0, 1.0)),
+            'group_reward_alignment': float(np.clip(signal.get('group_reward_alignment', team_alignment), -1.0, 1.0)),
+            'group_reward_trend': float(np.clip(signal.get('group_reward_trend', team_trend), -1.0, 1.0)),
+            'group_reward_best': float(np.clip(signal.get('group_reward_best', team_best), 0.0, 1.0)),
+            'group_reward_pressure': float(max(0.0, signal.get('group_reward_pressure', team_pressure))),
+            'group_reward_delta': float(signal.get('group_reward_delta', meta.get('population_reward_delta', 0.0))),
+            'team_objective': float(np.clip(signal.get('team_objective', objective_default), -3.0, 3.0)),
+            'group_reward_objective': float(np.clip(signal.get('team_objective', objective_default), -3.0, 3.0)),
+            'success_rate': float(np.clip(signal.get('success_rate', success_rate), 0.0, 1.0)),
+            'success_window': float(np.clip(signal.get('success_window', success_window), 0.0, 1.0)),
+            'advantage_span': float(np.clip(signal.get('advantage_span', advantage_span), 0.0, 10.0)),
+            'advantage_peak': float(signal.get('advantage_peak', advantage_peak)),
+        }
+    if isinstance(meta, dict):
+        meta['signal_kernel'] = dict(coeffs)
+        meta['signal_program_requested'] = requested_program
+        meta['signal_program'] = program
+        meta['team_objective'] = float(signal.get('team_objective', objective_default))
+        meta['group_reward_objective'] = float(
+            signal.get('group_reward_objective', signal.get('team_objective', objective_default))
+        )
+    return signal
 
 
 def _structure_cache_key(g: 'Genome', order: Sequence[int]) -> Optional[Tuple[Any, ...]]:
@@ -852,6 +2627,27 @@ class Genome:
         self.cooperative = bool(cooperative)
         self.meta_reflections: List[Dict[str, Any]] = []
         self._meta_revision = 0
+        self.rl_params: Dict[str, float] = {
+            'lr': float(np.clip(np.random.uniform(5e-4, 5e-2), 1e-5, 0.2)),
+            'gamma': float(np.clip(np.random.uniform(0.88, 0.997), 0.0, 0.9995)),
+            'entropy': float(np.clip(np.random.uniform(5e-4, 5e-2), 0.0, 0.5)),
+            'gae_lambda': float(np.clip(np.random.uniform(0.85, 0.99), 0.2, 0.9995)),
+        }
+        self.rl_memory_limit = int(_DEFAULT_RL_MEMORY_LIMIT)
+        self.rl_memory: deque = deque(maxlen=self.rl_memory_limit)
+        self.rl_success_archive: deque = deque(maxlen=_RL_SUCCESS_ARCHIVE_LIMIT)
+        self.rl_train_steps = int(18)
+        self.rl_l2 = float(0.0001)
+        self.rl_meta: Dict[str, Any] = _rl_default_meta()
+        self.rl_weight_coeffs: Dict[str, float] = dict(_RL_WEIGHT_COEFF_DEFAULTS)
+        self.rl_weight_program_template: str = _RL_WEIGHT_DSL_TEMPLATE
+        self.rl_signal_coeffs: Dict[str, float] = dict(_RL_SIGNAL_COEFF_DEFAULTS)
+        self.rl_signal_program_template: str = _RL_SIGNAL_DSL_TEMPLATE
+        self.rl_scheduler_coeffs: Dict[str, float] = dict(_RL_SCHED_COEFF_DEFAULTS)
+        self.rl_scheduler_program_template: str = _RL_SCHED_DSL_TEMPLATE
+        self._rl_weight_program_cache: Optional[Tuple[Any, str]] = None
+        self._rl_signal_program_cache: Optional[Tuple[Any, str]] = None
+        self._rl_scheduler_program_cache: Optional[Tuple[Any, str]] = None
 
     def meta_reflect(self, event: str, payload: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
         info = dict(payload or {})
@@ -906,6 +2702,55 @@ class Genome:
         g.max_hidden_nodes = self.max_hidden_nodes
         g.max_edges = self.max_edges
         g._compat_cache = None
+        try:
+            g.rl_params = dict(getattr(self, 'rl_params', {}))
+        except Exception:
+            g.rl_params = dict()
+        limit = int(getattr(self, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
+        g.rl_memory_limit = limit
+        try:
+            buf = list(getattr(self, 'rl_memory', []))
+        except Exception:
+            buf = []
+        g.rl_memory = deque(buf, maxlen=limit)
+        try:
+            success_buf = list(getattr(self, 'rl_success_archive', []))
+        except Exception:
+            success_buf = []
+        g.rl_success_archive = deque(success_buf, maxlen=_RL_SUCCESS_ARCHIVE_LIMIT)
+        g.rl_train_steps = int(getattr(self, 'rl_train_steps', 18))
+        g.rl_l2 = float(getattr(self, 'rl_l2', 0.0001))
+        try:
+            meta = dict(getattr(self, 'rl_meta', {}))
+        except Exception:
+            meta = {}
+        merged_meta = _rl_default_meta()
+        merged_meta.update(meta)
+        g.rl_meta = merged_meta
+        try:
+            coeffs = dict(getattr(self, 'rl_weight_coeffs', {}))
+        except Exception:
+            coeffs = dict(_RL_WEIGHT_COEFF_DEFAULTS)
+        g.rl_weight_coeffs = _rl_sanitise_weight_coeffs(coeffs)
+        template = getattr(self, 'rl_weight_program_template', _RL_WEIGHT_DSL_TEMPLATE)
+        g.rl_weight_program_template = template if isinstance(template, str) else _RL_WEIGHT_DSL_TEMPLATE
+        try:
+            sig_coeffs = dict(getattr(self, 'rl_signal_coeffs', {}))
+        except Exception:
+            sig_coeffs = dict(_RL_SIGNAL_COEFF_DEFAULTS)
+        g.rl_signal_coeffs = _rl_sanitise_signal_coeffs(sig_coeffs)
+        sig_template = getattr(self, 'rl_signal_program_template', _RL_SIGNAL_DSL_TEMPLATE)
+        g.rl_signal_program_template = sig_template if isinstance(sig_template, str) else _RL_SIGNAL_DSL_TEMPLATE
+        try:
+            sched_coeffs = dict(getattr(self, 'rl_scheduler_coeffs', {}))
+        except Exception:
+            sched_coeffs = dict(_RL_SCHED_COEFF_DEFAULTS)
+        g.rl_scheduler_coeffs = _rl_sanitise_scheduler_coeffs(sched_coeffs)
+        sched_template = getattr(self, 'rl_scheduler_program_template', _RL_SCHED_DSL_TEMPLATE)
+        g.rl_scheduler_program_template = sched_template if isinstance(sched_template, str) else _RL_SCHED_DSL_TEMPLATE
+        g._rl_weight_program_cache = None
+        g._rl_signal_program_cache = None
+        g._rl_scheduler_program_cache = None
         return g
 
     def invalidate_caches(self, structure: bool=False, weights: bool=False):
@@ -1233,6 +3078,37 @@ class Genome:
             'changed': len(deltas),
         }
         self.meta_reflect('mutate_weights', payload)
+
+    def mutate_parameter(
+        self,
+        key: str,
+        rng: np.random.Generator,
+        *,
+        sigma: float=0.2,
+        low: Optional[float]=None,
+        high: Optional[float]=None,
+        log_scale: bool=False,
+    ) -> bool:
+        params = getattr(self, 'rl_params', None)
+        if not params or key not in params:
+            return False
+        val = float(params[key])
+        try:
+            if log_scale:
+                baseline = math.log(max(1e-12, val))
+                perturbed = baseline + float(rng.normal(0.0, max(1e-6, sigma)))
+                new_val = math.exp(perturbed)
+            else:
+                scale = max(abs(val), 1e-3)
+                new_val = val + float(rng.normal(0.0, max(1e-6, sigma))) * scale
+        except Exception:
+            return False
+        if low is not None:
+            new_val = max(float(low), new_val)
+        if high is not None:
+            new_val = min(float(high), new_val)
+        params[key] = float(new_val)
+        return True
 
     def mutate_toggle_enable(self, rng: np.random.Generator, prob=0.01):
         changed = False
@@ -2653,9 +4529,9 @@ class ReproPlanaNEATPlus:
         self.refine_topk_ratio = float(os.environ.get('NEAT_REFINE_TOPK_RATIO', '0.08'))
         self.stagnation_window = 6
         self.stagnation_delta = 1e-3
-        self.stagnation_commission_strength = 0.35
-        self.stagnation_commission_cooldown = 6
-        self.stagnation_elite_bias = 0.65
+        self.stagnation_commission_strength = 0.45
+        self.stagnation_commission_cooldown = 5
+        self.stagnation_elite_bias = 0.78
         self.stagnation_difficulty_bump = 0.12
         self.stagnation_flagged_penalty = 0.08
         self.stagnation_flagged_window = 12
@@ -2671,7 +4547,28 @@ class ReproPlanaNEATPlus:
         self._stagnation_elite_freeze = 0
         self._stagnation_flagged: Dict[int, int] = {}
         self._stagnation_pending_event: Optional[Dict[str, Any]] = None
+        self._top3_static_ids: Tuple[int, ...] = tuple()
+        self._top3_static_count: int = 0
+        self._top3_static_pressure: float = 1.0
+        self._top3_static_snapshot: Dict[str, Any] = {}
+        self.altruism_retirement_trigger = 0.85
+        self.altruism_retirement_penalty_scale = 0.34
+        self.altruism_retirement_cooldown = 5
+        self.altruism_retirement_static_gain = 0.6
+        self.altruism_retirement_scarcity_gain = 0.45
+        self.altruism_retirement_monodromy_gain = 0.35
+        self.altruism_retirement_entropy_relief = 0.45
+        self._altruism_retirees: Dict[int, Dict[str, Any]] = {}
+        self._altruism_retirement_snapshot: Dict[str, Any] = {}
         self.stagnation_commission_history: List[Dict[str, Any]] = []
+        self.rl_param_mutation_rate = 0.35
+        self._rl_collective_objective: Dict[str, float] = {}
+        self._rl_collective_history: deque = deque(maxlen=64)
+        self.monodromy_program_template: str = _MONODROMY_DSL_TEMPLATE
+        self.monodromy_program_coeffs: Dict[str, float] = dict(_MONODROMY_COEFF_DEFAULTS)
+        self._monodromy_program_source: Optional[str] = None
+        self._monodromy_program_dirty: bool = True
+        self._monodromy_program_cache: Optional[Tuple[Any, str]] = None
         nodes = {}
         for i in range(num_inputs):
             nodes[i] = NodeGene(i, 'input', 'identity')
@@ -2742,7 +4639,7 @@ class ReproPlanaNEATPlus:
         self.sex_fitness_scale = {'female': 1.0, 'male': 0.9, 'hermaphrodite': 1.2}
         self.regen_bonus = 0.2
         self.regen_mut_rate_boost = 1.8
-        self.non_elite_mating_rate = 0.5
+        self.non_elite_mating_rate = 0.6
         self.lcs_reward_weight = 0.02
         self.diversity_weight = 0.02
         self.hermaphrodite_mate_bias = 2.5
@@ -2758,8 +4655,8 @@ class ReproPlanaNEATPlus:
         self.hermaphrodite_altruism_penalty = 0.12
         self.hermaphrodite_altruism_memory_drop = 0.08
         self.hermaphrodite_altruism_span_stress = 0.18
-        self.lazy_fraction = 0.02
-        self.lazy_fraction_max = 0.021
+        self.lazy_fraction = 0.028
+        self.lazy_fraction_max = 0.035
         self.lazy_individual_fitness = -1.0
         self.auto_complexity_controls = True
         self.auto_complexity_bonus_fraction = 0.18
@@ -2768,11 +4665,11 @@ class ReproPlanaNEATPlus:
         self.lazy_complexity_target_scale = 1.18
         self.lazy_complexity_duplicate_bias = 0.45
         self.lazy_complexity_min_growth = 0.0
-        self.lazy_lineage_decay = 0.82
-        self.lazy_lineage_strength_cap = 3.0
-        self.lazy_lineage_inheritance_gain = 0.32
-        self.lazy_lineage_inheritance_decay = 0.24
-        self.lazy_lineage_persistence = 0.7
+        self.lazy_lineage_decay = 0.88
+        self.lazy_lineage_strength_cap = 3.4
+        self.lazy_lineage_inheritance_gain = 0.38
+        self.lazy_lineage_inheritance_decay = 0.22
+        self.lazy_lineage_persistence = 0.76
         self.env = {
             'difficulty': 0.0,
             'noise_std': 0.0,
@@ -2838,8 +4735,18 @@ class ReproPlanaNEATPlus:
         self.monodromy_diversity_grace_strength = 0.3
         self.monodromy_noise_weight = 0.25
         self.monodromy_family_weight = 0.35
+        self.monodromy_envelope_floor = 0.3
+        self.monodromy_envelope_bias = 0.9
+        self.monodromy_envelope_cap = 1.25
         self.monodromy_noise_style_overrides: Dict[str, Dict[str, Any]] = {}
+        self.monodromy_non_rl_pressure_boost = 1.45
+        self.monodromy_non_rl_base_floor = 0.012
+        self.monodromy_non_rl_cap_gain = 0.35
+        self.monodromy_non_rl_envelope_floor = 0.42
+        self.monodromy_non_rl_envelope_bias = 1.1
+        self.monodromy_non_rl_top_pressure_min = 1.4
         self._monodromy_registry: Dict[int, Dict[str, float]] = {}
+        self._monodromy_last_boost: float = 1.0
         self._monodromy_snapshot: Dict[str, float] = {
             'pressure_mean': 0.0,
             'pressure_max': 0.0,
@@ -2858,6 +4765,7 @@ class ReproPlanaNEATPlus:
             'noise_entropy': 0.0,
             'family_factor_mean': 1.0,
             'family_factor_max': 1.0,
+            'span_scale': 0.0,
         }
         self._monodromy_noise_tag = ''
         self._auto_complexity_bonus_state = {
@@ -2971,6 +4879,106 @@ class ReproPlanaNEATPlus:
             fid = self._next_family_id()
         child.family_id = int(fid)
         return int(fid)
+
+    def _update_rl_collective_objective(self, generation: int) -> Dict[str, float]:
+        metas: List[Dict[str, Any]] = []
+        for g in self.population:
+            meta = getattr(g, 'rl_meta', None)
+            if not isinstance(meta, dict):
+                continue
+            if int(meta.get('episodes', 0) or 0) <= 0:
+                continue
+            metas.append(meta)
+        if not metas:
+            self._rl_collective_objective = {}
+            controller = getattr(self, 'spinor_controller', None)
+            if controller is not None and hasattr(controller, 'update_rl_objective'):
+                try:
+                    controller.update_rl_objective(generation, {})
+                except Exception:
+                    pass
+            return {}
+        reward_mean = np.asarray(
+            [float(m.get('reward_ema', m.get('last_reward', 0.0))) for m in metas],
+            dtype=np.float64,
+        )
+        reward_best = np.asarray(
+            [float(m.get('best_reward', m.get('last_reward', 0.0))) for m in metas],
+            dtype=np.float64,
+        )
+        reward_trend = np.asarray(
+            [float(m.get('trend', 0.0)) for m in metas],
+            dtype=np.float64,
+        )
+        reward_var = np.asarray(
+            [max(0.0, float(m.get('reward_var', 0.0))) for m in metas],
+            dtype=np.float64,
+        )
+        pop_mean = float(np.mean(reward_mean)) if reward_mean.size else 0.0
+        pop_best = float(np.max(reward_best)) if reward_best.size else pop_mean
+        pop_trend = float(np.mean(reward_trend)) if reward_trend.size else 0.0
+        pop_var = float(np.mean(reward_var)) if reward_var.size else 0.0
+        pop_std = float(np.sqrt(max(pop_var, 1e-09)))
+        alignment = float(np.tanh(pop_mean / (1.0 + pop_std + abs(pop_best) * 0.05)))
+        trend_norm = float(np.tanh(pop_trend / (1.0 + pop_std + abs(pop_mean) * 0.1)))
+        best_norm = float(np.tanh(pop_best / (1.0 + pop_std + abs(pop_mean))))
+        spread = float(np.tanh(float(np.std(reward_mean)) / (1.0 + abs(pop_mean) + pop_std))) if reward_mean.size else 0.0
+        pressure = float(np.clip(max(0.0, -trend_norm) + 0.5 * max(0.0, 0.35 - alignment), 0.0, 2.0))
+        denom = max(1.0, abs(pop_mean) + pop_std)
+        span_component = float(np.tanh((pop_std + spread) / denom))
+        objective = float(
+            np.clip(
+                _RL_SIGNAL_COEFF_DEFAULTS['team_objective_bias']
+                + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_alignment'] * alignment
+                + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_trend'] * trend_norm
+                - _RL_SIGNAL_COEFF_DEFAULTS['team_objective_pressure'] * pressure
+                + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_best'] * best_norm
+                + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_span'] * span_component,
+                -3.0,
+                3.0,
+            )
+        )
+        history = getattr(self, '_rl_collective_history', None)
+        prev_delta = 0.0
+        if isinstance(history, deque) and history:
+            prev_mean = float(history[-1].get('mean', 0.0))
+            prev_delta = float(pop_mean - prev_mean)
+        snapshot = {
+            'generation': int(generation),
+            'mean': pop_mean,
+            'best': pop_best,
+            'trend': pop_trend,
+            'std': pop_std,
+            'alignment': alignment,
+            'trend_norm': trend_norm,
+            'best_norm': best_norm,
+            'spread': spread,
+            'pressure': pressure,
+            'delta_mean': prev_delta,
+            'objective': objective,
+        }
+        if isinstance(history, deque):
+            history.append(snapshot)
+        for meta in metas:
+            meta['population_reward_mean'] = pop_mean
+            meta['population_reward_best'] = pop_best
+            meta['population_reward_trend'] = pop_trend
+            meta['population_reward_std'] = pop_std
+            meta['population_reward_alignment'] = alignment
+            meta['population_reward_trend_norm'] = trend_norm
+            meta['population_reward_best_norm'] = best_norm
+            meta['population_reward_pressure'] = pressure
+            meta['population_reward_spread'] = spread
+            meta['population_reward_delta'] = prev_delta
+            meta['population_reward_objective'] = objective
+        self._rl_collective_objective = snapshot
+        controller = getattr(self, 'spinor_controller', None)
+        if controller is not None and hasattr(controller, 'update_rl_objective'):
+            try:
+                controller.update_rl_objective(generation, snapshot)
+            except Exception:
+                pass
+        return snapshot
 
     def _update_lazy_feedback(self, generation: int, fitnesses: Sequence[float], best_idx: int, best_fit: float, avg_fit: float) -> None:
         total = len(self.population)
@@ -3136,6 +5144,183 @@ class ReproPlanaNEATPlus:
                 flagged.pop(int(gid), None)
             self._stagnation_flagged = flagged
 
+    def _decay_altruism_retirements(self, generation: int) -> None:
+        registry = getattr(self, '_altruism_retirees', None)
+        if not isinstance(registry, dict):
+            self._altruism_retirees = {}
+            return
+        changed = False
+        for gid, info in list(registry.items()):
+            try:
+                until = int(info.get('until', info.get('cooldown', 0)))
+            except Exception:
+                try:
+                    until = int(info)
+                except Exception:
+                    until = generation
+            if generation >= until:
+                registry.pop(gid, None)
+                changed = True
+                for genome in self.population:
+                    if int(getattr(genome, 'id', -1)) == int(gid):
+                        setattr(genome, 'altruism_retired', False)
+                        setattr(genome, 'altruism_retirement_until', generation)
+                        break
+        if changed:
+            self._altruism_retirees = registry
+
+    @staticmethod
+    def _altruism_profile(genome: 'Genome') -> Dict[str, float]:
+        alt_vals: List[float] = []
+        mem_vals: List[float] = []
+        span_vals: List[float] = []
+        for node in getattr(genome, 'nodes', {}).values():
+            ntype = getattr(node, 'type', '')
+            if ntype in ('input', 'bias'):
+                continue
+            alt_vals.append(float(np.clip(getattr(node, 'altruism', 0.5), 0.0, 1.0)))
+            mem_vals.append(float(np.clip(getattr(node, 'altruism_memory', 0.0), -1.5, 1.5)))
+            span_vals.append(float(np.clip(getattr(node, 'altruism_span', 0.0), 0.0, 4.0)))
+        if not alt_vals:
+            return {
+                'alt_mean': 0.5,
+                'alt_max': 0.5,
+                'mem_mean': 0.0,
+                'span_mean': 0.0,
+                'count': 0,
+            }
+        alt_arr = np.asarray(alt_vals, dtype=np.float64)
+        mem_arr = np.asarray(mem_vals, dtype=np.float64) if mem_vals else np.zeros_like(alt_arr)
+        span_arr = np.asarray(span_vals, dtype=np.float64) if span_vals else np.zeros_like(alt_arr)
+        return {
+            'alt_mean': float(alt_arr.mean()),
+            'alt_max': float(alt_arr.max()),
+            'mem_mean': float(mem_arr.mean()) if mem_vals else 0.0,
+            'span_mean': float(span_arr.mean()) if span_vals else 0.0,
+            'count': int(len(alt_vals)),
+        }
+
+    def _apply_altruism_retirement(
+        self,
+        top3_best: Sequence[Tuple['Genome', float, int]],
+        fitnesses: List[float],
+        baseline_fitnesses: List[float],
+        generation: int,
+    ) -> None:
+        self._decay_altruism_retirements(generation)
+        registry = getattr(self, '_altruism_retirees', {})
+        diversity = getattr(self, '_diversity_snapshot', {}) or {}
+        scarcity = float(max(0.0, diversity.get('scarcity', 0.0))) if isinstance(diversity, dict) else 0.0
+        entropy_norm = diversity.get('entropy_norm', diversity.get('entropy', 0.0)) if isinstance(diversity, dict) else 0.0
+        try:
+            entropy_norm = float(entropy_norm)
+        except Exception:
+            entropy_norm = 0.0
+        entropy_norm = max(0.0, entropy_norm)
+        mono = getattr(self, '_monodromy_snapshot', {}) or {}
+        mono_pressure = float(max(0.0, mono.get('pressure_mean', 0.0))) if isinstance(mono, dict) else 0.0
+        static_count = int(getattr(self, '_top3_static_count', 0) or 0)
+        static_pressure = max(0.0, float(getattr(self, '_top3_static_pressure', 1.0)) - 1.0)
+        retire_pressure = (
+            float(self.altruism_retirement_static_gain) * static_pressure
+            + float(self.altruism_retirement_scarcity_gain) * scarcity
+            + float(self.altruism_retirement_monodromy_gain) * mono_pressure
+        )
+        collective = getattr(self, '_collective_signal', {}) or {}
+        altruism_target = float(collective.get('altruism_target', 0.5) or 0.5)
+        solidarity = float(collective.get('solidarity', 0.5) or 0.5)
+        retire_pressure *= float(1.0 + 0.3 * max(0.0, altruism_target - 0.5))
+        retire_pressure *= float(1.0 + 0.25 * max(0.0, solidarity - 0.5))
+        if entropy_norm > 1.0:
+            relief = 1.0 / (1.0 + float(self.altruism_retirement_entropy_relief) * (entropy_norm - 1.0))
+            retire_pressure *= float(max(0.2, relief))
+        retire_pressure = float(max(0.0, retire_pressure))
+        base_floor = min(baseline_fitnesses) if baseline_fitnesses else 0.0
+        retired: Dict[int, Dict[str, Any]] = {}
+        trigger_threshold = float(self.altruism_retirement_trigger)
+        penalty_scale = float(max(0.05, self.altruism_retirement_penalty_scale))
+        for genome, _fit, _gen in top3_best[:3]:
+            if genome is None:
+                continue
+            gid = int(getattr(genome, 'id', -1))
+            profile = self._altruism_profile(genome)
+            drive = profile['alt_mean'] + 0.45 * max(0.0, profile['mem_mean'])
+            drive += 0.25 * max(0.0, profile['alt_max'] - profile['alt_mean'])
+            drive -= 0.18 * profile['span_mean']
+            drive += 0.12 * max(0.0, altruism_target - 0.5)
+            lazy_strength = float(getattr(genome, 'lazy_lineage_strength', 0.0) or 0.0)
+            drive += 0.08 * max(0.0, lazy_strength - 1.0)
+            drive = float(max(0.0, drive))
+            score = retire_pressure * drive
+            retired_flag = False
+            if score >= trigger_threshold and static_count > 0:
+                try:
+                    idx = next(i for i, g in enumerate(self.population) if g.id == gid)
+                except StopIteration:
+                    idx = None
+                if idx is not None and 0 <= idx < len(fitnesses):
+                    already = registry.get(gid, {})
+                    cooldown_until = int(already.get('until', -1)) if isinstance(already, dict) else int(already or -1)
+                    if generation >= cooldown_until:
+                        base = abs(fitnesses[idx]) + abs(base_floor) + 1.0
+                        strength = penalty_scale * (1.0 + 0.5 * static_pressure + 0.25 * scarcity)
+                        strength *= float(1.0 + min(1.5, max(0.0, score - trigger_threshold)))
+                        penalty = base * strength
+                        fitnesses[idx] = float(fitnesses[idx] - penalty)
+                        if idx < len(baseline_fitnesses):
+                            baseline_fitnesses[idx] = float(baseline_fitnesses[idx] - penalty)
+                        setattr(genome, 'altruism_retired', True)
+                        cooldown = int(max(1, round(self.altruism_retirement_cooldown + 2 * static_pressure)))
+                        expiry = generation + cooldown
+                        setattr(genome, 'altruism_retirement_until', expiry)
+                        genome.cooperative = False
+                        try:
+                            strength_prev = float(getattr(genome, 'lazy_lineage_strength', 0.0) or 0.0)
+                            setattr(genome, 'lazy_lineage_strength', float(np.clip(strength_prev * 0.5, 0.0, strength_prev)))
+                        except Exception:
+                            pass
+                        registry[gid] = {
+                            'until': int(expiry),
+                            'score': float(score),
+                            'pressure': float(retire_pressure),
+                            'penalty': float(penalty),
+                            'generation': int(generation),
+                        }
+                        try:
+                            genome.meta_reflect(
+                                'altruism_retire',
+                                {
+                                    'score': float(score),
+                                    'pressure': float(retire_pressure),
+                                    'penalty': float(penalty),
+                                    'generation': int(generation),
+                                },
+                            )
+                        except Exception:
+                            pass
+                        self._note_lineage(gid, generation, f'altruism_retire {score:.2f} Δ{penalty:.3f}')
+                        retired[gid] = registry[gid]
+                        retired_flag = True
+            if not retired_flag:
+                try:
+                    registry.setdefault(gid, {})
+                except Exception:
+                    registry[gid] = {}
+        snapshot = {
+            'generation': int(generation),
+            'pressure': float(retire_pressure),
+            'retired': int(len(retired)),
+            'candidates': int(len(top3_best[:3])),
+            'static_count': int(static_count),
+            'scarcity': float(scarcity),
+            'entropy_norm': float(entropy_norm),
+            'mono_pressure': float(mono_pressure),
+        }
+        if retired:
+            snapshot['scores'] = {int(k): float(v.get('score', 0.0)) for k, v in retired.items()}
+        self._altruism_retirees = registry
+        self._altruism_retirement_snapshot = snapshot
+
     def _monitor_top3_stagnation(
         self,
         top3_best: Sequence[Tuple['Genome', float, int]],
@@ -3151,6 +5336,7 @@ class ReproPlanaNEATPlus:
             watch = {
                 'last_ids': tuple(),
                 'count': 0,
+                'unchanged_count': 0,
                 'last_best': None,
                 'last_avg': None,
                 'cooldown': 0,
@@ -3166,6 +5352,48 @@ class ReproPlanaNEATPlus:
         ids = tuple(int(g.id) for g, _fit, _gen in top3_best[:3])
         if not ids:
             watch.update({'last_ids': tuple(), 'count': 0, 'last_best': best_fit, 'last_avg': avg_fit, 'last_gen': int(generation)})
+            self._top3_static_ids = tuple()
+            self._top3_static_count = 0
+            self._top3_static_pressure = 1.0
+            self._top3_static_snapshot = {
+                'generation': int(generation),
+                'count': 0,
+                'pressure': 1.0,
+                'stagnating': False,
+                'family_lock': False,
+                'delta_mag': 0.0,
+                'window': max(3, int(getattr(self, 'stagnation_window', 6))),
+            }
+            diversity = getattr(self, '_diversity_snapshot', {}) or {}
+            entropy_norm = 0.0
+            scarcity = 0.0
+            if isinstance(diversity, dict):
+                try:
+                    entropy_norm = float(diversity.get('entropy_norm', diversity.get('entropy', 0.0)) or 0.0)
+                except Exception:
+                    entropy_norm = 0.0
+                try:
+                    scarcity = float(diversity.get('scarcity', 0.0) or 0.0)
+                except Exception:
+                    scarcity = 0.0
+            mono = getattr(self, '_monodromy_snapshot', {}) or {}
+            mono_pressure = 0.0
+            if isinstance(mono, dict):
+                try:
+                    mono_pressure = float(mono.get('pressure_mean', 0.0) or 0.0)
+                except Exception:
+                    mono_pressure = 0.0
+            self._decay_altruism_retirements(generation)
+            self._altruism_retirement_snapshot = {
+                'generation': int(generation),
+                'pressure': 0.0,
+                'retired': 0,
+                'candidates': 0,
+                'static_count': 0,
+                'scarcity': float(scarcity),
+                'entropy_norm': float(max(0.0, entropy_norm)),
+                'mono_pressure': float(max(0.0, mono_pressure)),
+            }
             return
         last_ids = tuple(watch.get('last_ids', tuple()))
         unchanged = ids == last_ids and len(ids) == len(last_ids)
@@ -3210,6 +5438,10 @@ class ReproPlanaNEATPlus:
             watch['count'] = 1
         else:
             watch['count'] = 0
+        if unchanged:
+            watch['unchanged_count'] = int(watch.get('unchanged_count', 0)) + 1
+        else:
+            watch['unchanged_count'] = 0
         reason_parts: List[str] = []
         if stagnating:
             reason_parts.append('delta')
@@ -3240,6 +5472,35 @@ class ReproPlanaNEATPlus:
                 top_family_share=top_family_share,
                 stasis=stasis_signal,
             )
+
+        self._top3_static_ids = ids
+        raw_static = int(watch.get('unchanged_count', 0))
+        base_multiplier = 1.0 + 0.6 * math.log1p(raw_static)
+        if raw_static >= window:
+            base_multiplier += 0.25 * (raw_static - window + 1)
+        if stagnating and raw_static > 0:
+            base_multiplier *= 1.0 + min(1.8, 0.25 * raw_static)
+        if family_lock and raw_static > 0:
+            base_multiplier *= 1.0 + min(1.2, 0.18 * raw_static)
+        if stasis_signal > 0.35:
+            base_multiplier *= 1.0 + min(0.9, 0.12 * raw_static)
+        base_multiplier = float(np.clip(base_multiplier, 1.0, 12.0))
+        if not unchanged:
+            base_multiplier = max(1.0, base_multiplier * 0.6)
+        self._top3_static_count = raw_static if unchanged else 0
+        self._top3_static_pressure = base_multiplier
+        self._top3_static_snapshot = {
+            'generation': int(generation),
+            'ids': ids,
+            'count': int(raw_static if unchanged else 0),
+            'stagnating': bool(stagnating),
+            'family_lock': bool(family_lock),
+            'stasis_signal': float(stasis_signal),
+            'delta_mag': float(delta_mag),
+            'pressure': float(self._top3_static_pressure),
+            'window': int(window),
+        }
+        self._apply_altruism_retirement(top3_best, fitnesses, baseline_fitnesses, generation)
 
     def _trigger_stagnation_intervention(
         self,
@@ -3350,15 +5611,29 @@ class ReproPlanaNEATPlus:
         lazy_share = float(np.clip(lazy.get('share', 0.0), 0.0, 1.0))
         advantage = float(getattr(evaluator, 'last_advantage_score', 0.0) or 0.0)
         altruism_hint = float(np.clip(getattr(evaluator, 'last_altruism_signal', 0.5) or 0.5, 0.0, 1.0))
-        solidarity = float(np.clip(diversity_entropy, 0.0, 1.0))
-        stress = float(np.clip(diversity_scarcity + max(0.0, family_surplus_mean), 0.0, 2.5))
-        target = float(np.clip(0.6 * altruism_hint + 0.4 * (1.0 - advantage), 0.0, 1.0))
+        rl_obj = getattr(self, '_rl_collective_objective', {}) or {}
+        team_alignment = float(np.clip(rl_obj.get('alignment', 0.0), -1.0, 1.0))
+        team_trend = float(np.clip(rl_obj.get('trend_norm', 0.0), -1.0, 1.0))
+        team_best = float(np.clip(rl_obj.get('best_norm', 0.0), 0.0, 1.0))
+        team_pressure = float(max(0.0, rl_obj.get('pressure', 0.0)))
+        team_delta = float(rl_obj.get('delta_mean', 0.0))
+        solidarity = float(max(0.0, diversity_entropy)) + 0.35 * max(0.0, team_alignment)
+        stress = float(np.clip(diversity_scarcity + max(0.0, family_surplus_mean) + 0.6 * team_pressure, 0.0, 3.0))
+        altruism_drive = 0.6 * altruism_hint + 0.25 * (1.0 - advantage)
+        altruism_drive += 0.2 * (0.5 + 0.5 * team_alignment + 0.25 * team_trend)
+        altruism_drive += 0.1 * (0.5 + 0.5 * team_best + 0.3 * np.tanh(team_delta))
+        target = float(np.clip(altruism_drive, 0.0, 1.0))
         self._collective_signal = {
             'altruism_target': target,
             'solidarity': solidarity,
             'stress': stress,
             'lazy_share': lazy_share,
             'advantage': advantage,
+            'group_reward_alignment': float(team_alignment),
+            'group_reward_trend': float(team_trend),
+            'group_reward_best': float(team_best),
+            'group_reward_pressure': float(team_pressure),
+            'group_reward_delta': float(team_delta),
         }
         if controller is not None:
             try:
@@ -3572,6 +5847,21 @@ class ReproPlanaNEATPlus:
             scale = float(getattr(self, 'mutation_will_mutation_scale', 0.05))
             delta = float(self.rng.normal(0.0, scale))
             genome.mutation_will = float(np.clip(float(getattr(genome, 'mutation_will', 0.5)) + delta, 0.0, 1.0))
+        rl_rate = float(getattr(self, 'rl_param_mutation_rate', 0.35))
+        if rl_rate > 0.0 and self.rng.random() < rl_rate:
+            genome.mutate_parameter('lr', self.rng, sigma=0.35, low=1e-5, high=0.2, log_scale=True)
+        if rl_rate > 0.0 and self.rng.random() < rl_rate:
+            genome.mutate_parameter('gamma', self.rng, sigma=0.08, low=0.4, high=0.9995, log_scale=False)
+        if rl_rate > 0.0 and self.rng.random() < rl_rate:
+            genome.mutate_parameter('entropy', self.rng, sigma=0.45, low=0.0, high=0.5, log_scale=True)
+        if rl_rate > 0.0 and self.rng.random() < rl_rate:
+            genome.mutate_parameter('gae_lambda', self.rng, sigma=0.25, low=0.2, high=0.9995, log_scale=False)
+        if rl_rate > 0.0 and self.rng.random() < 0.5 * rl_rate:
+            _mutate_rl_weight_kernel(genome, self.rng)
+        if rl_rate > 0.0 and self.rng.random() < 0.5 * rl_rate:
+            _mutate_rl_signal_kernel(genome, self.rng)
+        if rl_rate > 0.0 and self.rng.random() < 0.5 * rl_rate:
+            _mutate_rl_scheduler_kernel(genome, self.rng)
 
     def _crossover_maternal_biased(self, mother: Genome, father: Genome, species_members):
         fit_dict = {g: f for g, f in species_members}
@@ -3660,6 +5950,7 @@ class ReproPlanaNEATPlus:
         child.regen = bool(self.rng.random() < p)
         child.regen_mode = self.rng.choice(['head', 'tail', 'split'])
         child.embryo_bias = mother.embryo_bias if self.rng.random() < 0.7 else father.embryo_bias
+        self._inherit_rl_parameters(child, mother, father)
         return child
 
     def _apply_reproductive_altruism(
@@ -3697,6 +5988,106 @@ class ReproPlanaNEATPlus:
             node.altruism_memory = float(np.clip(prev_mem + mem_delta, -1.5, 1.5))
             node.altruism_span = float(np.clip(prev_span + span_delta, 0.0, 4.0))
 
+    def _inherit_rl_parameters(self, child: Genome, mother: Optional[Genome], father: Optional[Genome]) -> None:
+        try:
+            m_params = dict(getattr(mother, 'rl_params', {}) or {}) if mother is not None else {}
+        except Exception:
+            m_params = {}
+        try:
+            f_params = dict(getattr(father, 'rl_params', {}) or {}) if father is not None else {}
+        except Exception:
+            f_params = {}
+        if not m_params and not f_params:
+            return
+        keys = set(m_params.keys()).union(f_params.keys())
+        mixed: Dict[str, float] = {}
+        for key in keys:
+            mv = float(m_params.get(key, f_params.get(key, 0.0)))
+            fv = float(f_params.get(key, mv))
+            alpha = float(self.rng.uniform(0.25, 0.75))
+            mixed[key] = float(alpha * mv + (1.0 - alpha) * fv)
+        child.rl_params = mixed
+        coeff_m = _rl_sanitise_weight_coeffs(getattr(mother, 'rl_weight_coeffs', None) if mother is not None else None)
+        coeff_f = _rl_sanitise_weight_coeffs(getattr(father, 'rl_weight_coeffs', None) if father is not None else None)
+        coeff_mix: Dict[str, float] = {}
+        for key in _RL_WEIGHT_COEFF_DEFAULTS:
+            mv = coeff_m.get(key, _RL_WEIGHT_COEFF_DEFAULTS[key])
+            fv = coeff_f.get(key, _RL_WEIGHT_COEFF_DEFAULTS[key])
+            blend = float(self.rng.uniform(0.3, 0.7))
+            coeff_mix[key] = float(blend * mv + (1.0 - blend) * fv)
+        child.rl_weight_coeffs = coeff_mix
+        templates = [
+            getattr(mother, 'rl_weight_program_template', None) if mother is not None else None,
+            getattr(father, 'rl_weight_program_template', None) if father is not None else None,
+        ]
+        templates = [tpl for tpl in templates if isinstance(tpl, str) and tpl.strip()]
+        child.rl_weight_program_template = templates[0] if templates else _RL_WEIGHT_DSL_TEMPLATE
+        child._rl_weight_program_cache = None
+        sig_m = _rl_sanitise_signal_coeffs(getattr(mother, 'rl_signal_coeffs', None) if mother is not None else None)
+        sig_f = _rl_sanitise_signal_coeffs(getattr(father, 'rl_signal_coeffs', None) if father is not None else None)
+        sig_mix: Dict[str, float] = {}
+        for key in _RL_SIGNAL_COEFF_DEFAULTS:
+            mv = sig_m.get(key, _RL_SIGNAL_COEFF_DEFAULTS[key])
+            fv = sig_f.get(key, _RL_SIGNAL_COEFF_DEFAULTS[key])
+            blend = float(self.rng.uniform(0.3, 0.7))
+            sig_mix[key] = float(blend * mv + (1.0 - blend) * fv)
+        child.rl_signal_coeffs = sig_mix
+        sig_templates = [
+            getattr(mother, 'rl_signal_program_template', None) if mother is not None else None,
+            getattr(father, 'rl_signal_program_template', None) if father is not None else None,
+        ]
+        sig_templates = [tpl for tpl in sig_templates if isinstance(tpl, str) and tpl.strip()]
+        child.rl_signal_program_template = sig_templates[0] if sig_templates else _RL_SIGNAL_DSL_TEMPLATE
+        child._rl_signal_program_cache = None
+        sched_m = _rl_sanitise_scheduler_coeffs(getattr(mother, 'rl_scheduler_coeffs', None) if mother is not None else None)
+        sched_f = _rl_sanitise_scheduler_coeffs(getattr(father, 'rl_scheduler_coeffs', None) if father is not None else None)
+        sched_mix: Dict[str, float] = {}
+        for key in _RL_SCHED_COEFF_DEFAULTS:
+            mv = sched_m.get(key, _RL_SCHED_COEFF_DEFAULTS[key])
+            fv = sched_f.get(key, _RL_SCHED_COEFF_DEFAULTS[key])
+            blend = float(self.rng.uniform(0.3, 0.7))
+            sched_mix[key] = float(blend * mv + (1.0 - blend) * fv)
+        child.rl_scheduler_coeffs = sched_mix
+        sched_templates = [
+            getattr(mother, 'rl_scheduler_program_template', None) if mother is not None else None,
+            getattr(father, 'rl_scheduler_program_template', None) if father is not None else None,
+        ]
+        sched_templates = [tpl for tpl in sched_templates if isinstance(tpl, str) and tpl.strip()]
+        child.rl_scheduler_program_template = sched_templates[0] if sched_templates else _RL_SCHED_DSL_TEMPLATE
+        child._rl_scheduler_program_cache = None
+        limit = int(getattr(child, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
+        child.rl_memory_limit = limit
+        merged = deque(maxlen=limit)
+        try:
+            m_buf = list(getattr(mother, 'rl_memory', []) or []) if mother is not None else []
+        except Exception:
+            m_buf = []
+        try:
+            f_buf = list(getattr(father, 'rl_memory', []) or []) if father is not None else []
+        except Exception:
+            f_buf = []
+        tail = max(1, limit // 2)
+        if m_buf:
+            merged.extend(m_buf[-tail:])
+        if f_buf:
+            merged.extend(f_buf[-tail:])
+        child.rl_memory = merged
+        archive = deque(maxlen=_RL_SUCCESS_ARCHIVE_LIMIT)
+        try:
+            m_archive = list(getattr(mother, 'rl_success_archive', []) or []) if mother is not None else []
+        except Exception:
+            m_archive = []
+        try:
+            f_archive = list(getattr(father, 'rl_success_archive', []) or []) if father is not None else []
+        except Exception:
+            f_archive = []
+        if m_archive:
+            archive.extend(m_archive[-max(1, _RL_SUCCESS_ARCHIVE_LIMIT // 2):])
+        if f_archive:
+            archive.extend(f_archive[-max(1, _RL_SUCCESS_ARCHIVE_LIMIT // 2):])
+        child.rl_success_archive = archive
+        child.rl_meta = _rl_merge_meta(getattr(mother, 'rl_meta', None), getattr(father, 'rl_meta', None))
+
     def _make_offspring(self, species, offspring_counts, sidx, species_pool):
         sp = species[sidx]
 
@@ -3706,8 +6097,40 @@ class ReproPlanaNEATPlus:
         new_pop = []
         events = {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0, 'asexual_clone': 0}
         sp.sort()
+        retire_registry = getattr(self, '_altruism_retirees', {}) or {}
+        now_gen = int(getattr(self, 'generation', 0))
+        active_retired: Set[int] = set()
+        if isinstance(retire_registry, dict):
+            for gid, info in retire_registry.items():
+                try:
+                    until = int(info.get('until', info.get('cooldown', now_gen)))
+                except Exception:
+                    until = now_gen
+                if until > now_gen:
+                    active_retired.add(int(gid))
+
+        def _is_retired(genome: 'Genome') -> bool:
+            gid = int(getattr(genome, 'id', -1))
+            if gid in active_retired:
+                return True
+            if getattr(genome, 'altruism_retired', False):
+                try:
+                    until = int(getattr(genome, 'altruism_retirement_until', now_gen))
+                except Exception:
+                    until = now_gen
+                return until > now_gen
+            return False
+
+        def _filter_retired(pool_seq: Sequence['Genome']) -> List['Genome']:
+            filtered = [g for g in pool_seq if not _is_retired(g)]
+            return filtered if filtered else list(pool_seq)
+
         effective_elitism = max(0, int(getattr(self, '_elitism_effective', self.elitism)))
-        elites = [g for g, _ in sp.members[:min(effective_elitism, offspring_counts[sidx])]]
+        elites: List['Genome'] = []
+        for g, _ in sp.members[:min(effective_elitism, offspring_counts[sidx])]:
+            if _is_retired(g):
+                continue
+            elites.append(g)
         for e in elites:
             child = e.copy()
             child.cooperative = True
@@ -3729,15 +6152,15 @@ class ReproPlanaNEATPlus:
             self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen, 'family_id': child.family_id}
         remaining = offspring_counts[sidx] - len(elites)
         k = max(2, int(math.ceil(self.survival_rate * len(sp.members))))
-        females = [g for g, _ in sp.members[:k] if g.sex == 'female']
-        males = [g for g, _ in sp.members[:k] if g.sex == 'male']
-        hermaphrodites = [g for g, _ in sp.members[:k] if g.sex == 'hermaphrodite']
-        pool = [g for g, _ in sp.members[:k]]
+        females = _filter_retired([g for g, _ in sp.members[:k] if g.sex == 'female'])
+        males = _filter_retired([g for g, _ in sp.members[:k] if g.sex == 'male'])
+        hermaphrodites = _filter_retired([g for g, _ in sp.members[:k] if g.sex == 'hermaphrodite'])
+        pool = _filter_retired([g for g, _ in sp.members[:k]])
         non_elite_ids = set(getattr(self, '_last_top3_ids', set()))
         if not females or not males:
-            females = [g for g, _ in sp.members if g.sex == 'female'] or females
-            males = [g for g, _ in sp.members if g.sex == 'male'] or males
-            hermaphrodites = [g for g, _ in sp.members if g.sex == 'hermaphrodite'] or hermaphrodites
+            females = _filter_retired([g for g, _ in sp.members if g.sex == 'female']) or females
+            males = _filter_retired([g for g, _ in sp.members if g.sex == 'male']) or males
+            hermaphrodites = _filter_retired([g for g, _ in sp.members if g.sex == 'hermaphrodite']) or hermaphrodites
         mix_ratio = self._mix_asexual_ratio()
         monitor = getattr(self, 'lcs_monitor', None)
         weight_tol = getattr(monitor, 'eps', 0.0) if monitor is not None else 0.0
@@ -3752,6 +6175,7 @@ class ReproPlanaNEATPlus:
             father = None
             parent_candidate = pool[int(self.rng.integers(len(pool)))]
             effective_mix_ratio = mix_ratio
+            parent_retired = _is_retired(parent_candidate)
             if bool(getattr(self, 'adaptive_self_mutation', True)):
                 f_par = float(fit_map.get(parent_candidate.id, species_avg))
                 denom = (abs(species_avg) + 1e-9)
@@ -3773,6 +6197,8 @@ class ReproPlanaNEATPlus:
                 effective_mix_ratio = min(0.95, max(0.0, effective_mix_ratio * (1.0 + delta)))
             if hermaphrodites:
                 effective_mix_ratio = effective_mix_ratio / float(getattr(self, 'hermaphrodite_mate_bias', 2.5))
+            if parent_retired:
+                effective_mix_ratio = 0.0
             if self.rng.random() < effective_mix_ratio:
                 parent = parent_candidate
                 if parent.sex == 'hermaphrodite':
@@ -3794,8 +6220,8 @@ class ReproPlanaNEATPlus:
             else:
                 use_sexual_reproduction = True
             if use_sexual_reproduction:
-                potential_mothers = females + hermaphrodites
-                potential_fathers = males + hermaphrodites
+                potential_mothers = _filter_retired(females + hermaphrodites)
+                potential_fathers = _filter_retired(males + hermaphrodites)
                 if potential_mothers and potential_fathers and (self.rng.random() > self.pollen_flow_rate):
                     mother = potential_mothers[int(self.rng.integers(len(potential_mothers)))]
                     if potential_fathers:
@@ -3811,9 +6237,9 @@ class ReproPlanaNEATPlus:
                 elif len(species_pool) > 1:
                     mother = pool[int(self.rng.integers(len(pool)))]
                     other = species_pool[(sidx + 1) % len(species_pool)]
-                    other_pool = [g for g, _ in other.members]
-                    other_males = [g for g, _ in other.members if g.sex == 'male']
-                    other_herm = [g for g, _ in other.members if g.sex == 'hermaphrodite']
+                    other_pool = _filter_retired([g for g, _ in other.members])
+                    other_males = _filter_retired([g for g, _ in other.members if g.sex == 'male'])
+                    other_herm = _filter_retired([g for g, _ in other.members if g.sex == 'hermaphrodite'])
                     father_pool = other_males + other_herm if other_males or other_herm else other_pool
                     father = father_pool[int(self.rng.integers(len(father_pool)))]
                     mode = 'sexual_cross'
@@ -4433,6 +6859,12 @@ class ReproPlanaNEATPlus:
                 'noise_entropy': 0.0,
                 'family_factor_mean': 1.0,
                 'family_factor_max': 1.0,
+                'span_scale': 0.0,
+                'top3_static_count': 0,
+                'top3_pressure': 1.0,
+                'top3_static': {},
+                'rl_mode': bool(getattr(self, '_monodromy_rl_mode', False)),
+                'pressure_boost': float(getattr(self, '_monodromy_last_boost', 1.0)),
             }
 
         n = len(fitnesses)
@@ -4441,6 +6873,16 @@ class ReproPlanaNEATPlus:
             return list(fitnesses)
         base = float(getattr(self, 'monodromy_pressure_base', 0.0))
         rng = float(getattr(self, 'monodromy_pressure_range', 0.0))
+        rl_mode = bool(getattr(self, '_monodromy_rl_mode', False))
+        boost = 1.0
+        if not rl_mode:
+            boost = float(max(1.0, getattr(self, 'monodromy_non_rl_pressure_boost', 1.0)))
+            base_floor = float(max(0.0, getattr(self, 'monodromy_non_rl_base_floor', 0.0)))
+            base = max(base * boost, base + base_floor)
+            rng = max(rng * (1.0 + 0.5 * (boost - 1.0)), rng + base * 0.35)
+        else:
+            boost = 1.0
+        self._monodromy_last_boost = float(boost)
         if base <= 0.0 and rng <= 0.0:
             _reset_snapshot()
             return list(fitnesses)
@@ -4451,6 +6893,7 @@ class ReproPlanaNEATPlus:
         if baseline_arr.size == 0:
             _reset_snapshot()
             return list(fitnesses)
+        monodromy_executor = _monodromy_prepare_executor(self)
         overrides = getattr(self, 'monodromy_noise_style_overrides', None)
         controller = getattr(self, 'spinor_controller', None)
         env_obj = getattr(controller, 'env', None) if controller is not None else None
@@ -4471,6 +6914,13 @@ class ReproPlanaNEATPlus:
         entropy_excess = max(0.0, float(noise_entropy) - float(noise_focus))
         noise_factor = float(np.clip(1.0 + noise_weight * (noise_bias - 0.3 * entropy_excess), 0.2, 1.6))
         self._monodromy_noise_tag = style.get('symbol', noise_kind or '')
+        top3_multiplier = float(max(1.0, getattr(self, '_top3_static_pressure', 1.0)))
+        top3_count = int(max(0, getattr(self, '_top3_static_count', 0)))
+        top3_state = getattr(self, '_top3_static_snapshot', None)
+        if not rl_mode:
+            min_top = float(max(1.0, getattr(self, 'monodromy_non_rl_top_pressure_min', 1.0)))
+            top3_multiplier = float(max(top3_multiplier, min_top))
+            top3_multiplier *= float(max(1.0, 1.0 + 0.35 * (boost - 1.0)))
         if signature_counts is None:
             signature_counts = Counter(signature_map.values()) if signature_map else Counter()
         else:
@@ -4585,6 +7035,23 @@ class ReproPlanaNEATPlus:
         else:
             best_val = float(baseline_arr[top_indices[0]]) if top_indices else median
         span_scale = abs(best_val - median)
+        baseline_std = 0.0
+        quantile_spread = 0.0
+        if baseline_arr.size:
+            try:
+                baseline_std = float(baseline_arr.std())
+            except Exception:
+                baseline_std = float(np.std(baseline_arr))
+            if baseline_arr.size >= 4:
+                try:
+                    q_hi = float(np.quantile(baseline_arr, 0.84))
+                    q_lo = float(np.quantile(baseline_arr, 0.16))
+                    quantile_spread = max(0.0, q_hi - q_lo)
+                except Exception:
+                    quantile_spread = 0.0
+        spread_candidate = max(baseline_std, 0.5 * quantile_spread)
+        if math.isfinite(spread_candidate) and spread_candidate > 0.0 and span_scale < spread_candidate:
+            span_scale = spread_candidate
         if not math.isfinite(span_scale) or span_scale < 1e-6:
             span_scale = max(1e-6, abs(best_val) if math.isfinite(best_val) else 1.0)
         phase_step = float(getattr(self, 'monodromy_phase_step', 0.38196601125))
@@ -4597,6 +7064,14 @@ class ReproPlanaNEATPlus:
         growth_weight = float(np.clip(getattr(self, 'monodromy_growth_weight', 0.0), 0.0, 1.5))
         slump_gain = float(np.clip(getattr(self, 'monodromy_slump_gain', 0.0), 0.0, 1.5))
         fast_release = float(np.clip(getattr(self, 'monodromy_fast_release', 0.0), 0.0, 1.0))
+        envelope_floor = float(np.clip(getattr(self, 'monodromy_envelope_floor', 0.0), 0.0, 1.0))
+        envelope_bias = float(max(0.0, getattr(self, 'monodromy_envelope_bias', 0.0)))
+        envelope_cap = float(max(envelope_floor, float(getattr(self, 'monodromy_envelope_cap', 1.0))))
+        if not rl_mode:
+            cap_gain = float(max(0.0, getattr(self, 'monodromy_non_rl_cap_gain', 0.0)))
+            cap = float(max(cap * (1.0 + cap_gain), cap + base * 2.0))
+            envelope_floor = float(max(envelope_floor, getattr(self, 'monodromy_non_rl_envelope_floor', envelope_floor)))
+            envelope_bias = float(max(envelope_bias, getattr(self, 'monodromy_non_rl_envelope_bias', envelope_bias)))
         registry = getattr(self, '_monodromy_registry', None)
         if registry is None:
             registry = {}
@@ -4695,20 +7170,9 @@ class ReproPlanaNEATPlus:
                 grace_factor = max(0.2, 1.0 - grace_strength * min(1.0, grace_val))
                 grace_val *= grace_decay
             state['diversity_grace'] = grace_val
-            envelope = min(1.0, stasis / span)
+            raw_envelope = (stasis + envelope_bias) / max(1.0, span)
+            envelope = float(min(envelope_cap, max(envelope_floor, raw_envelope)))
             osc = 0.5 - 0.5 * math.cos(2.0 * math.pi * phase)
-            target = (base + rng * osc) * envelope
-            if growth_weight > 0.0:
-                grow = math.tanh(max(0.0, momentum) / span_scale_safe)
-                target *= max(0.0, 1.0 - growth_weight * grow)
-            if slump_gain > 0.0:
-                slump = math.tanh(max(0.0, -momentum) / span_scale_safe)
-                target *= 1.0 + slump_gain * slump
-            if relief_gain > 0.0:
-                target *= max(0.0, 1.0 - relief_gain)
-            target *= div_factor
-            target *= grace_factor
-            target *= noise_factor
             info = family_metrics.get(family_id) if family_metrics else None
             members = family_members.get(family_id, tuple())
             if info:
@@ -4747,22 +7211,64 @@ class ReproPlanaNEATPlus:
             state['family_spread'] = float(family_spread)
             state['family_share_delta'] = float(share_delta)
             state['family_surplus_ratio'] = float(surplus_ratio)
-            family_factor = 1.0
-            if family_weight > 0.0:
-                share_factor = 1.0 + family_weight * min(3.5, max(0.0, surplus_ratio))
-                trend_factor = float(np.clip(1.0 + 0.5 * family_weight * share_delta * max(1, len(family_counts)), 0.5, 1.8))
-                median_factor = 1.0 + 0.45 * family_weight * max(0.0, (family_median - median) / span_scale_safe)
-                if span_scale_safe > 0.0:
-                    spread_norm = float(np.clip(1.0 - min(1.0, family_spread / max(span_scale_safe, 1e-9)), 0.0, 1.0))
-                else:
-                    spread_norm = 0.0
-                spread_factor = 1.0 + 0.25 * family_weight * spread_norm
-                family_factor = float(np.clip(share_factor * trend_factor * median_factor * spread_factor, 1.0, 6.0))
-            state['family_factor'] = family_factor
+            dsl_result: Optional[Dict[str, float]] = None
+            if monodromy_executor is not None:
+                dsl_state = {
+                    'base': float(base),
+                    'range_amp': float(rng),
+                    'osc': float(osc),
+                    'envelope': float(envelope),
+                    'growth_weight': float(growth_weight),
+                    'momentum': float(momentum),
+                    'span_scale': float(span_scale_safe),
+                    'slump_gain': float(slump_gain),
+                    'relief_gain': float(relief_gain),
+                    'div_factor': float(div_factor),
+                    'grace_factor': float(grace_factor),
+                    'noise_factor': float(noise_factor),
+                    'top3_multiplier': float(top3_multiplier),
+                    'family_weight': float(family_weight),
+                    'surplus_ratio': float(surplus_ratio),
+                    'share_delta': float(share_delta),
+                    'family_count': int(len(family_counts)),
+                    'family_median': float(family_median),
+                    'median': float(median),
+                    'family_spread': float(family_spread),
+                }
+                dsl_result = _monodromy_run_program(monodromy_executor, dsl_state)
+            if dsl_result is None:
+                target = (base + rng * osc) * envelope
+                if growth_weight > 0.0:
+                    grow = math.tanh(max(0.0, momentum) / span_scale_safe)
+                    target *= max(0.0, 1.0 - growth_weight * grow)
+                if slump_gain > 0.0:
+                    slump = math.tanh(max(0.0, -momentum) / span_scale_safe)
+                    target *= 1.0 + slump_gain * slump
+                if relief_gain > 0.0:
+                    target *= max(0.0, 1.0 - relief_gain)
+                target *= div_factor
+                target *= grace_factor
+                target *= noise_factor
+                target *= top3_multiplier
+                family_factor = 1.0
+                if family_weight > 0.0:
+                    share_factor = 1.0 + family_weight * min(3.5, max(0.0, surplus_ratio))
+                    trend_factor = float(np.clip(1.0 + 0.5 * family_weight * share_delta * max(1, len(family_counts)), 0.5, 1.8))
+                    median_factor = 1.0 + 0.45 * family_weight * max(0.0, (family_median - median) / span_scale_safe)
+                    if span_scale_safe > 0.0:
+                        spread_norm = float(np.clip(1.0 - min(1.0, family_spread / max(span_scale_safe, 1e-9)), 0.0, 1.0))
+                    else:
+                        spread_norm = 0.0
+                    spread_factor = 1.0 + 0.25 * family_weight * spread_norm
+                    family_factor = float(np.clip(share_factor * trend_factor * median_factor * spread_factor, 1.0, 6.0))
+                target *= family_factor
+            else:
+                target = float(dsl_result.get('target', 0.0))
+                family_factor = float(dsl_result.get('family_factor', 1.0))
+            state['family_factor'] = float(family_factor)
             family_factor_total += family_factor
             if family_factor > family_factor_max:
                 family_factor_max = family_factor
-            target *= family_factor
             pressure_prev = float(state.get('pressure', 0.0))
             pressure = pressure_prev * (1.0 - smoothing) + target * smoothing
             state['pressure'] = pressure
@@ -4853,10 +7359,23 @@ class ReproPlanaNEATPlus:
             'family_spread_mean': float(family_spread_mean),
             'family_share_delta_mean': float(family_trend_mean),
             'family_target_share': float(family_target_share),
+            'span_scale': float(span_scale_safe),
+            'top3_pressure': float(top3_multiplier),
+            'top3_static_count': int(top3_count),
+            'rl_mode': bool(rl_mode),
+            'pressure_boost': float(boost),
         }
+        if isinstance(top3_state, dict):
+            self._monodromy_snapshot['top3_static'] = dict(top3_state)
         return adjusted
 
     def evolve(self, fitness_fn: Callable[[Genome], float], n_generations=100, target_fitness=None, verbose=True, env_schedule=None):
+        is_rl_task = bool(
+            getattr(fitness_fn, 'is_rl', False)
+            or getattr(fitness_fn, 'rl_mode', False)
+            or getattr(fitness_fn, 'rl', False)
+        )
+        self._monodromy_rl_mode = bool(is_rl_task)
         history = []
         best_ever = None
         best_ever_fit = -1000000000.0
@@ -4868,6 +7387,7 @@ class ReproPlanaNEATPlus:
         for step in range(n_generations):
             gen = start_gen + step
             self.generation = gen
+            self._monodromy_rl_mode = bool(is_rl_task)
             try:
                 prev = history[-1] if history else (None, None)
                 if env_schedule is not None:
@@ -4947,15 +7467,18 @@ class ReproPlanaNEATPlus:
                 base_div_bonus = float(getattr(self, 'structure_diversity_bonus', 0.0))
                 base_div_power = float(getattr(self, 'structure_diversity_power', 1.0))
                 diversity_counts = np.asarray(list(signature_counts.values()), dtype=np.float64) if signature_counts else np.zeros(0, dtype=np.float64)
+                diversity_entropy_raw = 0.0
+                diversity_entropy_norm = 0.0
                 if diversity_counts.size:
                     freq = diversity_counts / max(1.0, diversity_counts.sum())
                     raw_entropy = float(-(freq * np.log(freq + 1e-12)).sum())
                     max_entropy = float(np.log(max(1.0, diversity_counts.size)))
-                    diversity_entropy = raw_entropy / max(max_entropy, 1e-12) if max_entropy > 0 else 0.0
-                else:
-                    diversity_entropy = 0.0
-                diversity_entropy = float(np.clip(diversity_entropy, 0.0, 1.0))
-                diversity_scarcity = float(np.clip(1.0 - diversity_entropy, 0.0, 1.0))
+                    diversity_entropy_raw = float(max(0.0, raw_entropy))
+                    if max_entropy > 0:
+                        diversity_entropy_norm = float(diversity_entropy_raw / max(max_entropy, 1e-12))
+                    else:
+                        diversity_entropy_norm = float(diversity_entropy_raw)
+                diversity_scarcity = float(max(0.0, 1.0 - diversity_entropy_norm))
                 family_entropy = 0.0
                 top_family_share = 0.0
                 family_surplus_ratio_max = 0.0
@@ -4977,7 +7500,7 @@ class ReproPlanaNEATPlus:
                         if ratios:
                             family_surplus_ratio_max = float(max(ratios))
                             family_surplus_ratio_mean = float(sum(ratios) / len(ratios))
-                family_entropy = float(np.clip(family_entropy, 0.0, 1.0))
+                family_entropy = float(max(0.0, family_entropy))
                 complexity_arr = np.asarray(complexity_scores, dtype=np.float64) if complexity_scores else np.zeros(0, dtype=np.float64)
                 complexity_mean = float(complexity_arr.mean()) if complexity_arr.size else 0.0
                 complexity_std = float(complexity_arr.std()) if complexity_arr.size else 0.0
@@ -4994,7 +7517,8 @@ class ReproPlanaNEATPlus:
                 household_pressure = float(self._household_pressure())
                 diversity_snapshot = {
                     'gen': int(gen),
-                    'entropy': float(diversity_entropy),
+                    'entropy': float(diversity_entropy_raw),
+                    'entropy_norm': float(diversity_entropy_norm),
                     'scarcity': float(diversity_scarcity),
                     'complexity_mean': float(complexity_mean),
                     'complexity_std': float(complexity_std),
@@ -5013,7 +7537,7 @@ class ReproPlanaNEATPlus:
                     'family_surplus_ratio_mean': float(family_surplus_ratio_mean),
                     'household_pressure': float(household_pressure),
                 }
-                self._update_collective_signal(diversity_entropy, diversity_scarcity, family_surplus_ratio_mean, gen)
+                self._update_collective_signal(diversity_entropy_norm, diversity_scarcity, family_surplus_ratio_mean, gen)
                 self._diversity_snapshot = diversity_snapshot
                 self.diversity_history.append(diversity_snapshot)
                 if len(self.diversity_history) > int(getattr(self, 'diversity_history_limit', 4096)):
@@ -5190,6 +7714,10 @@ class ReproPlanaNEATPlus:
                 raw_best = float(np.max(baseline_fitnesses)) if baseline_fitnesses else best_fit
                 raw_avg = float(np.mean(baseline_fitnesses)) if baseline_fitnesses else avg_fit
                 self.raw_best_history.append((raw_best, raw_avg))
+                try:
+                    self._update_rl_collective_objective(gen)
+                except Exception:
+                    pass
                 self._update_lazy_feedback(gen, fitnesses, best_idx, best_fit, avg_fit)
                 self._imprint_population_altruism(fitnesses)
                 context_best = self._contextual_best_axis(best_fit, avg_fit)
@@ -5291,6 +7819,8 @@ class ReproPlanaNEATPlus:
                             f" Δ{mono.get('relief_mean', 0.0):.3f} μ{mono.get('momentum_mean', 0.0):.3f}"
                             f" div{mono.get('diversity_mean', 0.0):.2f} gr{mono.get('grace_mean', 0.0):.2f}"
                             f" nf{mono.get('noise_factor', 1.0):.2f} fam{mono.get('family_factor_mean', 1.0):.2f}@{int(mono.get('families', 0))}"
+                            f" σ{mono.get('span_scale', 0.0):.3f}"
+                            f" τ{mono.get('top3_pressure', 1.0):.2f}@{int(mono.get('top3_static_count', 0))}"
                         )
                         nk = mono.get('noise_kind')
                         if nk:
@@ -5299,8 +7829,10 @@ class ReproPlanaNEATPlus:
                     div_snap = getattr(self, '_diversity_snapshot', None)
                     if isinstance(div_snap, dict) and div_snap:
                         try:
+                            entropy_raw = float(div_snap.get('entropy', 0.0))
+                            entropy_norm = float(div_snap.get('entropy_norm', entropy_raw))
                             div_str = (
-                                f" | div H{float(div_snap.get('entropy', 0.0)):.2f}"
+                                f" | div H{entropy_raw:.2f} η{entropy_norm:.2f}"
                                 f" sc{float(div_snap.get('scarcity', 0.0)):.2f}"
                                 f" κ{float(div_snap.get('structural_spread', 0.0)):.2f}"
                             )
@@ -5310,7 +7842,20 @@ class ReproPlanaNEATPlus:
                             div_str += f" hh{float(div_snap.get('household_pressure', 0.0)):.2f}"
                         except Exception:
                             div_str = ''
-                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}{div_str}")
+                    retire_str = ''
+                    retire_snap = getattr(self, '_altruism_retirement_snapshot', None)
+                    if isinstance(retire_snap, dict) and retire_snap:
+                        try:
+                            pressure_val = float(retire_snap.get('pressure', 0.0))
+                            retired_count = int(retire_snap.get('retired', 0) or 0)
+                            candidate_count = int(retire_snap.get('candidates', 0) or 0)
+                            static_count = int(retire_snap.get('static_count', 0) or 0)
+                            retire_str = f" | retire ϕ{pressure_val:.2f} ρ{retired_count}@{candidate_count}"
+                            if static_count:
+                                retire_str += f" s{static_count}"
+                        except Exception:
+                            retire_str = ''
+                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}{div_str}{retire_str}")
                 if context_best > best_ever_fit:
                     best_ever_fit = context_best
                     best_ever = self.population[best_idx].copy()
@@ -5510,12 +8055,20 @@ def forward_batch(comp, X, w=None):
     n = len(comp['order'])
     A = np.zeros((B, n), dtype=np.float64)
     Z = np.zeros((B, n), dtype=np.float64)
-    in_idx = comp['inputs']
-    assert X.shape[1] == len(in_idx), 'X dim != number of input nodes'
-    for k, nid in enumerate(in_idx):
-        A[:, nid] = X[:, k]
-    for b in comp['biases']:
-        A[:, b] = 1.0
+    in_idx = np.asarray(comp['inputs'], dtype=np.intp)
+    expected_inputs = int(in_idx.size)
+    X_use = X
+    if X.shape[1] != expected_inputs:
+        if X.shape[1] > expected_inputs:
+            X_use = X[:, :expected_inputs]
+        else:
+            pad = expected_inputs - X.shape[1]
+            X_use = np.pad(X, ((0, 0), (0, pad)), mode='constant')
+    if expected_inputs:
+        A[:, in_idx] = X_use[:, :expected_inputs]
+    biases = np.asarray(comp['biases'], dtype=np.intp)
+    if biases.size:
+        A[:, biases] = 1.0
     matmul_clip = float(comp.get('matmul_clip', 256.0))
     if not np.isfinite(matmul_clip) or matmul_clip < 0.0:
         matmul_clip = 0.0
@@ -5566,15 +8119,33 @@ def _softmax(logits):
     ex = np.exp(x)
     return ex / (ex.sum(axis=1, keepdims=True) + 1e-09)
 
-def loss_and_output_delta(comp, Z, y, l2, w):
+def loss_and_output_delta(comp, Z, y, l2, w, sample_weight=None):
     out_idx = comp['outputs']
     B = Z.shape[0]
+    weight_vec = None
+    weight_sum = float(B)
+    if sample_weight is not None:
+        try:
+            weight_vec = np.asarray(sample_weight, dtype=np.float64).reshape(B)
+            weight_vec = np.nan_to_num(np.clip(weight_vec, 0.0, None), nan=0.0, posinf=0.0, neginf=0.0)
+            weight_sum = float(np.sum(weight_vec))
+            if not np.isfinite(weight_sum) or weight_sum <= 0:
+                weight_vec = None
+                weight_sum = float(B)
+        except Exception:
+            weight_vec = None
+            weight_sum = float(B)
     if len(out_idx) == 1:
         z = Z[:, out_idx[0:1]]
         p = 1.0 / (1.0 + np.exp(-z))
         yv = y.reshape(B, 1).astype(np.float64)
-        loss = (np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0) - yv * z).mean()
-        delta_out = p - yv
+        loss_vec = (np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0) - yv * z).reshape(B)
+        if weight_vec is not None:
+            loss = float(np.sum(loss_vec * weight_vec) / max(1e-12, weight_sum))
+            delta_out = (p - yv) * weight_vec.reshape(B, 1)
+        else:
+            loss = float(loss_vec.mean())
+            delta_out = p - yv
         probs = p
     else:
         logits = Z[:, out_idx]
@@ -5591,12 +8162,18 @@ def loss_and_output_delta(comp, Z, y, l2, w):
             y_one[np.arange(B, dtype=np.int64), y_idx] = 1.0
         else:
             y_one = y.astype(np.float64)
-        loss = -(y_one * np.log(probs + 1e-09)).sum(axis=1).mean()
-        delta_out = probs - y_one
+        loss_vec = -(y_one * np.log(probs + 1e-09)).sum(axis=1)
+        if weight_vec is not None:
+            loss = float(np.sum(loss_vec * weight_vec) / max(1e-12, weight_sum))
+            delta_out = (probs - y_one) * weight_vec.reshape(B, 1)
+        else:
+            loss = float(loss_vec.mean())
+            delta_out = probs - y_one
     loss = float(loss + 0.5 * l2 * np.sum(w * w))
-    return (loss, delta_out, probs)
+    norm = float(weight_sum) if weight_vec is not None else float(B)
+    return (loss, delta_out, probs, norm)
 
-def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
+def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001, sample_weight=None):
     """
     Hardened backprop with gradient/weight clipping and NaN guards.
     既存シグネチャ互換（追加引数は train_* から供給）。
@@ -5605,7 +8182,7 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
     grad_clip = 5.0
     w_clip = 12.0
     A, Z = forward_batch(comp, X, w)
-    loss, delta_out, _ = loss_and_output_delta(comp, Z, y, l2, w)
+    loss, delta_out, _, norm = loss_and_output_delta(comp, Z, y, l2, w, sample_weight=sample_weight)
     if not _np.isfinite(loss):
         w = _np.tanh(w) * 0.1
         loss = float(_np.nan_to_num(loss, nan=1000.0, posinf=1000.0, neginf=1000.0))
@@ -5726,7 +8303,8 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
                     delta_update = push_term * (src_mix * mem_gain)
                     delta_update = _np.nan_to_num(delta_update, nan=0.0, posinf=0.0, neginf=0.0)
                     delta_a[:, s] += delta_update
-    grad_w = grad_w / max(1, B) + l2 * w
+    denom = max(1.0, float(norm))
+    grad_w = grad_w / denom + l2 * w
     if not _np.all(_np.isfinite(grad_w)):
         grad_w = _np.nan_to_num(grad_w, nan=0.0, posinf=0.0, neginf=0.0)
     if grad_clip and grad_clip > 0:
@@ -5752,17 +8330,33 @@ def train_with_backprop_numpy(
     profile_out: Optional[Dict[str, Any]]=None,
     rng: Optional[np.random.Generator]=None,
     collective_signal: Optional[Dict[str, float]]=None,
+    sample_weight: Optional[Sequence[float]]=None,
 ):
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
     np.nan_to_num(X, copy=False)
     np.nan_to_num(y, copy=False)
+    sample_weight_arr: Optional[np.ndarray] = None
+    if sample_weight is not None:
+        try:
+            sw = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+        except Exception:
+            sw = None
+        if sw is not None and sw.size == X.shape[0]:
+            sw = np.nan_to_num(np.clip(sw, 0.0, None), nan=0.0, posinf=0.0, neginf=0.0)
+            if np.any(sw > 0):
+                sample_weight_arr = sw
     collective_signal = dict(collective_signal or {})
     altruism_target = float(collective_signal.get('altruism_target', 0.5))
     solidarity = float(collective_signal.get('solidarity', 0.5))
     stress = float(collective_signal.get('stress', 0.0))
     lazy_share = float(collective_signal.get('lazy_share', 0.0))
     advantage = float(collective_signal.get('advantage', 0.0))
+    group_alignment = float(np.clip(collective_signal.get('group_reward_alignment', 0.0), -1.0, 1.0))
+    group_trend = float(np.clip(collective_signal.get('group_reward_trend', 0.0), -1.0, 1.0))
+    group_best = float(np.clip(collective_signal.get('group_reward_best', 0.0), 0.0, 1.0))
+    group_pressure = float(max(0.0, collective_signal.get('group_reward_pressure', 0.0)))
+    group_delta = float(collective_signal.get('group_reward_delta', 0.0))
     comp = compile_genome(genome)
     w = comp['w'].copy()
     history = []
@@ -5792,7 +8386,7 @@ def train_with_backprop_numpy(
     if w.size == 0:
         return history
     for _ in range(int(steps)):
-        w, L, profile = backprop_step(comp, X, y, w, lr=lr, l2=l2)
+        w, L, profile = backprop_step(comp, X, y, w, lr=lr, l2=l2, sample_weight=sample_weight_arr)
         if not np.isfinite(L):
             L = float(np.nan_to_num(L, nan=1000.0, posinf=1000.0, neginf=1000.0))
         history.append(L)
@@ -5842,12 +8436,30 @@ def train_with_backprop_numpy(
             prev_alt = float(np.clip(getattr(node, 'altruism', 0.5), 0.0, 1.0))
             prev_mem = float(np.clip(getattr(node, 'altruism_memory', 0.0), -1.5, 1.5))
             prev_span = float(np.clip(getattr(node, 'altruism_span', 0.0), 0.0, 4.0))
-            solidarity_gain = 0.5 * solidarity + 0.3 * (1.0 - advantage) + 0.2 * lazy_share
+            solidarity_gain = (
+                0.45 * solidarity
+                + 0.25 * (1.0 - advantage)
+                + 0.18 * lazy_share
+                + 0.22 * (0.5 + 0.5 * group_alignment + 0.2 * group_trend)
+                + 0.1 * (0.5 + 0.5 * group_best + 0.25 * np.tanh(group_delta))
+            )
             target_alt = float(np.clip(0.6 * altruism_target + 0.4 * solidarity_gain, 0.0, 1.0))
             node.altruism = float(np.clip(0.72 * prev_alt + 0.28 * target_alt, 0.0, 1.0))
-            mem_target = float(np.clip(solidarity - stress, -1.5, 1.5))
+            mem_target = float(
+                np.clip(
+                    solidarity - stress + 0.25 * group_trend - 0.18 * group_pressure,
+                    -1.5,
+                    1.5,
+                )
+            )
             node.altruism_memory = float(np.clip(0.6 * prev_mem + 0.4 * mem_target, -1.5, 1.5))
-            span_target = float(np.clip(stress + advantage, 0.0, 4.0))
+            span_target = float(
+                np.clip(
+                    stress + advantage + 0.3 * group_pressure - 0.22 * group_trend,
+                    0.0,
+                    4.0,
+                )
+            )
             node.altruism_span = float(np.clip(0.65 * prev_span + 0.35 * span_target, 0.0, 4.0))
         if profile_out is not None:
             profile_out['avg_profile'] = np.asarray(avg_profile, dtype=np.float64)
@@ -6539,6 +9151,7 @@ def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: st
     fields = [
         'gen',
         'entropy',
+        'entropy_norm',
         'scarcity',
         'family_entropy',
         'top_family_share',
@@ -6570,6 +9183,7 @@ def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: st
             writer.writerow(payload)
     gens = np.array([int(item.get('gen', idx)) for idx, item in enumerate(div_history)], dtype=np.int32)
     entropy = np.array([float(item.get('entropy', 0.0)) for item in div_history], dtype=np.float64)
+    entropy_norm = np.array([float(item.get('entropy_norm', 0.0)) for item in div_history], dtype=np.float64)
     scarcity = np.array([float(item.get('scarcity', 0.0)) for item in div_history], dtype=np.float64)
     family_entropy = np.array([float(item.get('family_entropy', 0.0)) for item in div_history], dtype=np.float64)
     top_family_share = np.array([float(item.get('top_family_share', 0.0)) for item in div_history], dtype=np.float64)
@@ -6584,7 +9198,8 @@ def export_diversity_summary(div_history: Sequence[Dict[str, Any]], csv_path: st
     household_pressure = np.array([float(item.get('household_pressure', 0.0)) for item in div_history], dtype=np.float64)
     fig, axes = plt.subplots(2, 1, sharex=True, figsize=(7.4, 6.0))
     ax_top, ax_bottom = axes
-    ax_top.plot(gens, entropy, label='entropy (structural)', color='#1f78b4', linewidth=1.8)
+    ax_top.plot(gens, entropy, label='entropy raw', color='#1f78b4', linewidth=1.8)
+    ax_top.plot(gens, entropy_norm, label='entropy norm', color='#4f9bd9', linewidth=1.4, linestyle=':')
     ax_top.plot(gens, scarcity, label='scarcity', color='#d62728', linewidth=1.6)
     ax_top.plot(gens, family_entropy, label='entropy (family)', color='#6a3d9a', linewidth=1.4, linestyle='-.')
     ax_top.fill_between(gens, 0.0, scarcity, color='#ff9896', alpha=0.25)
@@ -8019,35 +10634,864 @@ def setup_neat_for_env(env_id: str, population: int=48, output_activation: str='
     _set_monodromy_mode(neat, bool(monodromy_active))
     return (neat, env)
 
-def _rollout_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_norm=None):
-    """Rollout one episode with a Genome and an action mapper."""
+def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]]) -> None:
+    if not experiences:
+        return
+    try:
+        limit = int(getattr(genome, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
+    except Exception:
+        limit = _DEFAULT_RL_MEMORY_LIMIT
+    buf = getattr(genome, 'rl_memory', None)
+    prev_entries: List[Dict[str, Any]] = []
+    if isinstance(buf, deque):
+        prev_entries = list(buf)
+    if not isinstance(buf, deque) or buf.maxlen != limit:
+        if prev_entries:
+            buf = deque(prev_entries[-limit:], maxlen=limit)
+        else:
+            buf = deque(maxlen=limit)
+    meta = _rl_prepare_meta(genome)
+    reward_anchor = float(meta.get('reward_ema', 0.0))
+    archive = getattr(genome, 'rl_success_archive', None)
+    if not isinstance(archive, deque):
+        archive = deque(maxlen=_RL_SUCCESS_ARCHIVE_LIMIT)
+    elif archive.maxlen != _RL_SUCCESS_ARCHIVE_LIMIT:
+        archive = deque(list(archive)[- _RL_SUCCESS_ARCHIVE_LIMIT:], maxlen=_RL_SUCCESS_ARCHIVE_LIMIT)
+    baseline = float(meta.get('reward_ema', meta.get('last_reward', 0.0)))
+    reward_var = float(max(0.0, meta.get('reward_var', 0.0)))
+    reward_sigma = float(math.sqrt(reward_var + 1e-9))
+    success_count = 0
+    new_advantages: List[float] = []
+    for exp in experiences:
+        try:
+            obs = np.asarray(exp.get('obs'), dtype=np.float64).reshape(-1)
+        except Exception:
+            continue
+        action = exp.get('action')
+        if isinstance(action, np.ndarray):
+            if action.size == 1:
+                action = int(action.ravel()[0])
+        elif isinstance(action, np.generic):
+            action = int(action)
+        next_obs_raw = exp.get('next_obs')
+        next_obs = None
+        if next_obs_raw is not None:
+            try:
+                next_obs = np.asarray(next_obs_raw, dtype=np.float64).reshape(-1)
+            except Exception:
+                next_obs = None
+        novelty = 0.0
+        if next_obs is not None and next_obs.shape == obs.shape:
+            try:
+                novelty = float(np.linalg.norm(next_obs - obs))
+            except Exception:
+                novelty = 0.0
+        reward_val = float(exp.get('reward', 0.0))
+        ret_val = float(exp.get('return', exp.get('reward', 0.0)))
+        if 'advantage' in exp:
+            advantage_val = float(exp.get('advantage', ret_val - baseline))
+        else:
+            advantage_val = float(ret_val - baseline)
+        success_flag = bool(exp.get('success', advantage_val >= 0.0))
+        if success_flag:
+            success_count += 1
+        if 'advantage_norm' in exp:
+            norm_advantage = float(exp.get('advantage_norm', 0.0))
+        else:
+            if reward_sigma > 0.0:
+                norm_advantage = float(np.tanh(advantage_val / reward_sigma))
+            else:
+                denom = abs(baseline) + reward_sigma + 1e-6
+                norm_advantage = float(np.tanh(advantage_val / denom))
+        payload = {
+            'obs': obs,
+            'action': action,
+            'reward': reward_val,
+            'next_obs': next_obs,
+            'return': ret_val,
+            'novelty': float(novelty),
+            'done': bool(exp.get('done', False)),
+            'advantage': advantage_val,
+            'advantage_norm': norm_advantage,
+            'success': bool(success_flag),
+        }
+        surprise = abs(reward_val - reward_anchor)
+        payload['priority'] = float(abs(ret_val) + 0.1 * abs(reward_val) + 0.5 * payload['novelty'] + 0.3 * surprise)
+        buf.append(payload)
+        if success_flag:
+            archive.append(dict(payload))
+        new_advantages.append(advantage_val)
+    genome.rl_memory = buf
+    genome.rl_success_archive = archive
+    try:
+        util = len(buf) / float(buf.maxlen or len(buf) or 1)
+    except Exception:
+        util = 0.0
+    meta['memory_util'] = float(np.clip(util, 0.0, 1.0))
+    meta['weight_kernel'] = dict(_ensure_rl_weight_coeffs(genome))
+    meta['signal_kernel'] = dict(_ensure_rl_signal_coeffs(genome))
+    if experiences:
+        ratio = float(success_count) / float(len(experiences))
+        meta['success_window'] = float(ratio)
+        prev_rate = float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+        meta['success_rate'] = float((1.0 - _RL_SUCCESS_ALPHA) * prev_rate + _RL_SUCCESS_ALPHA * ratio)
+    if new_advantages:
+        mean_adv = float(sum(new_advantages) / len(new_advantages))
+        prev_adv = float(meta.get('advantage_ema', 0.0))
+        meta['advantage_ema'] = float((1.0 - _RL_SUCCESS_ALPHA) * prev_adv + _RL_SUCCESS_ALPHA * mean_adv)
+        span_now = float(max(new_advantages) - min(new_advantages))
+        prev_span = float(meta.get('advantage_span', 0.0))
+        meta['advantage_span'] = float((1.0 - 0.5 * _RL_SUCCESS_ALPHA) * prev_span + 0.5 * _RL_SUCCESS_ALPHA * span_now)
+        peak_prev = float(meta.get('advantage_peak', 0.0))
+        meta['advantage_peak'] = float(max(peak_prev, max(new_advantages)))
+
+
+def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> None:
+    buf = list(getattr(genome, 'rl_memory', []) or [])
+    if len(buf) < 4:
+        return
+    meta = _rl_prepare_meta(genome)
+    discrete: List[Tuple[int, Dict[str, Any]]] = []
+    for idx, item in enumerate(buf):
+        act = item.get('action')
+        if isinstance(act, (int, np.integer)):
+            discrete.append((idx, item))
+    archive_list = list(getattr(genome, 'rl_success_archive', []) or [])
+    if archive_list:
+        base_index = len(buf)
+        for offset, item in enumerate(archive_list):
+            act = item.get('action')
+            if isinstance(act, (int, np.integer)):
+                discrete.append((base_index + offset, item))
+    if len(discrete) < 4:
+        return
+    indices = np.asarray([idx for idx, _ in discrete], dtype=np.float64)
+    items = [item for _, item in discrete]
+    returns = np.asarray([float(d.get('return', d.get('reward', 0.0))) for d in items], dtype=np.float64)
+    if returns.size == 0:
+        return
+    if np.allclose(returns, returns[0]):
+        ret_weights = np.ones_like(returns)
+    else:
+        shifted = returns - np.min(returns)
+        if np.allclose(shifted, 0.0):
+            ret_weights = np.ones_like(returns)
+        else:
+            ret_weights = shifted
+    ret_weights = ret_weights + float(max(0.0, entropy)) * (np.std(returns) + 1e-6)
+    advantages = np.asarray([float(d.get('advantage', d.get('return', 0.0))) for d in items], dtype=np.float64)
+    if advantages.size:
+        adv_center = float(meta.get('advantage_ema', 0.0))
+        adv_norm = advantages - adv_center
+        adv_std = float(np.std(adv_norm))
+        if adv_std > 1e-6:
+            adv_norm = adv_norm / (adv_std + 1e-6)
+        else:
+            adv_norm = np.tanh(adv_norm)
+    else:
+        adv_norm = np.zeros_like(ret_weights)
+    success_flags = np.asarray([1.0 if d.get('success') else 0.0 for d in items], dtype=np.float64)
+    if success_flags.size:
+        success_rate = float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+        success_bonus = success_flags * (0.5 + 0.5 * success_rate)
+    else:
+        success_bonus = np.zeros_like(ret_weights)
+    ret_weights = ret_weights + np.maximum(0.0, adv_norm) * 0.6 + success_bonus
+    novelty = np.asarray([float(d.get('novelty', 0.0)) for d in items], dtype=np.float64)
+    if novelty.size:
+        min_novel = float(np.min(novelty))
+        novelty = novelty - min_novel
+        max_novel = float(np.max(novelty))
+        if max_novel > 0:
+            novelty = novelty / max_novel
+        else:
+            novelty = np.zeros_like(ret_weights)
+    else:
+        novelty = np.zeros_like(ret_weights)
+    priority = np.asarray([float(d.get('priority', 1.0)) for d in items], dtype=np.float64)
+    if priority.size:
+        max_priority = float(np.max(priority))
+        if max_priority > 0:
+            priority = priority / max_priority
+        else:
+            priority = np.ones_like(ret_weights)
+    else:
+        priority = np.ones_like(ret_weights)
+    if indices.size:
+        recency = indices - float(np.min(indices)) + 1.0
+        max_recency = float(np.max(recency))
+        if max_recency > 0:
+            recency = recency / max_recency
+        else:
+            recency = np.ones_like(indices)
+    else:
+        recency = np.ones_like(ret_weights)
+    stability = float(np.clip(meta.get('stability', 0.0), 0.0, 1.0))
+    trend = float(meta.get('trend', 0.0))
+    denom = max(1.0, abs(meta.get('last_reward', 0.0)) + 1e-6)
+    trend_norm = float(np.tanh(trend / denom))
+    novelty_gain = 0.25 + 0.55 * (1.0 - stability)
+    recency_gain = 0.2 + 0.5 * max(0.0, -trend_norm)
+    coeffs = _ensure_rl_weight_coeffs(genome)
+    requested_program = _rl_weight_program_for(genome)
+    default_program = _RL_WEIGHT_DSL_TEMPLATE.format(**{k: repr(v) for k, v in _RL_WEIGHT_COEFF_DEFAULTS.items()})
+    program = requested_program
+    weight_state = {
+        'weights': ret_weights.copy(),
+        'ret_weights': ret_weights,
+        'novelty_gain': novelty_gain,
+        'recency_gain': recency_gain,
+        'novelty': novelty,
+        'priority': priority,
+        'recency': recency,
+        'returns': returns,
+        'stability': stability,
+        'trend_norm': trend_norm,
+        'entropy': float(max(0.0, entropy)),
+        'memory_util': float(np.clip(meta.get('memory_util', 0.0), 0.0, 1.0)),
+        'lazy_strength': float(np.clip(getattr(genome, 'lazy_lineage_strength', 0.0), 0.0, 4.0)),
+        'size': float(len(items)),
+        'advantage': adv_norm,
+        'advantage_raw': advantages,
+        'success_rate': float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0)),
+        'success_window': float(np.clip(meta.get('success_window', meta.get('success_rate', 0.0)), 0.0, 1.0)),
+    }
+    weights = _rl_run_weight_program(weight_state, program)
+    if weights is None or weights.shape != ret_weights.shape:
+        program = default_program
+        weights = _rl_run_weight_program(weight_state, program)
+    if weights is None or weights.shape != ret_weights.shape:
+        weights = ret_weights.copy()
+    weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1e-8)
+    weights = np.clip(weights, 1e-8, None)
+    total_w = float(np.sum(weights))
+    if not np.isfinite(total_w) or total_w <= 0:
+        weights = np.ones_like(ret_weights)
+        total_w = float(len(weights))
+    probs = weights / total_w
+    steps = max(1, int(getattr(genome, 'rl_train_steps', 18)))
+    sample_floor = max(8, int(steps * (0.6 + 0.6 * (1.0 - stability))))
+    sample_size = min(len(items), sample_floor)
+    if sample_size <= 0:
+        return
+    selected: List[int] = []
+    selected_set: Set[int] = set()
+    if novelty.size and np.any(novelty):
+        quota_novel = min(len(items), max(1, sample_size // 3))
+        kth = max(0, len(items) - quota_novel)
+        top_idx = np.argpartition(novelty, kth)[-quota_novel:]
+        order = np.argsort(novelty[top_idx])[::-1]
+        for idx in top_idx[order]:
+            idx_int = int(idx)
+            if idx_int in selected_set:
+                continue
+            selected.append(idx_int)
+            selected_set.add(idx_int)
+            if len(selected) >= sample_size:
+                break
+    if priority.size and len(selected) < sample_size:
+        quota_priority = min(len(items), max(1, sample_size // 4))
+        kth = max(0, len(items) - quota_priority)
+        top_idx = np.argpartition(priority, kth)[-quota_priority:]
+        order = np.argsort(priority[top_idx])[::-1]
+        for idx in top_idx[order]:
+            idx_int = int(idx)
+            if idx_int in selected_set:
+                continue
+            selected.append(idx_int)
+            selected_set.add(idx_int)
+            if len(selected) >= sample_size:
+                break
+    remaining = sample_size - len(selected)
+    if remaining > 0:
+        weight_copy = np.array(weights, copy=True)
+        if selected_set:
+            sel_idx = np.fromiter(selected_set, dtype=np.int64)
+            weight_copy[sel_idx] = 0.0
+        total = float(np.sum(weight_copy))
+        if not np.isfinite(total) or total <= 0:
+            weight_copy.fill(1.0)
+            total = float(len(weight_copy))
+        probs_sample = weight_copy / total
+        max_extra = max(0, len(items) - len(selected_set))
+        remaining = min(remaining, max_extra)
+        if remaining > 0:
+            try:
+                extra = np.random.choice(len(items), size=remaining, replace=False, p=probs_sample)
+            except ValueError:
+                extra = np.random.choice(len(items), size=remaining, replace=False)
+            for idx in extra:
+                idx_int = int(idx)
+                if idx_int in selected_set:
+                    continue
+                selected.append(idx_int)
+                selected_set.add(idx_int)
+                if len(selected) >= sample_size:
+                    break
+    if len(selected) < sample_size:
+        order = np.argsort(weights)[::-1]
+        for idx in order:
+            idx_int = int(idx)
+            if idx_int in selected_set:
+                continue
+            selected.append(idx_int)
+            selected_set.add(idx_int)
+            if len(selected) >= sample_size:
+                break
+    if not selected:
+        return
+    selected = selected[:sample_size]
+    picked = [items[int(i)] for i in selected]
+    sample_weights = None
+    try:
+        idx_arr = np.asarray(selected, dtype=np.int64)
+        weights_selected = weights[idx_arr]
+    except Exception:
+        weights_selected = None
+    if weights_selected is not None and len(weights_selected) == len(picked):
+        local_weights = np.asarray(weights_selected, dtype=np.float64)
+        local_weights = np.nan_to_num(local_weights, nan=0.0, posinf=0.0, neginf=0.0)
+        adv_selected = np.asarray([float(p.get('advantage_norm', 0.0)) for p in picked], dtype=np.float64)
+        success_selected = np.asarray([1.0 if p.get('success') else 0.0 for p in picked], dtype=np.float64)
+        local_weights *= (1.0 + 0.6 * np.maximum(0.0, adv_selected))
+        local_weights += 0.1 * success_selected
+        local_weights = np.clip(local_weights, 1e-4, None)
+        if np.all(np.isfinite(local_weights)) and np.any(local_weights > 0):
+            mean_w = float(np.mean(local_weights))
+            if mean_w > 0:
+                local_weights = local_weights / mean_w
+            sample_weights = local_weights
+    try:
+        obs_stack = [np.asarray(p['obs'], dtype=np.float64).ravel() for p in picked]
+        X = _stack_replay_observations(obs_stack)
+    except Exception:
+        return
+    if X.ndim != 2:
+        X = X.reshape(X.shape[0], -1)
+    X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=-1.0, copy=False)
+    try:
+        y = np.asarray([int(p['action']) for p in picked], dtype=np.int64)
+    except Exception:
+        return
+    if y.ndim != 1 or y.size != X.shape[0]:
+        return
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int32)
+    steps = int(getattr(genome, 'rl_train_steps', 18))
+    l2 = float(getattr(genome, 'rl_l2', 0.0001))
+    batch_returns = [float(p.get('return', p.get('reward', 0.0))) for p in picked]
+    collective_signal = _rl_collective_signal(genome, meta, rewards=batch_returns, experiences=picked)
+    signal_kernel = dict(_ensure_rl_signal_coeffs(genome))
+    meta['weight_kernel'] = dict(coeffs)
+    meta['weight_program_requested'] = requested_program
+    meta['weight_program'] = program
+    meta['signal_kernel'] = signal_kernel
+    signal_program_active = meta.get('signal_program')
+    if not isinstance(signal_program_active, str) or not signal_program_active.strip():
+        signal_program_active = _rl_signal_program_for(genome)
+        meta['signal_program'] = signal_program_active
+    signal_program_requested = meta.get('signal_program_requested', signal_program_active)
+    meta['signal_program_requested'] = signal_program_requested
+    try:
+        history = train_with_backprop_numpy(
+            genome,
+            X,
+            y,
+            steps=steps,
+            lr=float(lr),
+            l2=l2,
+            collective_signal=collective_signal,
+            sample_weight=sample_weights,
+        )
+    except Exception as err:
+        print('[warn] rl replay update skipped:', err)
+        return
+    meta['collective_signal'] = dict(collective_signal)
+    if picked:
+        novelty_mean = float(np.mean([p.get('novelty', 0.0) for p in picked]))
+        priority_mean = float(np.mean([p.get('priority', 0.0) for p in picked]))
+        adv_array = np.asarray([float(p.get('advantage', p.get('return', 0.0))) for p in picked], dtype=np.float64)
+        adv_mean = float(np.mean(adv_array)) if adv_array.size else 0.0
+        adv_span = float(np.ptp(adv_array)) if adv_array.size else 0.0
+        success_ratio = float(np.mean([1.0 if p.get('success') else 0.0 for p in picked]))
+        meta['last_replay'] = {
+            'batch': len(picked),
+            'mean_return': float(np.mean(batch_returns)) if batch_returns else 0.0,
+            'novelty_mean': novelty_mean,
+            'priority_mean': priority_mean,
+            'advantage_mean': adv_mean,
+            'advantage_span': adv_span,
+            'advantage_peak': float(meta.get('advantage_peak', adv_span)),
+            'success_ratio': success_ratio,
+            'success_rate': float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0)),
+            'weight_kernel': dict(coeffs),
+            'weight_program_requested': requested_program,
+            'weight_program': program,
+            'signal_kernel': dict(signal_kernel),
+            'signal_program_requested': signal_program_requested,
+            'signal_program': signal_program_active,
+        }
+        if history:
+            meta['last_replay']['final_loss'] = float(history[-1])
+        if sample_weights is not None:
+            try:
+                meta['last_replay']['sample_weight_mean'] = float(np.mean(sample_weights))
+                meta['last_replay']['sample_weight_max'] = float(np.max(sample_weights))
+            except Exception:
+                pass
+    try:
+        genome.meta_reflect(
+            'rl_replay_train',
+            {
+                'batch': len(picked),
+                'lr': float(lr),
+                'entropy': float(entropy),
+                'collective_signal': dict(collective_signal),
+                'mean_return': float(np.mean(batch_returns)) if batch_returns else 0.0,
+                'weight_kernel': dict(coeffs),
+                'weight_program_requested': requested_program,
+                'weight_program': program,
+                'signal_kernel': dict(signal_kernel),
+                'signal_program_requested': signal_program_requested,
+                'signal_program': signal_program_active,
+                'sample_weight_mean': float(np.mean(sample_weights)) if sample_weights is not None else 0.0,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _rl_update_meta_profile(
+    genome: Genome,
+    rewards: Sequence[float],
+    *,
+    lr: float,
+    entropy: float,
+    gamma: float,
+    experiences: Sequence[Dict[str, Any]],
+) -> None:
+    if genome is None:
+        return
+    meta = _rl_prepare_meta(genome)
+    memory_buf = list(getattr(genome, 'rl_memory', []) or [])
+    limit_curr = float(getattr(genome, 'rl_memory_limit', len(memory_buf) or 1))
+    memory_util = float(np.clip(len(memory_buf) / max(1.0, limit_curr), 0.0, 1.0))
+    if not rewards:
+        meta['entropy_push'] = float(entropy)
+        meta['lr_push'] = float(lr)
+        meta['gamma_push'] = float(gamma)
+        meta['memory_util'] = memory_util
+        params_now = getattr(genome, 'rl_params', {}) or {}
+        gae_now = float(np.clip(params_now.get('gae_lambda', 0.95), 0.2, 0.9995))
+        meta['lambda_push'] = gae_now
+        meta['collective_signal'] = _rl_collective_signal(genome, meta, rewards=[], experiences=experiences)
+        signal_kernel = dict(_ensure_rl_signal_coeffs(genome))
+        meta['signal_kernel'] = signal_kernel
+        signal_program_active = meta.get('signal_program')
+        if not isinstance(signal_program_active, str) or not signal_program_active.strip():
+            signal_program_active = _rl_signal_program_for(genome)
+            meta['signal_program'] = signal_program_active
+        meta['signal_program_requested'] = meta.get('signal_program_requested', signal_program_active)
+        sched_kernel = dict(_ensure_rl_scheduler_coeffs(genome))
+        meta['scheduler_kernel'] = sched_kernel
+        sched_program_active = meta.get('scheduler_program')
+        if not isinstance(sched_program_active, str) or not sched_program_active.strip():
+            sched_program_active = _rl_scheduler_program_for(genome)
+            meta['scheduler_program'] = sched_program_active
+        meta['scheduler_program_requested'] = meta.get('scheduler_program_requested', sched_program_active)
+        meta['scheduler_outputs'] = {
+            'entropy': float(entropy),
+            'lr': float(lr),
+            'gamma': float(gamma),
+            'gae_lambda': float(gae_now),
+        }
+        return
+    rewards_arr = np.asarray(rewards, dtype=np.float64)
+    avg_reward = float(np.mean(rewards_arr))
+    reward_std = float(np.std(rewards_arr))
+    reward_span = float(np.ptp(rewards_arr)) if rewards_arr.size else 0.0
+    prev_ema = float(meta['reward_ema']) if meta.get('episodes', 0) > 0 else avg_reward
+    if meta.get('episodes', 0) <= 0:
+        meta['reward_ema'] = avg_reward
+    else:
+        meta['reward_ema'] = (1.0 - _RL_META_ALPHA) * meta['reward_ema'] + _RL_META_ALPHA * avg_reward
+    diff = avg_reward - prev_ema
+    meta['reward_var'] = (1.0 - _RL_META_VAR_ALPHA) * meta.get('reward_var', 0.0) + _RL_META_VAR_ALPHA * (diff ** 2)
+    meta['episodes'] = int(meta.get('episodes', 0)) + len(rewards)
+    meta['last_reward'] = avg_reward
+    meta['trend'] = float(0.6 * meta.get('trend', 0.0) + 0.4 * diff)
+    meta['stability'] = float(1.0 / (1.0 + max(1e-9, meta['reward_var'])))
+    meta['best_reward'] = float(max(meta.get('best_reward', float('-inf')), float(np.max(rewards_arr))))
+    success_threshold = float(meta.get('reward_ema', avg_reward))
+    success_count = sum(1 for r in rewards if r >= success_threshold)
+    success_ratio = float(success_count) / float(len(rewards)) if rewards else 0.0
+    meta['success_window'] = float(success_ratio)
+    prev_rate = float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+    meta['success_rate'] = float((1.0 - _RL_SUCCESS_ALPHA) * prev_rate + _RL_SUCCESS_ALPHA * success_ratio)
+    if experiences:
+        novelty_vals: List[float] = []
+        adv_vals: List[float] = []
+        for exp in experiences:
+            obs = exp.get('obs')
+            next_obs = exp.get('next_obs')
+            try:
+                obs_arr = np.asarray(obs, dtype=np.float64).ravel()
+            except Exception:
+                continue
+            if next_obs is None:
+                continue
+            try:
+                next_arr = np.asarray(next_obs, dtype=np.float64).ravel()
+            except Exception:
+                continue
+            if obs_arr.shape != next_arr.shape:
+                continue
+            try:
+                novelty_vals.append(float(np.linalg.norm(next_arr - obs_arr)))
+            except Exception:
+                continue
+            try:
+                adv_vals.append(float(exp.get('advantage', exp.get('return', 0.0)) - success_threshold))
+            except Exception:
+                pass
+        if novelty_vals:
+            mean_novelty = float(sum(novelty_vals) / len(novelty_vals))
+            meta['novelty_ema'] = float(0.8 * meta.get('novelty_ema', 0.0) + 0.2 * mean_novelty)
+        if adv_vals:
+            adv_mean = float(sum(adv_vals) / len(adv_vals))
+            prev_adv = float(meta.get('advantage_ema', 0.0))
+            meta['advantage_ema'] = float((1.0 - _RL_SUCCESS_ALPHA) * prev_adv + _RL_SUCCESS_ALPHA * adv_mean)
+            span_now = float(max(adv_vals) - min(adv_vals))
+            prev_span = float(meta.get('advantage_span', 0.0))
+            meta['advantage_span'] = float((1.0 - 0.5 * _RL_SUCCESS_ALPHA) * prev_span + 0.5 * _RL_SUCCESS_ALPHA * span_now)
+            peak_prev = float(meta.get('advantage_peak', 0.0))
+            meta['advantage_peak'] = float(max(peak_prev, max(adv_vals)))
+    params_before = dict(getattr(genome, 'rl_params', {}) or {})
+    stability = float(meta['stability'])
+    denom = max(1.0, abs(prev_ema) + reward_std + 1e-6)
+    norm_delta = float(np.tanh(diff / denom))
+    depth_spread = 0.0
+    try:
+        _hidden, _edges, _branch, depth_spread, _score = genome.structural_complexity_stats()
+    except Exception:
+        depth_spread = 0.0
+    depth_factor = 1.0 + 0.02 * float(depth_spread)
+    steps_now = max(1, int(getattr(genome, 'rl_train_steps', 18)))
+    target_steps = int(
+        np.clip(
+            round(steps_now * (1.0 + 0.45 * norm_delta) * depth_factor * (0.7 + 0.6 * memory_util)),
+            8,
+            96,
+        )
+    )
+    changes: Dict[str, Any] = {}
+    if target_steps != steps_now:
+        changes['rl_train_steps'] = (steps_now, target_steps)
+        genome.rl_train_steps = target_steps
+    l2_now = float(getattr(genome, 'rl_l2', 0.0001))
+    target_l2 = float(np.clip(l2_now * (1.0 - 0.35 * norm_delta), 1e-6, 0.01))
+    if not math.isclose(target_l2, l2_now, rel_tol=1e-3, abs_tol=1e-6):
+        changes['rl_l2'] = (l2_now, target_l2)
+        genome.rl_l2 = target_l2
+    will = float(np.clip(getattr(genome, 'mutation_will', 0.5), 0.0, 1.0))
+    base_limit = int(getattr(genome, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
+    desired = (_DEFAULT_RL_MEMORY_LIMIT * (0.6 + 0.8 * (1.0 - stability)))
+    desired *= (0.7 + 0.6 * will)
+    desired *= (1.0 + 0.1 * float(depth_spread))
+    novelty_metric = float(meta.get('novelty_ema', 0.0))
+    novelty_scale = float(np.tanh(novelty_metric / (abs(meta.get('reward_ema', 0.0)) + reward_std + 1e-6)))
+    reward_pressure = float(max(0.0, meta.get('population_reward_pressure', 0.0)))
+    reward_trend = float(np.clip(meta.get('population_reward_trend_norm', 0.0), -1.0, 1.0))
+    reward_alignment = float(np.clip(meta.get('population_reward_alignment', 0.0), -1.0, 1.0))
+    reward_spread = float(np.clip(meta.get('population_reward_spread', 0.0), 0.0, 2.0))
+    novelty_gain = 1.0 + 0.25 * abs(novelty_scale)
+    novelty_gain *= (1.0 + 0.12 * reward_pressure)
+    reward_gain = (1.0 + 0.18 * reward_spread + 0.22 * max(0.0, -reward_trend))
+    reward_gain *= (1.0 + 0.1 * abs(reward_alignment))
+    desired = int(np.clip(round(desired * novelty_gain * reward_gain), _RL_MEMORY_LIMIT_MIN, _RL_MEMORY_LIMIT_MAX))
+    buf_list = memory_buf
+    if desired != base_limit:
+        trimmed = deque(buf_list[-desired:], maxlen=desired)
+        genome.rl_memory_limit = desired
+        genome.rl_memory = trimmed
+        changes['rl_memory_limit'] = (base_limit, desired)
+        memory_buf = list(trimmed)
+    limit = float(getattr(genome, 'rl_memory_limit', len(memory_buf) or 1))
+    memory_util = float(np.clip(len(memory_buf) / max(1.0, limit), 0.0, 1.0))
+    params = getattr(genome, 'rl_params', {}) or {}
+    gae_seed = float(np.clip(params.get('gae_lambda', 0.95), 0.2, 0.9995))
+    scheduler_program_used: Optional[str] = None
+    scheduler_requested: Optional[str] = None
+    scheduler_outputs: Optional[Dict[str, float]] = None
+    if params:
+        entropy_now = float(np.clip(params.get('entropy', entropy), 0.0, 0.5))
+        lr_now = float(np.clip(params.get('lr', lr), 1e-5, 0.2))
+        gamma_now = float(np.clip(params.get('gamma', gamma), 0.4, 0.9995))
+        gae_now = float(np.clip(params.get('gae_lambda', gae_seed), 0.2, 0.9995))
+        reward_span_norm = float(np.tanh(reward_span / denom)) if denom > 0 else 0.0
+        scheduler_state = {
+            'entropy': entropy_now,
+            'lr': lr_now,
+            'gamma': gamma_now,
+            'gae_lambda': gae_now,
+            'norm_delta': norm_delta,
+            'stability': stability,
+            'novelty_scale': float(np.clip(novelty_scale, -1.0, 1.0)),
+            'memory_util': float(np.clip(memory_util, 0.0, 1.0)),
+            'team_alignment': float(np.clip(meta.get('population_reward_alignment', 0.0), -1.0, 1.0)),
+            'team_trend': float(np.clip(meta.get('population_reward_trend_norm', 0.0), -1.0, 1.0)),
+            'team_pressure': float(max(0.0, meta.get('population_reward_pressure', 0.0))),
+            'team_best': float(np.clip(meta.get('population_reward_best_norm', 0.0), 0.0, 1.0)),
+            'reward_span_norm': reward_span_norm,
+            'success_rate': float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0)),
+            'success_window': float(np.clip(meta.get('success_window', meta.get('success_rate', 0.0)), 0.0, 1.0)),
+            'advantage_span': float(np.clip(meta.get('advantage_span', 0.0), 0.0, 10.0)),
+        }
+        scheduler_requested = _rl_scheduler_program_for(genome)
+        default_sched_program = _RL_SCHED_DSL_TEMPLATE.format(
+            **{k: repr(v) for k, v in _RL_SCHED_COEFF_DEFAULTS.items()}
+        )
+        program = scheduler_requested
+        scheduler_outputs = _rl_run_scheduler_program(scheduler_state, program)
+        if scheduler_outputs is None:
+            program = default_sched_program
+            scheduler_outputs = _rl_run_scheduler_program(scheduler_state, program)
+        if scheduler_outputs is None:
+            entropy_target = float(
+                np.clip(
+                    entropy_now * (1.0 + (1.0 - stability) * 0.4 - 0.25 * norm_delta),
+                    1e-5,
+                    0.5,
+                )
+            )
+            entropy_target = float(
+                np.clip(entropy_target * (1.0 + 0.3 * (1.0 - abs(novelty_scale))), 1e-5, 0.5)
+            )
+            lr_scale = (1.0 + 0.55 * norm_delta) * (0.9 + 0.2 * (1.0 - memory_util))
+            lr_target = float(np.clip(lr_now * lr_scale, 1e-5, 0.2))
+            gamma_target = float(
+                np.clip(
+                    gamma_now
+                    + 0.01 * norm_delta * (0.5 + 0.5 * stability)
+                    + 0.02 * novelty_scale,
+                    0.4,
+                    0.9995,
+                )
+            )
+            lambda_target = float(
+                np.clip(
+                    gae_now
+                    + 0.18 * norm_delta
+                    + 0.12 * float(np.clip(novelty_scale, -1.0, 1.0))
+                    + 0.1 * float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+                    - 0.08 * reward_span_norm,
+                    0.2,
+                    0.9995,
+                )
+            )
+            scheduler_outputs = {
+                'entropy': entropy_target,
+                'lr': lr_target,
+                'gamma': gamma_target,
+                'gae_lambda': lambda_target,
+            }
+        else:
+            entropy_target = float(np.clip(scheduler_outputs.get('entropy', entropy_now), 1e-5, 0.5))
+            lr_target = float(np.clip(scheduler_outputs.get('lr', lr_now), 1e-5, 0.2))
+            gamma_target = float(np.clip(scheduler_outputs.get('gamma', gamma_now), 0.4, 0.9995))
+            lambda_target = float(np.clip(scheduler_outputs.get('gae_lambda', gae_now), 0.2, 0.9995))
+            scheduler_outputs = {
+                'entropy': entropy_target,
+                'lr': lr_target,
+                'gamma': gamma_target,
+                'gae_lambda': lambda_target,
+            }
+        scheduler_program_used = program
+        params.update({'entropy': entropy_target, 'lr': lr_target, 'gamma': gamma_target, 'gae_lambda': lambda_target})
+        genome.rl_params = params
+        meta['entropy_push'] = entropy_target
+        meta['lr_push'] = lr_target
+        meta['gamma_push'] = gamma_target
+        meta['lambda_push'] = lambda_target
+    else:
+        meta['entropy_push'] = float(entropy)
+        meta['lr_push'] = float(lr)
+        meta['gamma_push'] = float(gamma)
+        meta['lambda_push'] = gae_seed
+    sched_active = meta.get('scheduler_program')
+    if not isinstance(sched_active, str) or not sched_active.strip():
+        sched_active = _rl_scheduler_program_for(genome)
+        meta['scheduler_program'] = sched_active
+    if scheduler_program_used is not None:
+        meta['scheduler_program'] = scheduler_program_used
+    scheduler_requested = scheduler_requested or meta.get('scheduler_program_requested', meta.get('scheduler_program'))
+    meta['scheduler_program_requested'] = scheduler_requested
+    meta['scheduler_kernel'] = dict(_ensure_rl_scheduler_coeffs(genome))
+    if scheduler_outputs is not None:
+        meta['scheduler_outputs'] = {k: float(v) for k, v in scheduler_outputs.items()}
+    else:
+        meta.setdefault(
+            'scheduler_outputs',
+            {
+                'entropy': float(meta['entropy_push']),
+                'lr': float(meta['lr_push']),
+                'gamma': float(meta['gamma_push']),
+                'gae_lambda': float(meta['lambda_push']),
+            },
+        )
+    meta['memory_util'] = memory_util
+    signal = _rl_collective_signal(genome, meta, rewards=rewards, experiences=experiences)
+    meta['collective_signal'] = dict(signal)
+    meta['weight_kernel'] = dict(_ensure_rl_weight_coeffs(genome))
+    weight_program = _rl_weight_program_for(genome)
+    meta['weight_program_requested'] = weight_program
+    meta['weight_program'] = weight_program
+    signal_kernel = dict(_ensure_rl_signal_coeffs(genome))
+    meta['signal_kernel'] = signal_kernel
+    signal_program_active = meta.get('signal_program')
+    if not isinstance(signal_program_active, str) or not signal_program_active.strip():
+        signal_program_active = _rl_signal_program_for(genome)
+        meta['signal_program'] = signal_program_active
+    meta['signal_program_requested'] = meta.get('signal_program_requested', signal_program_active)
+    if params_before != getattr(genome, 'rl_params', {}) and 'rl_params' not in changes:
+        changes['rl_params'] = dict(genome.rl_params)
+    if changes:
+        try:
+            genome.meta_reflect(
+                'rl_meta_adjust',
+                {
+                    'avg_reward': avg_reward,
+                    'ema_reward': meta['reward_ema'],
+                    'normalized_delta': norm_delta,
+                    'stability': stability,
+                    'changes': changes,
+                    'collective_signal': signal,
+                },
+            )
+        except Exception:
+            pass
+def _rl_collect_episode(
+    genome: Genome,
+    env,
+    mapper,
+    *,
+    gamma: float,
+    entropy: float,
+    gae_lambda: float,
+    meta: Optional[Dict[str, Any]]=None,
+    max_steps: Optional[int]=None,
+    render: bool=False,
+    obs_norm=None,
+):
     total, steps, done = (0.0, 0, False)
     reset_out = env.reset()
     obs = reset_out[0] if isinstance(reset_out, tuple) and len(reset_out) >= 1 else reset_out
+    experiences: List[Dict[str, Any]] = []
+    meta = meta or {}
+    baseline_reward = float(meta.get('reward_ema', 0.0)) if isinstance(meta, dict) else 0.0
+    baseline_adv = float(meta.get('advantage_ema', 0.0)) if isinstance(meta, dict) else 0.0
+    baseline = baseline_reward + baseline_adv
+    lam = float(np.clip(gae_lambda, 0.0, 0.9995))
+    entropy_gain = float(max(0.0, entropy))
     while not done:
         if render:
             try:
                 env.render()
             except Exception:
                 pass
-        x = obs if obs_norm is None else obs_norm(obs)
-        y = genome.forward_one(np.asarray(x, dtype=np.float32).ravel())
-        mapped = mapper(y)
+        obs_vec = obs if obs_norm is None else obs_norm(obs)
+        obs_arr = np.asarray(obs_vec, dtype=np.float32).ravel()
+        logits = genome.forward_one(obs_arr)
+        mapped = mapper(logits)
         if isinstance(mapped, tuple):
-            act = mapped[0]
+            action, probs = mapped
         else:
-            act = mapped
-        step_out = env.step(act)
+            action, probs = (mapped, None)
+        step_out = env.step(action)
         if isinstance(step_out, tuple) and len(step_out) == 5:
-            obs, reward, terminated, truncated, info = step_out
+            next_obs, reward, terminated, truncated, info = step_out
             done = bool(terminated or truncated)
         else:
-            obs, reward, done, info = step_out
+            next_obs, reward, done, info = step_out
             done = bool(done)
+        next_obs_vec = np.asarray(next_obs, dtype=np.float32).ravel()
+        chosen_prob = None
+        entropy_term = 0.0
+        if probs is not None:
+            try:
+                if np.isscalar(action):
+                    idx = int(action)
+                    if 0 <= idx < len(probs):
+                        chosen_prob = float(max(1e-8, probs[idx]))
+                        if entropy_gain > 0.0:
+                            entropy_term = float(max(0.0, -math.log(chosen_prob)))
+            except Exception:
+                chosen_prob = None
+        experiences.append(
+            {
+                'obs': obs_arr.copy(),
+                'action': action,
+                'reward': float(reward),
+                'next_obs': next_obs_vec.copy(),
+                'prob': chosen_prob,
+                'done': bool(done),
+                'entropy_bonus': entropy_term,
+            }
+        )
         total += float(reward)
+        obs = next_obs
         steps += 1
         if max_steps is not None and steps >= int(max_steps):
             break
+    if not experiences:
+        return total, experiences
+    returns = np.zeros(len(experiences), dtype=np.float64)
+    future = 0.0
+    for idx in reversed(range(len(experiences))):
+        exp = experiences[idx]
+        reward = float(exp.get('reward', 0.0))
+        done_flag = 1.0 if exp.get('done') else 0.0
+        future = reward + float(gamma) * future * (1.0 - done_flag)
+        if entropy_gain > 0.0:
+            future += entropy_gain * float(exp.get('entropy_bonus', 0.0))
+        returns[idx] = future
+    reward_std = float(np.std(returns)) if returns.size else 0.0
+    norm_denom = max(1e-6, abs(baseline_reward) + reward_std)
+    next_smoothed = baseline
+    for idx in reversed(range(len(experiences))):
+        exp = experiences[idx]
+        ret = returns[idx]
+        smoothed_val = (1.0 - lam) * ret + lam * next_smoothed
+        advantage = smoothed_val - baseline
+        exp['return'] = float(smoothed_val)
+        exp['advantage'] = float(advantage)
+        exp['advantage_norm'] = float(np.tanh(advantage / norm_denom))
+        if exp.get('done'):
+            next_smoothed = baseline
+        else:
+            next_smoothed = smoothed_val
+        exp.pop('entropy_bonus', None)
+    return total, experiences
+
+
+def _rollout_policy_in_env(genome, env, mapper, max_steps=None, render=False, obs_norm=None):
+    """Rollout one episode with a Genome and an action mapper."""
+    params = getattr(genome, 'rl_params', {}) or {}
+    gamma = float(np.clip(params.get('gamma', 0.99), 0.0, 0.9995))
+    entropy = float(max(0.0, params.get('entropy', 0.01)))
+    gae_lambda = float(np.clip(params.get('gae_lambda', 0.95), 0.0, 0.9995))
+    meta = getattr(genome, 'rl_meta', {}) or {}
+    total, _ = _rl_collect_episode(
+        genome,
+        env,
+        mapper,
+        gamma=gamma,
+        entropy=entropy,
+        gae_lambda=gae_lambda,
+        meta=meta,
+        max_steps=max_steps,
+        render=render,
+        obs_norm=obs_norm,
+    )
     return total
 
 def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, episodes=1, obs_norm=None):
@@ -8061,9 +11505,42 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
     n_episodes = max(1, int(episodes))
 
     def _fitness(genome):
+        params = getattr(genome, 'rl_params', {}) or {}
+        gamma = float(np.clip(params.get('gamma', 0.99), 0.0, 0.9995))
+        entropy = float(max(0.0, params.get('entropy', 0.01)))
+        gae_lambda = float(np.clip(params.get('gae_lambda', 0.95), 0.0, 0.9995))
+        lr = float(np.clip(params.get('lr', 0.01), 1e-6, 1.0))
         total = 0.0
+        reward_list: List[float] = []
+        replay_batch: List[Dict[str, Any]] = []
+        meta_state = getattr(genome, 'rl_meta', {}) or {}
         for _ in range(n_episodes):
-            total += _rollout_policy_in_env(genome, env, mapper, max_steps=max_steps, render=False, obs_norm=obs_norm)
+            reward, experiences = _rl_collect_episode(
+                genome,
+                env,
+                mapper,
+                gamma=gamma,
+                entropy=entropy,
+                gae_lambda=gae_lambda,
+                meta=meta_state,
+                max_steps=max_steps,
+                render=False,
+                obs_norm=obs_norm,
+            )
+            total += reward
+            reward_list.append(float(reward))
+            replay_batch.extend(experiences)
+        if replay_batch:
+            _rl_store_experiences(genome, replay_batch)
+            _rl_experience_replay_update(genome, lr=lr, entropy=entropy)
+        _rl_update_meta_profile(
+            genome,
+            reward_list,
+            lr=lr,
+            entropy=entropy,
+            gamma=gamma,
+            experiences=replay_batch,
+        )
         return total / float(n_episodes)
 
     def _close_env():
@@ -8073,6 +11550,8 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
             pass
     _fitness.close_env = _close_env
     _fitness.env = env
+    _fitness.is_rl = True
+    _fitness.rl_mode = True
     return _fitness
 
 def eval_with_node_activations(genome: 'Genome', obs_vec: np.ndarray):
@@ -8157,8 +11636,19 @@ def _episode_bc_update(genome: 'Genome', obs_list, act_list, ret_list, steps=20,
     if len(obs_list) == 0:
         return
     n = len(obs_list)
-    k = max(1, int(max(1.0 / n, top_frac) * n))
-    idx = np.argsort(ret_list)[::-1][:k]
+    meta = getattr(genome, 'rl_meta', {}) or {}
+    success_rate = float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+    adaptive_frac = float(np.clip(top_frac + 0.2 * success_rate, 0.05, 0.95))
+    k = max(1, int(max(1.0 / n, adaptive_frac) * n))
+    returns = np.asarray(ret_list, dtype=np.float64)
+    baseline = float(meta.get('reward_ema', 0.0))
+    if returns.size:
+        scores = returns - baseline
+        if not np.any(np.abs(scores) > 1e-6):
+            scores = returns
+    else:
+        scores = np.asarray(ret_list)
+    idx = np.argsort(scores)[::-1][:k]
     X = np.asarray([obs_list[i] for i in idx], dtype=np.float64)
     y = np.asarray([act_list[i] for i in idx], dtype=np.int32)
     try:
@@ -8221,9 +11711,7 @@ def run_policy_in_env(genome: 'Genome', env_id: str, episodes: int=1, max_steps:
             if show_bars and probs is not None:
                 _draw_prob_bars(ax_prob, probs, title='Action probabilities')
             _apply_tight_layout(fig)
-            fig.canvas.draw()
-            w, h = fig.canvas.get_width_height()
-            buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+            buf = _fig_to_rgb(fig)
             frames.append(buf)
             plt.close(fig)
             ep_obs.append(obs.copy())
@@ -9314,7 +12802,45 @@ def run_spinor_monolith(
     group_idx_seq = _int_col(tele_rows, 'group_idx') if tele_rows else np.array([], dtype=np.int32)
     group_energy_seq = _float_col(tele_rows, 'group_energy') if tele_rows else np.array([], dtype=np.float64)
     group_label_seq = np.array(_str_col(tele_rows, 'group_label')) if tele_rows else np.array([], dtype=object)
+    fft_peak_seq = _float_col(tele_rows, 'fft_peak') if tele_rows else np.array([], dtype=np.float64)
+    fft_entropy_seq = _float_col(tele_rows, 'fft_entropy') if tele_rows else np.array([], dtype=np.float64)
+    fft_reason_seq = np.array(_str_col(tele_rows, 'fft_reason')) if tele_rows else np.array([], dtype=object)
     evaluator_notes = _str_col(tele_rows, 'evaluator_note') if tele_rows else []
+
+    harmonic_maps: List[Dict[int, float]] = []
+    max_harm = 0
+    if tele_rows:
+        for row in tele_rows:
+            payload = row.get('noise_harmonics', '{}') if isinstance(row, dict) else '{}'
+            try:
+                parsed = _json.loads(payload) if isinstance(payload, str) else {}
+            except Exception:
+                parsed = {}
+            clean: Dict[int, float] = {}
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    try:
+                        val = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if not np.isfinite(val):
+                        continue
+                    idx: Optional[int] = None
+                    if isinstance(key, str) and key.startswith('h'):
+                        try:
+                            idx = int(key[1:])
+                        except ValueError:
+                            idx = None
+                    if idx is None:
+                        try:
+                            idx = int(key)
+                        except (TypeError, ValueError):
+                            continue
+                    if idx < 0:
+                        continue
+                    clean[idx] = float(val)
+                    max_harm = max(max_harm, idx + 1)
+            harmonic_maps.append(clean)
 
     plt.figure()
     if g.size:
@@ -9355,6 +12881,7 @@ def run_spinor_monolith(
     plt.close()
 
     fig_noise: Optional[str] = None
+    fig_fft: Optional[str] = None
     if g.size:
         fig_noise = f'{out_prefix}_noise_timeline.png'
         fig, ax = plt.subplots(figsize=(8.2, 3.8))
@@ -9406,6 +12933,84 @@ def run_spinor_monolith(
         ax.grid(True, alpha=0.18, linestyle='--', linewidth=0.6)
         _apply_tight_layout(fig)
         _savefig(fig, fig_noise, dpi=170)
+        plt.close(fig)
+
+    if g.size and (np.isfinite(fft_peak_seq).any() or max_harm > 0):
+        rows = 2 if max_harm > 0 else 1
+        fig, axes = plt.subplots(rows, 1, figsize=(8.4, 3.0 * rows), sharex=False)
+        axes_arr = np.atleast_1d(axes)
+        ax_top = axes_arr[0]
+        if np.isfinite(fft_peak_seq).any():
+            ax_top.plot(g, fft_peak_seq, color='#1f77b4', lw=1.4, label='FFT peak')
+        if np.isfinite(fft_entropy_seq).any():
+            ax_top.plot(g, fft_entropy_seq, color='#d62728', lw=1.15, label='FFT entropy')
+        if fft_reason_seq.size:
+            spike_idx = [idx for idx, reason in enumerate(fft_reason_seq) if str(reason)]
+            if spike_idx:
+                peak_vals = np.clip(fft_peak_seq[spike_idx], 0.0, 1.2)
+                ax_top.scatter(g[spike_idx], peak_vals, color='#ff7f0e', s=26, alpha=0.85, label='disturbance')
+                for idx in spike_idx[:12]:
+                    ax_top.annotate(
+                        str(fft_reason_seq[idx])[:18],
+                        (g[idx], np.clip(fft_peak_seq[idx], 0.0, 1.2)),
+                        textcoords='offset points',
+                        xytext=(0, 7),
+                        ha='center',
+                        fontsize=8,
+                        rotation=28,
+                    )
+        ax_top.set_ylabel('normalized value')
+        ax_top.set_title('FFT disturbance telemetry')
+        ax_top.grid(alpha=0.25, linestyle='--', linewidth=0.6)
+        handles, labels = ax_top.get_legend_handles_labels()
+        if handles:
+            ax_top.legend(loc='upper right', fontsize=8, frameon=False)
+        if rows == 1:
+            ax_top.set_xlabel('generation')
+        if max_harm > 0:
+            ax_spec = axes_arr[1]
+            spec_mat = np.zeros((len(g), max_harm), dtype=np.float64)
+            for col, spec in enumerate(harmonic_maps):
+                if col >= spec_mat.shape[0] or not spec:
+                    continue
+                row = spec_mat[col]
+                for idx_h, val in spec.items():
+                    if 0 <= idx_h < max_harm:
+                        row[idx_h] = max(0.0, float(val))
+                total = float(row.sum())
+                if total > 0.0:
+                    row /= total
+            heat = spec_mat.T
+            if heat.size:
+                if g.size:
+                    x0 = float(g[0]) - 0.5
+                    x1 = float(g[-1]) + 0.5
+                else:
+                    x0, x1 = -0.5, float(len(g)) - 0.5
+                vmax = float(np.nanmax(heat)) if np.isfinite(heat).any() else 0.0
+                im = ax_spec.imshow(
+                    heat,
+                    aspect='auto',
+                    origin='lower',
+                    cmap='magma',
+                    extent=(x0, x1, -0.5, max_harm - 0.5),
+                    vmin=0.0,
+                    vmax=max(0.35, vmax if vmax > 0.0 else 0.35),
+                )
+                tick_count = min(6, len(g)) if len(g) else 0
+                if tick_count:
+                    tick_positions = np.linspace(float(g[0]), float(g[-1]), tick_count)
+                    ax_spec.set_xticks(tick_positions)
+                    ax_spec.set_xticklabels([f'{tp:.0f}' for tp in tick_positions], rotation=25)
+                ax_spec.set_ylabel('harmonic index')
+                ax_spec.set_yticks(range(max_harm))
+                ax_spec.set_yticklabels([f'h{i}' for i in range(max_harm)])
+                ax_spec.set_xlabel('generation')
+                ax_spec.set_title('Spectral energy distribution')
+                fig.colorbar(im, ax=ax_spec, orientation='vertical', fraction=0.046, pad=0.02, label='weight')
+        _apply_tight_layout(fig)
+        fig_fft = f'{out_prefix}_fft_disturbances.png'
+        _savefig(fig, fig_fft, dpi=170)
         plt.close(fig)
 
     spinor_grid_png: Optional[str] = None
@@ -9537,10 +13142,8 @@ def run_spinor_monolith(
                 title += f' ← {note}'
             fig.suptitle(title, fontsize=12)
             _apply_tight_layout(fig)
-            fig.canvas.draw()
-            w, h = fig.canvas.get_width_height()
-            frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-            frames.append(frame.reshape(h, w, 3))
+            frame = _fig_to_rgb(fig)
+            frames.append(frame)
             plt.close(fig)
 
         if frames:
@@ -9561,6 +13164,8 @@ def run_spinor_monolith(
     }
     if fig_noise:
         artifacts['noise_timeline_png'] = fig_noise
+    if fig_fft:
+        artifacts['fft_disturbance_png'] = fig_fft
     if resilience_log:
         artifacts['resilience_log'] = resilience_log
     if spinor_grid_png:
@@ -9659,6 +13264,12 @@ class SpinorGroupInteraction:
             return float(self._element_norms[int(idx) % self.size])
         except Exception:
             return float(self._element_norms[0])
+
+    def max_energy(self) -> float:
+        try:
+            return float(np.max(self._element_norms))
+        except Exception:
+            return 1.0
 
     def apply_to_points(self, idx: Optional[int], points: np.ndarray) -> np.ndarray:
         if idx is None or points.size == 0:
@@ -9771,7 +13382,7 @@ class NomologyEnv:
     seed: Optional[int] = None
     noise_weaver_seed: Optional[int] = None
     _rng: np.random.Generator = field(init=False, repr=False)
-    noise: float = 0.06
+    noise: float = 0.075
     turns: float = 1.6
     rot_bias: float = 0.0
     lazy_share: float = 0.0
@@ -9795,25 +13406,31 @@ class NomologyEnv:
     noise_kind_code: int = 0
     noise_palette: Tuple[str, ...] = ('white', 'alpha', 'beta', 'black')
     noise_stage_len: int = 6
-    noise_jitter: float = 0.006
+    noise_jitter: float = 0.009
     noise_levels: Dict[str, Tuple[float, float]] = field(
         default_factory=lambda: {
-            'white': (0.045, 0.012),
-            'alpha': (0.052, 0.014),
-            'beta': (0.058, 0.018),
-            'black': (0.068, 0.022),
+            'white': (0.052, 0.015),
+            'alpha': (0.059, 0.018),
+            'beta': (0.067, 0.022),
+            'black': (0.081, 0.028),
         }
     )
-    noise_min: float = 0.02
-    noise_max: float = 0.14
+    noise_min: float = 0.03
+    noise_max: float = 0.22
     noise_weaver: Optional[SpectralNoiseWeaver] = None
     noise_focus: float = 0.0
     noise_entropy: float = 0.0
     noise_harmonics: Dict[str, float] = field(default_factory=dict)
     noise_style_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    fft_retention: int = 3
+    last_fft_payload: Dict[str, Any] = field(default_factory=dict)
     _noise_counter: float = field(default=0.0, init=False, repr=False)
     _last_weaver_error: Optional[str] = field(default=None, init=False, repr=False)
+    _fft_decay: int = field(default=0, init=False, repr=False)
     diversity_signal: Dict[str, float] = field(default_factory=dict)
+    rl_objective: Dict[str, float] = field(default_factory=dict)
+    rl_mode: bool = False
+    last_reward_objective: float = 0.0
 
     def __post_init__(self) -> None:
         self._rng = np.random.default_rng(self.seed)
@@ -9843,6 +13460,8 @@ class NomologyEnv:
         self.last_env_shift = 0.0
         self.last_leader_id = None
         self.last_advantage_penalty = False
+        self._fft_decay = 0
+        self.last_fft_payload = {}
 
     def noise_style(self, kind: Optional[str]=None) -> Dict[str, Any]:
         target = kind or self.noise_kind
@@ -9863,17 +13482,75 @@ class NomologyEnv:
             'drift_scale': float(self.drift_scale),
         }
 
+    def register_rl_objective(self, snapshot: Dict[str, Any]) -> None:
+        if not isinstance(snapshot, dict):
+            self.rl_objective = {}
+            self.rl_mode = False
+            self.last_reward_objective = 0.0
+            return
+        payload: Dict[str, float] = {}
+        for key, val in snapshot.items():
+            if key == 'generation':
+                try:
+                    payload['generation'] = float(int(val))
+                except Exception:
+                    continue
+            elif isinstance(val, (int, float)):
+                try:
+                    payload[key] = float(val)
+                except Exception:
+                    continue
+        self.rl_objective = payload
+        self.rl_mode = bool(payload)
+        alignment = float(np.clip(payload.get('alignment', 0.0), -1.0, 1.0))
+        pressure = float(np.clip(payload.get('pressure', 0.0), 0.0, 4.0))
+        trend = float(np.clip(payload.get('trend_norm', 0.0), -1.0, 1.0))
+        best_norm = float(np.clip(payload.get('best_norm', 0.0), 0.0, 1.0))
+        spread = float(np.clip(payload.get('spread', 0.0), 0.0, 3.0))
+        span = float(np.clip(payload.get('delta_mean', 0.0), -3.0, 3.0))
+        objective = float(
+            np.clip(
+                payload.get(
+                    'objective',
+                    payload.get(
+                        'team_objective',
+                        _RL_SIGNAL_COEFF_DEFAULTS['team_objective_bias']
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_alignment'] * alignment
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_trend'] * trend
+                        - _RL_SIGNAL_COEFF_DEFAULTS['team_objective_pressure'] * pressure
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_best'] * best_norm
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_span'] * float(np.tanh(abs(span))),
+                    ),
+                ),
+                -3.0,
+                3.0,
+            )
+        )
+        self.last_reward_objective = objective
+        intensity_gain = float(np.clip(0.9 + 0.25 * pressure - 0.12 * objective, 0.6, 1.25))
+        self.intensity = float(np.clip(self.intensity * intensity_gain + 0.05 * max(0.0, -alignment), 0.05, 1.2))
+        jitter_gain = float(np.clip(0.96 + 0.08 * spread + 0.05 * pressure, 0.8, 1.4))
+        self.noise_jitter = float(np.clip(self.noise_jitter * jitter_gain, 0.001, 0.08))
+        noise_gain = float(np.clip(0.95 + 0.02 * pressure - 0.03 * objective, 0.75, 1.2))
+        self.noise = float(np.clip(self.noise * noise_gain + 0.005 * max(0.0, pressure), self.noise_min, self.noise_max))
+        profile = getattr(self, 'noise_profile', None)
+        if isinstance(profile, dict):
+            profile['reward_objective'] = objective
+            profile['reward_pressure'] = pressure
+            profile['reward_alignment'] = alignment
+            profile['reward_spread'] = spread
+
     def register_diversity(self, snapshot: Dict[str, float]) -> None:
         if not isinstance(snapshot, dict):
             return
         payload = {k: float(v) for k, v in snapshot.items() if isinstance(v, (int, float))}
         self.diversity_signal = payload
-        scarcity = float(np.clip(payload.get('scarcity', 0.0), 0.0, 1.0))
+        scarcity = float(max(payload.get('scarcity', 0.0), 0.0))
         spread = float(np.clip(payload.get('structural_spread', 0.0), 0.0, 4.0))
-        self.intensity = float(np.clip(self.intensity * (0.92 + 0.28 * scarcity), 0.05, 0.8))
-        self.noise_jitter = float(np.clip(self.noise_jitter * (1.0 + 0.2 * spread), 0.001, 0.05))
+        self.intensity = float(np.clip(self.intensity * (0.94 + 0.32 * scarcity), 0.05, 1.1))
+        self.noise_jitter = float(np.clip(self.noise_jitter * (1.0 + 0.2 * spread), 0.001, 0.065))
 
-    def _refresh_noise(self, advance: bool=False, surge: bool=False) -> None:
+    def _refresh_noise(self, advance: bool=False, surge: bool=False, allow_fft: bool=True) -> None:
         if advance:
             self._noise_counter += 1.0
         std, kind, profile = _cyclic_noise_profile(self._noise_counter, self._noise_ctx(surge))
@@ -9884,6 +13561,22 @@ class NomologyEnv:
         profile.setdefault('band_label', kind)
         profile.setdefault('cycle_phase', 0.0)
         profile['jitter'] = float(profile.get('jitter', 0.0) + jitter_extra)
+        if self.rl_mode:
+            reward_obj = float(self.last_reward_objective)
+            objective_pressure = float(np.clip(self.rl_objective.get('pressure', 0.0), 0.0, 4.0))
+            objective_alignment = float(np.clip(self.rl_objective.get('alignment', 0.0), -1.0, 1.0))
+            std = float(
+                np.clip(
+                    std * (1.0 + 0.05 * objective_pressure - 0.04 * reward_obj)
+                    + 0.01 * max(0.0, -objective_alignment),
+                    self.noise_min,
+                    self.noise_max,
+                )
+            )
+            profile['reward_objective'] = reward_obj
+            profile['reward_pressure'] = objective_pressure
+            profile['reward_alignment'] = objective_alignment
+            profile['rl_mode'] = True
         weaver = getattr(self, 'noise_weaver', None)
         if weaver is not None:
             weaver_ctx = self._noise_ctx(surge)
@@ -9905,6 +13598,33 @@ class NomologyEnv:
         self.noise = std
         self.noise_kind = kind
         self.noise_profile = profile
+        if allow_fft:
+            focus_term = float(np.clip(getattr(self, 'noise_focus', 0.0), 0.0, 2.5))
+            entropy_term = float(np.clip(getattr(self, 'noise_entropy', 0.0), 0.0, 3.5))
+            base_chance = 0.12 + 0.25 * float(self.intensity)
+            base_chance += 0.14 * focus_term
+            base_chance += 0.06 * entropy_term
+            if surge:
+                base_chance += 0.15
+            if self.rl_mode:
+                base_chance *= 0.78
+            if self._rng.random() < min(0.96, base_chance):
+                ambient_strength = float(
+                    np.clip(
+                        0.8
+                        + 1.15 * float(self.intensity)
+                        + 0.5 * focus_term
+                        + 0.12 * entropy_term,
+                        0.55,
+                        3.4,
+                    )
+                )
+                if self.rl_mode:
+                    ambient_strength *= 0.88
+                else:
+                    ambient_strength *= 1.08
+                reason = 'ambient_fft_surge' if surge else 'ambient_fft'
+                self.trigger_fft_spike(strength=ambient_strength, reason=reason)
         style = self.noise_style(kind)
         self.noise_kind_label = style.get('label', kind)
         self.noise_kind_symbol = style.get('symbol', kind[:1].upper() if kind else '?')
@@ -9942,12 +13662,25 @@ class NomologyEnv:
             self.noise_harmonics = {}
         self.noise_focus = float(profile.get('mix_focus', focus_val))
         self.noise_entropy = float(profile.get('mix_entropy', entropy_val))
+        if self._fft_decay > 0 and isinstance(self.last_fft_payload, dict):
+            payload = self.last_fft_payload
+            profile['fft_peak'] = float(payload.get('peak', float('nan')))
+            profile['fft_entropy'] = float(payload.get('entropy', float('nan')))
+            profile['fft_reason'] = payload.get('reason', '')
+            profile['fft_strength'] = float(payload.get('strength', 0.0))
+            profile['fft_active'] = True
+            self._fft_decay = max(0, int(self._fft_decay) - 1)
+            payload['steps_left'] = int(self._fft_decay)
+            if self._fft_decay <= 0:
+                payload['steps_left'] = 0
+        elif isinstance(self.last_fft_payload, dict):
+            self.last_fft_payload.pop('steps_left', None)
 
     def trigger_fft_spike(self, strength: float=1.0, bands: Optional[int]=None, reason: str='') -> Dict[str, Any]:
-        bands = int(bands) if bands is not None else int(max(8, self.noise_stage_len * 2))
+        bands = int(bands) if bands is not None else int(max(12, self.noise_stage_len * 3))
         bands = max(4, bands)
-        sample_len = max(bands * 2, int(self.noise_stage_len) * 4)
-        sample = self._rng.normal(0.0, self.noise + 0.01 * strength, size=sample_len)
+        sample_len = max(bands * 2, int(self.noise_stage_len) * 6)
+        sample = self._rng.normal(0.0, self.noise + 0.02 * strength, size=sample_len)
         spectrum = np.abs(np.fft.rfft(sample))
         spectrum = np.nan_to_num(spectrum, nan=0.0, posinf=0.0, neginf=0.0)
         total = float(spectrum.sum())
@@ -9962,9 +13695,9 @@ class NomologyEnv:
         if keep > 1:
             entropy = float(-(spectrum[:keep] * np.log(spectrum[:keep] + 1e-12)).sum() / np.log(keep))
         self.noise_harmonics = harmonics
-        self.noise_focus = float(np.clip(0.55 * self.noise_focus + 0.45 * peak * (1.0 + 0.25 * strength), 0.0, 1.8))
-        self.noise_entropy = float(np.clip(0.6 * self.noise_entropy + 0.4 * entropy, 0.0, 2.5))
-        self.noise = float(np.clip(self.noise * (1.0 + 0.22 * strength), self.noise_min, self.noise_max))
+        self.noise_focus = float(np.clip(0.45 * self.noise_focus + 0.55 * peak * (1.0 + 0.35 * strength), 0.0, 2.2))
+        self.noise_entropy = float(np.clip(0.5 * self.noise_entropy + 0.5 * entropy * (1.0 + 0.3 * strength), 0.0, 3.4))
+        self.noise = float(np.clip(self.noise * (1.0 + 0.38 * strength) + 0.015 * strength, self.noise_min, self.noise_max))
         try:
             self.noise_kind = str(self._rng.choice(self.noise_palette))
         except Exception:
@@ -9974,10 +13707,12 @@ class NomologyEnv:
         self.noise_kind_symbol = style.get('symbol', self.noise_kind_symbol)
         self.noise_kind_color = style.get('color', self.noise_kind_color)
         self.noise_kind_code = int(style.get('index', self.noise_kind_code))
-        self.turns = float(np.clip(self.turns * (1.0 + self._rng.normal(0.0, 0.1 * strength)), 0.7, 2.8))
-        self.rot_bias = float(np.clip(self.rot_bias + self._rng.normal(0.0, 0.45 * strength), -math.pi, math.pi))
+        self.turns = float(np.clip(self.turns * (1.0 + self._rng.normal(0.0, 0.14 * strength)), 0.6, 3.1))
+        self.rot_bias = float(np.clip(self.rot_bias + self._rng.normal(0.0, 0.55 * strength), -math.pi, math.pi))
+        self.noise_stage_len = int(np.clip(float(self.noise_stage_len) * (1.0 - 0.1 * strength) + 1.0, 3.0, 32.0))
+        self.intensity = float(np.clip(self.intensity * (1.12 + 0.25 * strength) + 0.025, 0.05, 1.12))
         self.regime_id = int(self.regime_id + 1)
-        self._refresh_noise(advance=True, surge=True)
+        self._refresh_noise(advance=True, surge=True, allow_fft=False)
         payload = {
             'strength': float(strength),
             'peak': float(peak),
@@ -9990,6 +13725,12 @@ class NomologyEnv:
         self.noise_profile['fft_entropy'] = float(self.noise_entropy)
         self.noise_profile['fft_reason'] = reason
         self.noise_profile['fft_stamp'] = time.time()
+        self.noise_profile['fft_strength'] = float(strength)
+        retention = int(max(1, getattr(self, 'fft_retention', 1)))
+        payload['timestamp'] = time.time()
+        payload['steps_left'] = int(retention)
+        self.last_fft_payload = dict(payload)
+        self._fft_decay = int(retention)
         return payload
 
     def maybe_switch(self) -> bool:
@@ -10042,6 +13783,15 @@ class SelfReproducingEvaluator:
     _resilience_notes: deque = field(default_factory=lambda: deque(maxlen=16), init=False, repr=False)
     last_leader_council: Tuple[int, ...] = field(default_factory=tuple, init=False, repr=False)
     last_council_dispersion: float = field(default=0.0, init=False, repr=False)
+    rl_mode: bool = field(default=False, init=False)
+    _rl_objective: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    _rl_objective_generation: int = field(default=-1, init=False, repr=False)
+    _rl_feature_dim: int = field(default=9, init=False, repr=False)
+    last_reward_alignment: float = field(default=0.0, init=False, repr=False)
+    last_reward_trend: float = field(default=0.0, init=False, repr=False)
+    last_reward_pressure: float = field(default=0.0, init=False, repr=False)
+    last_reward_mean: float = field(default=0.0, init=False, repr=False)
+    last_reward_objective: float = field(default=0.0, init=False, repr=False)
     lazy_feedback_smoothing: float = 0.35
     lazy_feedback_decay: float = 0.25
     _lazy_feedback: Dict[str, Any] = field(
@@ -10054,6 +13804,20 @@ class SelfReproducingEvaluator:
         init=False,
         repr=False,
     )
+    env_leader_program_template: str = field(default=_ENV_LEADER_DSL_TEMPLATE, init=False)
+    env_council_program_template: str = field(default=_ENV_COUNCIL_DSL_TEMPLATE, init=False)
+    env_leader_program_coeffs: Dict[str, float] = field(
+        default_factory=lambda: dict(_ENV_LEADER_COEFF_DEFAULTS),
+        init=False,
+        repr=False,
+    )
+    env_council_program_coeffs: Dict[str, float] = field(
+        default_factory=lambda: dict(_ENV_COUNCIL_COEFF_DEFAULTS),
+        init=False,
+        repr=False,
+    )
+    _env_leader_program_cache: Optional[Tuple[Any, str]] = field(default=None, init=False, repr=False)
+    _env_council_program_cache: Optional[Tuple[Any, str]] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.rng is not None:
@@ -10111,7 +13875,8 @@ class SelfReproducingEvaluator:
         else:
             code_norm = float(np.clip((code_idx / palette_span) * 2.0 - 1.0, -1.0, 1.0))
         focus_norm = float(np.clip(getattr(env, 'noise_focus', 0.0), 0.0, 1.5) / 1.5)
-        entropy_norm = float(np.clip(getattr(env, 'noise_entropy', 0.0), 0.0, 4.0) / 4.0)
+        entropy_raw_val = float(getattr(env, 'noise_entropy', 0.0) or 0.0)
+        entropy_norm = float(max(0.0, entropy_raw_val)) / 4.0
         bias_norm = float(style.get('bias', 0.0))
         base = [
             math.cos(theta),
@@ -10129,6 +13894,55 @@ class SelfReproducingEvaluator:
         ]
         if embed is not None:
             base.extend(embed.tolist())
+        rl_obj = getattr(self, '_rl_objective', {}) or {}
+        rl_gen = int(rl_obj.get('generation', getattr(self, '_rl_objective_generation', -1)))
+        if rl_gen < 0:
+            rl_recency = 0.0
+        else:
+            age = max(0, int(generation) - int(rl_gen))
+            horizon = float(getattr(self.spin, 'period_gens', 16) or 16)
+            rl_recency = float(np.clip(math.exp(-age / max(1.0, horizon * 0.5)), 0.0, 1.0))
+        align = float(np.clip(rl_obj.get('alignment', rl_obj.get('population_reward_alignment', 0.0)), -1.0, 1.0))
+        trend = float(np.clip(rl_obj.get('trend_norm', rl_obj.get('population_reward_trend_norm', 0.0)), -1.0, 1.0))
+        best_norm = float(np.clip(rl_obj.get('best_norm', rl_obj.get('population_reward_best_norm', 0.0)), 0.0, 1.0))
+        pressure = float(np.clip(rl_obj.get('pressure', rl_obj.get('population_reward_pressure', 0.0)), 0.0, 3.0))
+        spread = float(np.clip(rl_obj.get('spread', rl_obj.get('population_reward_spread', 0.0)), 0.0, 2.5))
+        delta = float(rl_obj.get('delta_mean', rl_obj.get('population_reward_delta', 0.0)))
+        mean_val = float(rl_obj.get('mean', rl_obj.get('reward_ema', 0.0)))
+        best_val = float(rl_obj.get('best', mean_val))
+        std_val = rl_obj.get('std')
+        if not isinstance(std_val, (int, float)):
+            reward_var = rl_obj.get('reward_var')
+            if isinstance(reward_var, (int, float)):
+                std_val = float(np.sqrt(max(0.0, reward_var)))
+            else:
+                std_val = 0.0
+        else:
+            std_val = float(std_val)
+        denom = max(1.0, abs(best_val) + std_val)
+        mean_norm = float(np.tanh(mean_val / denom))
+        delta_norm = float(np.tanh(delta / denom))
+        pressure_norm = float(np.clip(pressure / 2.0, 0.0, 1.5))
+        spread_norm = float(np.clip(spread / 2.0, 0.0, 1.5))
+        objective_val = float(np.clip(rl_obj.get('objective', rl_obj.get('team_objective', 0.0)), -3.0, 3.0))
+        objective_norm = float(np.clip(objective_val / 3.0, -1.0, 1.0))
+        rl_features = [
+            align,
+            trend,
+            best_norm,
+            pressure_norm,
+            delta_norm,
+            mean_norm,
+            rl_recency,
+            spread_norm,
+            objective_norm,
+        ]
+        rl_len = getattr(self, '_rl_feature_dim', len(rl_features))
+        if len(rl_features) < rl_len:
+            rl_features.extend([0.0] * (rl_len - len(rl_features)))
+        elif len(rl_features) > rl_len:
+            rl_features = rl_features[:rl_len]
+        base.extend(rl_features)
         vec = np.asarray(base, dtype=np.float32)
         if vec.size < self.feature_dim:
             vec = np.pad(vec, (0, self.feature_dim - vec.size))
@@ -10212,6 +14026,49 @@ class SelfReproducingEvaluator:
                 snapshot[key] = float(val)
         self._diversity_feedback = snapshot
 
+    def update_rl_objective(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            if getattr(self, '_rl_objective', None):
+                self._rl_objective = {}
+                self._rl_objective_generation = -1
+                self.rl_mode = False
+                self.last_reward_alignment = 0.0
+                self.last_reward_trend = 0.0
+                self.last_reward_pressure = 0.0
+                self.last_reward_mean = 0.0
+                self.last_reward_objective = 0.0
+            if hasattr(self.base_env, 'register_rl_objective'):
+                try:
+                    self.base_env.register_rl_objective({})
+                except Exception:
+                    pass
+            return
+        merged: Dict[str, Any] = dict(getattr(self, '_rl_objective', {}))
+        for key, val in payload.items():
+            if key == 'generation':
+                try:
+                    merged['generation'] = int(val)
+                except Exception:
+                    continue
+            elif isinstance(val, (int, float)):
+                try:
+                    merged[key] = float(val)
+                except Exception:
+                    continue
+        self._rl_objective = merged
+        self._rl_objective_generation = int(merged.get('generation', getattr(self, '_rl_objective_generation', -1)))
+        self.rl_mode = bool(self._rl_objective)
+        self.last_reward_alignment = float(merged.get('alignment', 0.0))
+        self.last_reward_trend = float(merged.get('trend_norm', 0.0))
+        self.last_reward_pressure = float(max(0.0, merged.get('pressure', 0.0)))
+        self.last_reward_mean = float(merged.get('mean', self.last_reward_mean))
+        self.last_reward_objective = float(np.clip(merged.get('objective', merged.get('team_objective', 0.0)), -3.0, 3.0))
+        if hasattr(self.base_env, 'register_rl_objective'):
+            try:
+                self.base_env.register_rl_objective(merged)
+            except Exception:
+                pass
+
     def _record_resilience(self, err: BaseException, generation: int) -> str:
         label = f'{type(err).__name__}@{generation}'
         self.last_resilience = label
@@ -10257,45 +14114,81 @@ class SelfReproducingEvaluator:
         div_state = getattr(self, '_diversity_feedback', {}) or {}
         scarcity = float(np.clip(div_state.get('scarcity', 0.0), 0.0, 1.0))
         spread = float(np.clip(div_state.get('structural_spread', 0.0), 0.0, 4.0))
-        entropy = float(np.clip(div_state.get('entropy', 0.0), 0.0, 1.2))
-        share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
+        entropy_norm = float(max(0.0, div_state.get('entropy_norm', div_state.get('entropy', 0.0))))
+        entropy_raw = float(max(0.0, div_state.get('entropy', entropy_norm)))
+        rl_obj = getattr(self, '_rl_objective', {}) or {}
+        reward_alignment = float(np.clip(rl_obj.get('alignment', rl_obj.get('population_reward_alignment', 0.0)), -1.0, 1.0))
+        reward_trend = float(np.clip(rl_obj.get('trend_norm', rl_obj.get('population_reward_trend_norm', 0.0)), -1.0, 1.0))
+        reward_best = float(np.clip(rl_obj.get('best_norm', rl_obj.get('population_reward_best_norm', 0.0)), 0.0, 1.0))
+        reward_pressure = float(np.clip(rl_obj.get('pressure', rl_obj.get('population_reward_pressure', 0.0)), 0.0, 3.0))
+        reward_spread = float(np.clip(rl_obj.get('spread', rl_obj.get('population_reward_spread', 0.0)), 0.0, 2.5))
+        reward_objective = float(
+            np.clip(
+                rl_obj.get(
+                    'objective',
+                    rl_obj.get(
+                        'team_objective',
+                        _RL_SIGNAL_COEFF_DEFAULTS['team_objective_bias']
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_alignment'] * reward_alignment
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_trend'] * reward_trend
+                        - _RL_SIGNAL_COEFF_DEFAULTS['team_objective_pressure'] * reward_pressure
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_best'] * reward_best
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_span'] * float(np.tanh(reward_spread)),
+                    ),
+                ),
+                -3.0,
+                3.0,
+            )
+        )
+        reward_drive = float(np.clip(reward_pressure + max(0.0, -reward_trend), 0.0, 4.0))
+        exploration_gain = float(np.clip(1.0 + 0.25 * reward_pressure + 0.18 * reward_spread - 0.15 * reward_objective, 0.6, 2.4))
+        exploitation_gain = float(np.clip(1.0 + 0.32 * reward_objective - 0.2 * reward_pressure, 0.5, 1.8))
         prev_noise = float(getattr(env, 'noise', 0.05))
         prev_turns = float(getattr(env, 'turns', 1.6))
         prev_rot = float(getattr(env, 'rot_bias', 0.0))
         scale_noise, scale_turns, scale_rot = self.output_scale
-        scale_noise *= float(1.0 + 0.35 * scarcity)
-        scale_turns *= float(1.0 + 0.2 * spread)
-        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy))
-        mod_out0 = float(out[0] * (1.0 - 0.35 * share) + anchor * 0.35)
-        mod_out1 = float(out[1] * (1.0 - 0.3 * share) + (anchor + gap * 0.5) * 0.3)
-        mod_out2 = float(out[2] * (1.0 - 0.3 * share) + gap * 0.6)
-        target_noise = float(np.clip(0.05 + scale_noise * mod_out0, 0.0, 0.25))
-        target_turns = float(np.clip(1.6 + scale_turns * mod_out1, 0.6, 3.2))
-        rot_target = prev_rot + scale_rot * mod_out2
-        anchor_noise = float(np.clip(0.05 + scale_noise * anchor, 0.0, 0.25))
-        anchor_turns = float(np.clip(1.6 + scale_turns * (anchor + gap * 0.25), 0.6, 3.2))
-        rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6)
-        inertia = float(np.clip(0.25 + 0.5 * share + 0.25 * stasis, 0.0, 0.9))
-        inertia *= float(np.clip(1.0 - 0.4 * scarcity + 0.15 * spread, 0.2, 1.05))
-        slip = max(0.0, 1.0 - inertia)
-        anchor_mix = slip * 0.5 * stasis
-        leader_mix = slip - anchor_mix
-        env.noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
-        env.turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
-        rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
-        env.rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+        scale_noise *= float(1.0 + 0.35 * scarcity) * exploration_gain
+        scale_turns *= float(1.0 + 0.2 * spread) * float(np.clip(0.85 + 0.2 * reward_spread, 0.5, 2.2))
+        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy_norm)) * exploitation_gain
+        leader_state = {
+            'share': float(share),
+            'stasis': float(stasis),
+            'anchor': float(anchor),
+            'gap': float(gap),
+            'scarcity': float(scarcity),
+            'spread': float(spread),
+            'reward_pressure': float(reward_pressure),
+            'reward_objective': float(reward_objective),
+            'scale_noise': float(scale_noise),
+            'scale_turns': float(scale_turns),
+            'scale_rot': float(scale_rot),
+            'output0': float(out[0]),
+            'output1': float(out[1]),
+            'output2': float(out[2]),
+            'prev_noise': prev_noise,
+            'prev_turns': prev_turns,
+            'prev_rot': prev_rot,
+            'reward_trend': float(reward_trend),
+            'reward_alignment': float(reward_alignment),
+            'reward_spread': float(reward_spread),
+            'reward_drive': float(reward_drive),
+        }
+        program = _env_leader_program_for(self)
+        result = _env_run_leader_program(dict(leader_state), program)
+        if result is None:
+            result = _env_leader_python(dict(leader_state))
+        share = float(result['share'])
+        env.noise = float(np.clip(result['noise'], 0.0, 0.25))
+        env.turns = float(np.clip(result['turns'], 0.6, 3.2))
+        env.rot_bias = float(result['rot_bias'])
         env.lazy_share = float(share)
         env.lazy_anchor = float(anchor)
         env.lazy_gap = float(gap)
         env.lazy_stasis = float(stasis)
-        env_shift = (
-            abs(env.noise - prev_noise) * 4.0
-            + abs(env.turns - prev_turns)
-            + 0.5 * abs(rot_blend - prev_rot)
-        )
-        selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - share))
-        advantage_score = float(np.clip(selfish_drive * (max(0.0, gap) + 0.35 * scarcity) * (0.5 + env_shift), 0.0, 3.0))
-        altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0))
+        env_shift = float(result['env_shift'])
+        selfish_drive = float(result['selfish_drive'])
+        advantage_score = float(np.clip(result['advantage_score'], 0.0, 3.5))
+        altruism_signal = float(np.clip(result['altruism_signal'], 0.0, 1.0))
         self.last_advantage_score = advantage_score
         self.last_leader_id = leader.id
         self.last_leader_council = (leader.id,)
@@ -10303,6 +14196,11 @@ class SelfReproducingEvaluator:
         self.last_altruism_signal = altruism_signal
         self.last_selfish_drive = selfish_drive
         self.last_env_shift = env_shift
+        self.last_reward_alignment = reward_alignment
+        self.last_reward_trend = reward_trend
+        self.last_reward_pressure = reward_pressure
+        self.last_reward_mean = float(rl_obj.get('mean', self.last_reward_mean))
+        self.last_reward_objective = reward_objective
         try:
             summary = self._mutate_child(leader, bundle, feats, out, generation)
         except Exception as mutate_err:
@@ -10334,6 +14232,8 @@ class SelfReproducingEvaluator:
             summary = f'{summary} | gap {gap:+.2f}'
         if advantage_score > 0.05:
             summary = f'{summary} | adv {advantage_score:.2f}'
+        if reward_pressure > 0.0 or abs(reward_objective) > 0.05:
+            summary = f'{summary} | reward {reward_objective:+.2f}/{reward_pressure:.2f}'
         self.last_event = summary
         return {
             'genome_id': leader.id,
@@ -10420,57 +14320,100 @@ class SelfReproducingEvaluator:
         div_state = getattr(self, '_diversity_feedback', {}) or {}
         scarcity = float(np.clip(div_state.get('scarcity', 0.0), 0.0, 1.0))
         spread = float(np.clip(div_state.get('structural_spread', 0.0), 0.0, 4.0))
-        entropy = float(np.clip(div_state.get('entropy', 0.0), 0.0, 1.2))
+        entropy_norm = float(max(0.0, div_state.get('entropy_norm', div_state.get('entropy', 0.0))))
+        entropy_raw = float(max(0.0, div_state.get('entropy', entropy_norm)))
+        rl_obj = getattr(self, '_rl_objective', {}) or {}
+        rl_gen = int(rl_obj.get('generation', getattr(self, '_rl_objective_generation', -1)))
+        if rl_gen < 0:
+            rl_recency = 0.0
+        else:
+            age = max(0, int(generation) - rl_gen)
+            horizon = float(getattr(self.spin, 'period_gens', 16) or 16)
+            rl_recency = float(np.clip(math.exp(-age / max(1.0, horizon * 0.5)), 0.0, 1.0))
+        reward_alignment = float(np.clip(rl_obj.get('alignment', rl_obj.get('population_reward_alignment', 0.0)), -1.0, 1.0))
+        reward_trend = float(np.clip(rl_obj.get('trend_norm', rl_obj.get('population_reward_trend_norm', 0.0)), -1.0, 1.0))
+        reward_best = float(np.clip(rl_obj.get('best_norm', rl_obj.get('population_reward_best_norm', 0.0)), 0.0, 1.0))
+        reward_pressure = float(np.clip(rl_obj.get('pressure', rl_obj.get('population_reward_pressure', 0.0)), 0.0, 3.0))
+        reward_spread = float(np.clip(rl_obj.get('spread', rl_obj.get('population_reward_spread', 0.0)), 0.0, 2.5))
+        reward_delta = float(rl_obj.get('delta_mean', rl_obj.get('population_reward_delta', 0.0)))
+        reward_mean = float(rl_obj.get('mean', rl_obj.get('reward_ema', 0.0)))
+        denom = max(1.0, abs(float(rl_obj.get('best', reward_mean))) + float(max(0.0, rl_obj.get('std', 0.0))) + reward_spread)
+        reward_mean_norm = float(np.tanh(reward_mean / denom))
+        reward_delta_norm = float(np.tanh(reward_delta / denom))
+        reward_pressure_norm = float(np.clip(reward_pressure / 2.0, 0.0, 1.5))
+        reward_drive = rl_recency * (0.5 + 0.4 * reward_pressure_norm + 0.3 * max(0.0, -reward_trend))
+        reward_focus = rl_recency * (0.4 + 0.6 * reward_best + 0.3 * max(0.0, reward_alignment))
+        self.rl_mode = rl_recency > 0.01 and bool(rl_obj)
+        self.last_reward_alignment = reward_alignment
+        self.last_reward_trend = reward_trend
+        self.last_reward_pressure = reward_pressure_norm
+        self.last_reward_mean = reward_mean_norm
+        try:
+            env.rl_mode = bool(self.rl_mode)
+            env.reward_pressure = reward_pressure
+        except Exception:
+            pass
         share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
-        lazy_pressure = float(np.clip(share * (1.0 + 0.5 * stasis + 0.25 * abs(gap)), 0.0, 1.6))
+        share *= float(np.clip(1.0 - 0.18 * reward_drive, 0.1, 1.0))
+        lazy_pressure = float(
+            np.clip(
+                share * (1.0 + 0.5 * stasis + 0.25 * abs(gap)) + reward_drive * 0.45,
+                0.0,
+                1.8,
+            )
+        )
         prev_noise = float(getattr(env, 'noise', 0.05))
         prev_turns = float(getattr(env, 'turns', 1.6))
         prev_rot = float(getattr(env, 'rot_bias', 0.0))
         scale_noise, scale_turns, scale_rot = self.output_scale
-        scale_noise *= float(1.0 + 0.35 * scarcity + 0.55 * lazy_pressure)
-        scale_turns *= float(1.0 + 0.2 * spread + 0.4 * lazy_pressure)
-        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy) + 0.35 * lazy_pressure)
-        anchor_pull = float(np.clip(0.35 + 0.25 * lazy_pressure, 0.0, 0.85))
-        gap_pull = float(np.clip(0.45 + 0.25 * lazy_pressure, 0.0, 0.9))
-        mod_out0 = float(consensus[0] * (1.0 - anchor_pull) + anchor * anchor_pull)
-        mod_out1 = float(consensus[1] * (1.0 - anchor_pull) + (anchor + gap * 0.5) * anchor_pull)
-        mod_out2 = float(consensus[2] * (1.0 - gap_pull) + gap * gap_pull)
-        target_noise = float(np.clip(0.05 + scale_noise * mod_out0, 0.0, 0.25))
-        target_turns = float(np.clip(1.6 + scale_turns * mod_out1, 0.6, 3.2))
-        rot_target = prev_rot + scale_rot * mod_out2
-        anchor_noise = float(np.clip(0.05 + scale_noise * (anchor + 0.2 * lazy_pressure), 0.0, 0.25))
-        anchor_turns = float(np.clip(1.6 + scale_turns * (anchor + gap * 0.25 + 0.15 * lazy_pressure), 0.6, 3.2))
-        rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6 + 0.2 * lazy_pressure)
-        inertia = float(np.clip(0.25 + 0.6 * share + 0.25 * stasis, 0.0, 0.92))
-        inertia *= float(np.clip(1.0 - 0.35 * scarcity + 0.25 * spread + 0.15 * lazy_pressure, 0.2, 1.1))
-        slip = max(0.0, 1.0 - inertia)
-        anchor_ratio = float(np.clip(0.3 + 0.4 * stasis + 0.3 * lazy_pressure, 0.0, 0.95))
-        anchor_mix = min(slip, slip * anchor_ratio)
-        leader_mix = slip - anchor_mix
-        env.noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
-        env.turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
-        rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
-        env.rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+        scale_noise *= float(1.0 + 0.35 * scarcity + 0.55 * lazy_pressure + 0.25 * reward_drive + 0.15 * abs(reward_alignment) * rl_recency)
+        scale_turns *= float(1.0 + 0.2 * spread + 0.4 * lazy_pressure + 0.2 * reward_focus + 0.12 * abs(reward_delta_norm))
+        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy_norm) + 0.35 * lazy_pressure + 0.2 * reward_drive + 0.1 * reward_spread * rl_recency)
+        council_state = {
+            'share': float(share),
+            'stasis': float(stasis),
+            'anchor': float(anchor),
+            'gap': float(gap),
+            'scarcity': float(scarcity),
+            'spread': float(spread),
+            'lazy_pressure': float(lazy_pressure),
+            'reward_alignment': float(reward_alignment),
+            'reward_mean_norm': float(reward_mean_norm),
+            'reward_delta_norm': float(reward_delta_norm),
+            'reward_focus': float(reward_focus),
+            'reward_drive': float(reward_drive),
+            'reward_pressure_norm': float(reward_pressure_norm),
+            'rl_recency': float(rl_recency),
+            'dispersion': float(dispersion),
+            'prev_noise': prev_noise,
+            'prev_turns': prev_turns,
+            'prev_rot': prev_rot,
+            'scale_noise': float(scale_noise),
+            'scale_turns': float(scale_turns),
+            'scale_rot': float(scale_rot),
+            'consensus0': float(consensus[0]),
+            'consensus1': float(consensus[1]),
+            'consensus2': float(consensus[2]),
+            'reward_spread': float(reward_spread),
+            'entropy_norm': float(entropy_norm),
+        }
+        program = _env_council_program_for(self)
+        council_result = _env_run_council_program(dict(council_state), program)
+        if council_result is None:
+            council_result = _env_council_python(dict(council_state))
+        share = float(council_result['share'])
+        lazy_pressure = float(council_result.get('lazy_pressure', lazy_pressure))
+        env.noise = float(np.clip(council_result['noise'], 0.0, 0.25))
+        env.turns = float(np.clip(council_result['turns'], 0.6, 3.2))
+        env.rot_bias = float(council_result['rot_bias'])
         env.lazy_share = float(share)
         env.lazy_anchor = float(anchor)
         env.lazy_gap = float(gap)
         env.lazy_stasis = float(stasis)
-        env_shift = (
-            abs(env.noise - prev_noise) * 4.0
-            + abs(env.turns - prev_turns)
-            + 0.5 * abs(rot_blend - prev_rot)
-            + dispersion
-            + 1.2 * lazy_pressure
-        )
-        selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - 0.6 * share))
-        advantage_score = float(
-            np.clip(
-                selfish_drive * (max(0.0, gap) + 0.35 * scarcity + 0.25 * lazy_pressure) * (0.5 + env_shift),
-                0.0,
-                3.0,
-            )
-        )
-        altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0))
+        env_shift = float(council_result['env_shift'])
+        selfish_drive = float(council_result['selfish_drive'])
+        advantage_score = float(np.clip(council_result['advantage_score'], 0.0, 3.5))
+        altruism_signal = float(np.clip(council_result['altruism_signal'], 0.0, 1.0))
         resilience_flag = ''
         if resilience_marks:
             uniq = list(dict.fromkeys(resilience_marks))
@@ -10518,6 +14461,11 @@ class SelfReproducingEvaluator:
             summary = f'{summary} | lazyP {lazy_pressure:.2f}'
         if advantage_score > 0.05:
             summary = f'{summary} | adv {advantage_score:.2f}'
+        if rl_recency > 0.0:
+            summary = (
+                f"{summary} | reward μ{reward_mean_norm:+.2f} trend {reward_trend:+.2f} "
+                f"P{reward_pressure_norm:.2f} align {reward_alignment:+.2f}"
+            )
         self.last_event = summary
         return {
             'genome_id': parent.id,
@@ -10529,6 +14477,11 @@ class SelfReproducingEvaluator:
             'altruism_signal': altruism_signal,
             'council_size': len(all_ids),
             'council_dispersion': dispersion,
+            'reward_alignment': reward_alignment,
+            'reward_trend': reward_trend,
+            'reward_pressure': reward_pressure,
+            'reward_recency': rl_recency,
+            'reward_mean_norm': reward_mean_norm,
         }
 
     def step(
@@ -10554,7 +14507,7 @@ class Telemetry:
     def __init__(self, tel_csv: str, regime_csv: str) -> None:
         self.tel_csv = tel_csv
         self.reg_csv = regime_csv
-        expected_cols = 31
+        expected_cols = 34
         if os.path.exists(self.tel_csv):
             try:
                 with open(self.tel_csv, 'r', newline='') as f:
@@ -10590,6 +14543,9 @@ class Telemetry:
                     'noise_focus',
                     'noise_entropy',
                     'noise_harmonics',
+                    'fft_peak',
+                    'fft_entropy',
+                    'fft_reason',
                     'turns',
                     'rot_bias',
                     'group_idx',
@@ -10667,6 +14623,40 @@ class Telemetry:
             harm_payload = _json.dumps({k: float(v) for k, v in harmonics.items()})
         else:
             harm_payload = '{}'
+        fft_peak = float('nan')
+        fft_entropy = float('nan')
+        fft_reason = ''
+        fft_source: Optional[Dict[str, Any]] = profile if isinstance(profile, dict) else None
+        if not fft_source or (
+            'fft_peak' not in fft_source
+            and 'fft_entropy' not in fft_source
+            and 'fft_reason' not in fft_source
+        ):
+            last_fft = getattr(env, 'last_fft_payload', None)
+            if isinstance(last_fft, dict) and last_fft:
+                fft_source = last_fft
+        if isinstance(fft_source, dict):
+            if 'fft_peak' in fft_source or 'peak' in fft_source:
+                try:
+                    fft_peak = float(fft_source.get('fft_peak', fft_source.get('peak', float('nan'))))
+                except Exception:
+                    fft_peak = float('nan')
+            if 'fft_entropy' in fft_source or 'entropy' in fft_source:
+                try:
+                    fft_entropy = float(fft_source.get('fft_entropy', fft_source.get('entropy', float('nan'))))
+                except Exception:
+                    fft_entropy = float('nan')
+            reason_val = fft_source.get('fft_reason', fft_source.get('reason', ''))
+            if isinstance(reason_val, str):
+                fft_reason = reason_val
+            strength_val = fft_source.get('fft_strength', fft_source.get('strength'))
+            if strength_val is not None:
+                try:
+                    strength_str = f"s={float(strength_val):.2f}"
+                except Exception:
+                    strength_str = ''
+                if strength_str:
+                    fft_reason = f"{fft_reason}|{strength_str}" if fft_reason else strength_str
         lazy_share = float(getattr(env, 'lazy_share', 0.0))
         lazy_anchor = float(getattr(env, 'lazy_anchor', 0.0))
         lazy_gap = float(getattr(env, 'lazy_gap', 0.0))
@@ -10692,6 +14682,9 @@ class Telemetry:
                 noise_focus,
                 noise_entropy,
                 harm_payload,
+                fft_peak,
+                fft_entropy,
+                fft_reason,
                 env.turns,
                 env.rot_bias,
                 '' if group_idx is None else int(group_idx),
@@ -10757,12 +14750,15 @@ class SpinorNomologyDatasetController:
         self.evaluator_seed = evaluator_seed
         self.mandatory_mode = bool(mandatory_mode)
         embed_dim = self.spin.group.embed_dim if self.spin.group else 0
-        self.feature_dim = 12 + embed_dim
-        self.evaluator_feature_dim = 12 + embed_dim
+        self._context_dim = 7
+        self._rl_feature_dim = 9
+        self.feature_dim = 5 + embed_dim + self._context_dim
+        self.evaluator_feature_dim = 12 + embed_dim + self._rl_feature_dim
         self.last_bundle: Optional[Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]] = None
         self.lazy_feedback_smoothing = 0.4
         self._lazy_feedback: Dict[str, Any] = {'generation': -1, 'share': 0.0, 'anchor': 0.0, 'gap': 0.0, 'stasis': 0.0}
         self._diversity_state: Dict[str, Any] = {'generation': -1}
+        self._rl_objective: Dict[str, Any] = {'generation': -1}
         self.last_evaluator_meta: Optional[Dict[str, Any]] = None
         try:
             self.env.lazy_share = 0.0
@@ -10794,6 +14790,46 @@ class SpinorNomologyDatasetController:
             except Exception:
                 pass
 
+    def _context_features(
+        self,
+        theta: float,
+        group_energy: float,
+    ) -> np.ndarray:
+        """Return normalized environmental context features (length `_context_dim`)."""
+        noise_min = float(getattr(self.env, 'noise_min', 0.0))
+        noise_max = float(getattr(self.env, 'noise_max', max(self.env.noise, 1.0)))
+        noise_span = max(1e-06, noise_max - noise_min)
+        noise_norm = (float(self.env.noise) - noise_min) / noise_span
+        turns_norm = (float(self.env.turns) - 0.6) / (3.2 - 0.6 + 1e-06)
+        rot_norm = ((float(self.env.rot_bias) + math.pi) % (2.0 * math.pi)) / (2.0 * math.pi)
+        if self.spin.group is not None:
+            try:
+                energy_scale = max(1e-06, float(self.spin.group.max_energy()))
+            except Exception:
+                energy_scale = 1.0
+        else:
+            energy_scale = 1.0
+        energy_norm = float(np.clip(group_energy / energy_scale, 0.0, 1.0))
+        entropy_norm = float(max(0.0, getattr(self.env, 'noise_entropy', 0.0) / 4.0))
+        focus_norm = float(np.clip(getattr(self.env, 'noise_focus', 0.0) / 1.5, 0.0, 1.0))
+        ctx = np.array(
+            [
+                math.cos(theta),
+                math.sin(theta),
+                float(np.clip(noise_norm, 0.0, 1.0)),
+                float(np.clip(turns_norm, 0.0, 1.0)),
+                float(np.clip(rot_norm, 0.0, 1.0)),
+                energy_norm,
+                focus_norm,
+            ],
+            dtype=np.float32,
+        )
+        if ctx.size < self._context_dim:
+            ctx = np.pad(ctx, (0, self._context_dim - ctx.size))
+        elif ctx.size > self._context_dim:
+            ctx = ctx[: self._context_dim]
+        return ctx
+
     def _dataset_core(
         self,
         n: int,
@@ -10802,6 +14838,7 @@ class SpinorNomologyDatasetController:
         group_idx: Optional[int],
         group_embed: Optional[np.ndarray],
         group_matrix: Optional[np.ndarray],
+        group_energy: float,
     ) -> Tuple[np.ndarray, np.ndarray]:
         try:
             X, y = neat.make_spirals(n=n, noise=self.env.noise, turns=self.env.turns, seed=int(self.rng.integers(1 << 31)))
@@ -10818,7 +14855,15 @@ class SpinorNomologyDatasetController:
             except Exception:
                 pass
         X_aug, _ = augment_with_spinor(X, theta, parity=parity, group_embed=group_embed)
-        return (X_aug.astype(np.float32), y.astype(np.int64))
+        ctx = self._context_features(theta, float(group_energy))
+        ctx_tile = np.tile(ctx.reshape(1, -1), (X_aug.shape[0], 1)) if ctx.size else np.zeros((X_aug.shape[0], 0), dtype=np.float32)
+        X_full = np.concatenate([X_aug, ctx_tile], axis=1) if ctx_tile.size else X_aug
+        if X_full.shape[1] < self.feature_dim:
+            pad_width = self.feature_dim - X_full.shape[1]
+            X_full = np.pad(X_full, ((0, 0), (0, pad_width)), mode='constant')
+        elif X_full.shape[1] > self.feature_dim:
+            X_full = X_full[:, : self.feature_dim]
+        return (X_full.astype(np.float32, copy=False), y.astype(np.int64, copy=False))
 
     def set_lazy_feedback(self, generation: int, feedback: Dict[str, Any]) -> None:
         if feedback is None:
@@ -10874,6 +14919,63 @@ class SpinorNomologyDatasetController:
             except Exception:
                 pass
 
+    def update_rl_objective(self, generation: int, snapshot: Dict[str, Any]) -> None:
+        if not isinstance(snapshot, dict):
+            self._rl_objective = {'generation': -1}
+            self.rl_mode = False
+            if self.evaluator is not None and hasattr(self.evaluator, 'update_rl_objective'):
+                try:
+                    self.evaluator.update_rl_objective({})
+                except Exception:
+                    pass
+            if hasattr(self.env, 'register_rl_objective'):
+                try:
+                    self.env.register_rl_objective({})
+                except Exception:
+                    pass
+            self.last_reward_alignment = 0.0
+            self.last_reward_trend = 0.0
+            self.last_reward_pressure = 0.0
+            self.last_reward_mean = 0.0
+            self.last_reward_objective = 0.0
+            return
+        payload: Dict[str, Any] = {'generation': int(generation)}
+        keys = (
+            'alignment',
+            'trend_norm',
+            'best_norm',
+            'pressure',
+            'spread',
+            'delta_mean',
+            'mean',
+            'best',
+            'std',
+            'objective',
+        )
+        for key in keys:
+            val = snapshot.get(key)
+            if isinstance(val, (int, float)):
+                payload[key] = float(val)
+        self._rl_objective = payload
+        self.rl_mode = bool(payload)
+        self.last_reward_alignment = float(payload.get('alignment', self.last_reward_alignment))
+        self.last_reward_trend = float(payload.get('trend_norm', self.last_reward_trend))
+        self.last_reward_pressure = float(max(0.0, payload.get('pressure', self.last_reward_pressure)))
+        self.last_reward_mean = float(payload.get('mean', self.last_reward_mean))
+        self.last_reward_objective = float(
+            np.clip(payload.get('objective', payload.get('team_objective', self.last_reward_objective)), -3.0, 3.0)
+        )
+        if self.evaluator is not None and hasattr(self.evaluator, 'update_rl_objective'):
+            try:
+                self.evaluator.update_rl_objective(payload)
+            except Exception:
+                pass
+        if hasattr(self.env, 'register_rl_objective'):
+            try:
+                self.env.register_rl_objective(payload)
+            except Exception:
+                pass
+
     def update_for_generation(self, gen: int, shmem=False) -> None:
         if self.last_gen == gen:
             return
@@ -10891,8 +14993,8 @@ class SpinorNomologyDatasetController:
                 pass
             evaluator_meta = self.evaluator.step(bundle, self.env, generation=gen)
         self.env.drift()
-        Xtr, ytr = self._dataset_core(self.n_tr, theta, parity, group_idx, group_embed, group_matrix)
-        Xva, yva = self._dataset_core(self.n_va, theta, parity, group_idx, group_embed, group_matrix)
+        Xtr, ytr = self._dataset_core(self.n_tr, theta, parity, group_idx, group_embed, group_matrix, group_energy)
+        Xva, yva = self._dataset_core(self.n_va, theta, parity, group_idx, group_embed, group_matrix, group_energy)
         neat._SHM_CACHE['Xtr'] = Xtr
         neat._SHM_CACHE['ytr'] = ytr
         neat._SHM_CACHE['Xva'] = Xva
