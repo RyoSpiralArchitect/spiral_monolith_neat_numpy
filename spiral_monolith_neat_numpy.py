@@ -3214,6 +3214,15 @@ class ReproPlanaNEATPlus:
         self._top3_static_count: int = 0
         self._top3_static_pressure: float = 1.0
         self._top3_static_snapshot: Dict[str, Any] = {}
+        self.altruism_retirement_trigger = 0.85
+        self.altruism_retirement_penalty_scale = 0.34
+        self.altruism_retirement_cooldown = 5
+        self.altruism_retirement_static_gain = 0.6
+        self.altruism_retirement_scarcity_gain = 0.45
+        self.altruism_retirement_monodromy_gain = 0.35
+        self.altruism_retirement_entropy_relief = 0.45
+        self._altruism_retirees: Dict[int, Dict[str, Any]] = {}
+        self._altruism_retirement_snapshot: Dict[str, Any] = {}
         self.stagnation_commission_history: List[Dict[str, Any]] = []
         self.rl_param_mutation_rate = 0.35
         nodes = {}
@@ -3684,6 +3693,183 @@ class ReproPlanaNEATPlus:
                 flagged.pop(int(gid), None)
             self._stagnation_flagged = flagged
 
+    def _decay_altruism_retirements(self, generation: int) -> None:
+        registry = getattr(self, '_altruism_retirees', None)
+        if not isinstance(registry, dict):
+            self._altruism_retirees = {}
+            return
+        changed = False
+        for gid, info in list(registry.items()):
+            try:
+                until = int(info.get('until', info.get('cooldown', 0)))
+            except Exception:
+                try:
+                    until = int(info)
+                except Exception:
+                    until = generation
+            if generation >= until:
+                registry.pop(gid, None)
+                changed = True
+                for genome in self.population:
+                    if int(getattr(genome, 'id', -1)) == int(gid):
+                        setattr(genome, 'altruism_retired', False)
+                        setattr(genome, 'altruism_retirement_until', generation)
+                        break
+        if changed:
+            self._altruism_retirees = registry
+
+    @staticmethod
+    def _altruism_profile(genome: 'Genome') -> Dict[str, float]:
+        alt_vals: List[float] = []
+        mem_vals: List[float] = []
+        span_vals: List[float] = []
+        for node in getattr(genome, 'nodes', {}).values():
+            ntype = getattr(node, 'type', '')
+            if ntype in ('input', 'bias'):
+                continue
+            alt_vals.append(float(np.clip(getattr(node, 'altruism', 0.5), 0.0, 1.0)))
+            mem_vals.append(float(np.clip(getattr(node, 'altruism_memory', 0.0), -1.5, 1.5)))
+            span_vals.append(float(np.clip(getattr(node, 'altruism_span', 0.0), 0.0, 4.0)))
+        if not alt_vals:
+            return {
+                'alt_mean': 0.5,
+                'alt_max': 0.5,
+                'mem_mean': 0.0,
+                'span_mean': 0.0,
+                'count': 0,
+            }
+        alt_arr = np.asarray(alt_vals, dtype=np.float64)
+        mem_arr = np.asarray(mem_vals, dtype=np.float64) if mem_vals else np.zeros_like(alt_arr)
+        span_arr = np.asarray(span_vals, dtype=np.float64) if span_vals else np.zeros_like(alt_arr)
+        return {
+            'alt_mean': float(alt_arr.mean()),
+            'alt_max': float(alt_arr.max()),
+            'mem_mean': float(mem_arr.mean()) if mem_vals else 0.0,
+            'span_mean': float(span_arr.mean()) if span_vals else 0.0,
+            'count': int(len(alt_vals)),
+        }
+
+    def _apply_altruism_retirement(
+        self,
+        top3_best: Sequence[Tuple['Genome', float, int]],
+        fitnesses: List[float],
+        baseline_fitnesses: List[float],
+        generation: int,
+    ) -> None:
+        self._decay_altruism_retirements(generation)
+        registry = getattr(self, '_altruism_retirees', {})
+        diversity = getattr(self, '_diversity_snapshot', {}) or {}
+        scarcity = float(max(0.0, diversity.get('scarcity', 0.0))) if isinstance(diversity, dict) else 0.0
+        entropy_norm = diversity.get('entropy_norm', diversity.get('entropy', 0.0)) if isinstance(diversity, dict) else 0.0
+        try:
+            entropy_norm = float(entropy_norm)
+        except Exception:
+            entropy_norm = 0.0
+        entropy_norm = max(0.0, entropy_norm)
+        mono = getattr(self, '_monodromy_snapshot', {}) or {}
+        mono_pressure = float(max(0.0, mono.get('pressure_mean', 0.0))) if isinstance(mono, dict) else 0.0
+        static_count = int(getattr(self, '_top3_static_count', 0) or 0)
+        static_pressure = max(0.0, float(getattr(self, '_top3_static_pressure', 1.0)) - 1.0)
+        retire_pressure = (
+            float(self.altruism_retirement_static_gain) * static_pressure
+            + float(self.altruism_retirement_scarcity_gain) * scarcity
+            + float(self.altruism_retirement_monodromy_gain) * mono_pressure
+        )
+        collective = getattr(self, '_collective_signal', {}) or {}
+        altruism_target = float(collective.get('altruism_target', 0.5) or 0.5)
+        solidarity = float(collective.get('solidarity', 0.5) or 0.5)
+        retire_pressure *= float(1.0 + 0.3 * max(0.0, altruism_target - 0.5))
+        retire_pressure *= float(1.0 + 0.25 * max(0.0, solidarity - 0.5))
+        if entropy_norm > 1.0:
+            relief = 1.0 / (1.0 + float(self.altruism_retirement_entropy_relief) * (entropy_norm - 1.0))
+            retire_pressure *= float(max(0.2, relief))
+        retire_pressure = float(max(0.0, retire_pressure))
+        base_floor = min(baseline_fitnesses) if baseline_fitnesses else 0.0
+        retired: Dict[int, Dict[str, Any]] = {}
+        trigger_threshold = float(self.altruism_retirement_trigger)
+        penalty_scale = float(max(0.05, self.altruism_retirement_penalty_scale))
+        for genome, _fit, _gen in top3_best[:3]:
+            if genome is None:
+                continue
+            gid = int(getattr(genome, 'id', -1))
+            profile = self._altruism_profile(genome)
+            drive = profile['alt_mean'] + 0.45 * max(0.0, profile['mem_mean'])
+            drive += 0.25 * max(0.0, profile['alt_max'] - profile['alt_mean'])
+            drive -= 0.18 * profile['span_mean']
+            drive += 0.12 * max(0.0, altruism_target - 0.5)
+            lazy_strength = float(getattr(genome, 'lazy_lineage_strength', 0.0) or 0.0)
+            drive += 0.08 * max(0.0, lazy_strength - 1.0)
+            drive = float(max(0.0, drive))
+            score = retire_pressure * drive
+            retired_flag = False
+            if score >= trigger_threshold and static_count > 0:
+                try:
+                    idx = next(i for i, g in enumerate(self.population) if g.id == gid)
+                except StopIteration:
+                    idx = None
+                if idx is not None and 0 <= idx < len(fitnesses):
+                    already = registry.get(gid, {})
+                    cooldown_until = int(already.get('until', -1)) if isinstance(already, dict) else int(already or -1)
+                    if generation >= cooldown_until:
+                        base = abs(fitnesses[idx]) + abs(base_floor) + 1.0
+                        strength = penalty_scale * (1.0 + 0.5 * static_pressure + 0.25 * scarcity)
+                        strength *= float(1.0 + min(1.5, max(0.0, score - trigger_threshold)))
+                        penalty = base * strength
+                        fitnesses[idx] = float(fitnesses[idx] - penalty)
+                        if idx < len(baseline_fitnesses):
+                            baseline_fitnesses[idx] = float(baseline_fitnesses[idx] - penalty)
+                        setattr(genome, 'altruism_retired', True)
+                        cooldown = int(max(1, round(self.altruism_retirement_cooldown + 2 * static_pressure)))
+                        expiry = generation + cooldown
+                        setattr(genome, 'altruism_retirement_until', expiry)
+                        genome.cooperative = False
+                        try:
+                            strength_prev = float(getattr(genome, 'lazy_lineage_strength', 0.0) or 0.0)
+                            setattr(genome, 'lazy_lineage_strength', float(np.clip(strength_prev * 0.5, 0.0, strength_prev)))
+                        except Exception:
+                            pass
+                        registry[gid] = {
+                            'until': int(expiry),
+                            'score': float(score),
+                            'pressure': float(retire_pressure),
+                            'penalty': float(penalty),
+                            'generation': int(generation),
+                        }
+                        try:
+                            genome.meta_reflect(
+                                'altruism_retire',
+                                {
+                                    'score': float(score),
+                                    'pressure': float(retire_pressure),
+                                    'penalty': float(penalty),
+                                    'generation': int(generation),
+                                },
+                            )
+                        except Exception:
+                            pass
+                        self._note_lineage(gid, generation, f'altruism_retire {score:.2f} Δ{penalty:.3f}')
+                        retired[gid] = registry[gid]
+                        retired_flag = True
+            if not retired_flag:
+                try:
+                    registry.setdefault(gid, {})
+                except Exception:
+                    registry[gid] = {}
+        snapshot = {
+            'generation': int(generation),
+            'pressure': float(retire_pressure),
+            'retired': int(len(retired)),
+            'candidates': int(len(top3_best[:3])),
+            'static_count': int(static_count),
+            'scarcity': float(scarcity),
+            'entropy_norm': float(entropy_norm),
+            'mono_pressure': float(mono_pressure),
+        }
+        if retired:
+            snapshot['scores'] = {int(k): float(v.get('score', 0.0)) for k, v in retired.items()}
+        self._altruism_retirees = registry
+        self._altruism_retirement_snapshot = snapshot
+
     def _monitor_top3_stagnation(
         self,
         top3_best: Sequence[Tuple['Genome', float, int]],
@@ -3726,6 +3912,36 @@ class ReproPlanaNEATPlus:
                 'family_lock': False,
                 'delta_mag': 0.0,
                 'window': max(3, int(getattr(self, 'stagnation_window', 6))),
+            }
+            diversity = getattr(self, '_diversity_snapshot', {}) or {}
+            entropy_norm = 0.0
+            scarcity = 0.0
+            if isinstance(diversity, dict):
+                try:
+                    entropy_norm = float(diversity.get('entropy_norm', diversity.get('entropy', 0.0)) or 0.0)
+                except Exception:
+                    entropy_norm = 0.0
+                try:
+                    scarcity = float(diversity.get('scarcity', 0.0) or 0.0)
+                except Exception:
+                    scarcity = 0.0
+            mono = getattr(self, '_monodromy_snapshot', {}) or {}
+            mono_pressure = 0.0
+            if isinstance(mono, dict):
+                try:
+                    mono_pressure = float(mono.get('pressure_mean', 0.0) or 0.0)
+                except Exception:
+                    mono_pressure = 0.0
+            self._decay_altruism_retirements(generation)
+            self._altruism_retirement_snapshot = {
+                'generation': int(generation),
+                'pressure': 0.0,
+                'retired': 0,
+                'candidates': 0,
+                'static_count': 0,
+                'scarcity': float(scarcity),
+                'entropy_norm': float(max(0.0, entropy_norm)),
+                'mono_pressure': float(max(0.0, mono_pressure)),
             }
             return
         last_ids = tuple(watch.get('last_ids', tuple()))
@@ -3833,6 +4049,7 @@ class ReproPlanaNEATPlus:
             'pressure': float(self._top3_static_pressure),
             'window': int(window),
         }
+        self._apply_altruism_retirement(top3_best, fitnesses, baseline_fitnesses, generation)
 
     def _trigger_stagnation_intervention(
         self,
@@ -4379,8 +4596,40 @@ class ReproPlanaNEATPlus:
         new_pop = []
         events = {'sexual_within': 0, 'sexual_cross': 0, 'asexual_regen': 0, 'asexual_clone': 0}
         sp.sort()
+        retire_registry = getattr(self, '_altruism_retirees', {}) or {}
+        now_gen = int(getattr(self, 'generation', 0))
+        active_retired: Set[int] = set()
+        if isinstance(retire_registry, dict):
+            for gid, info in retire_registry.items():
+                try:
+                    until = int(info.get('until', info.get('cooldown', now_gen)))
+                except Exception:
+                    until = now_gen
+                if until > now_gen:
+                    active_retired.add(int(gid))
+
+        def _is_retired(genome: 'Genome') -> bool:
+            gid = int(getattr(genome, 'id', -1))
+            if gid in active_retired:
+                return True
+            if getattr(genome, 'altruism_retired', False):
+                try:
+                    until = int(getattr(genome, 'altruism_retirement_until', now_gen))
+                except Exception:
+                    until = now_gen
+                return until > now_gen
+            return False
+
+        def _filter_retired(pool_seq: Sequence['Genome']) -> List['Genome']:
+            filtered = [g for g in pool_seq if not _is_retired(g)]
+            return filtered if filtered else list(pool_seq)
+
         effective_elitism = max(0, int(getattr(self, '_elitism_effective', self.elitism)))
-        elites = [g for g, _ in sp.members[:min(effective_elitism, offspring_counts[sidx])]]
+        elites: List['Genome'] = []
+        for g, _ in sp.members[:min(effective_elitism, offspring_counts[sidx])]:
+            if _is_retired(g):
+                continue
+            elites.append(g)
         for e in elites:
             child = e.copy()
             child.cooperative = True
@@ -4402,15 +4651,15 @@ class ReproPlanaNEATPlus:
             self.node_registry[child.id] = {'sex': child.sex, 'regen': child.regen, 'birth_gen': child.birth_gen, 'family_id': child.family_id}
         remaining = offspring_counts[sidx] - len(elites)
         k = max(2, int(math.ceil(self.survival_rate * len(sp.members))))
-        females = [g for g, _ in sp.members[:k] if g.sex == 'female']
-        males = [g for g, _ in sp.members[:k] if g.sex == 'male']
-        hermaphrodites = [g for g, _ in sp.members[:k] if g.sex == 'hermaphrodite']
-        pool = [g for g, _ in sp.members[:k]]
+        females = _filter_retired([g for g, _ in sp.members[:k] if g.sex == 'female'])
+        males = _filter_retired([g for g, _ in sp.members[:k] if g.sex == 'male'])
+        hermaphrodites = _filter_retired([g for g, _ in sp.members[:k] if g.sex == 'hermaphrodite'])
+        pool = _filter_retired([g for g, _ in sp.members[:k]])
         non_elite_ids = set(getattr(self, '_last_top3_ids', set()))
         if not females or not males:
-            females = [g for g, _ in sp.members if g.sex == 'female'] or females
-            males = [g for g, _ in sp.members if g.sex == 'male'] or males
-            hermaphrodites = [g for g, _ in sp.members if g.sex == 'hermaphrodite'] or hermaphrodites
+            females = _filter_retired([g for g, _ in sp.members if g.sex == 'female']) or females
+            males = _filter_retired([g for g, _ in sp.members if g.sex == 'male']) or males
+            hermaphrodites = _filter_retired([g for g, _ in sp.members if g.sex == 'hermaphrodite']) or hermaphrodites
         mix_ratio = self._mix_asexual_ratio()
         monitor = getattr(self, 'lcs_monitor', None)
         weight_tol = getattr(monitor, 'eps', 0.0) if monitor is not None else 0.0
@@ -4425,6 +4674,7 @@ class ReproPlanaNEATPlus:
             father = None
             parent_candidate = pool[int(self.rng.integers(len(pool)))]
             effective_mix_ratio = mix_ratio
+            parent_retired = _is_retired(parent_candidate)
             if bool(getattr(self, 'adaptive_self_mutation', True)):
                 f_par = float(fit_map.get(parent_candidate.id, species_avg))
                 denom = (abs(species_avg) + 1e-9)
@@ -4446,6 +4696,8 @@ class ReproPlanaNEATPlus:
                 effective_mix_ratio = min(0.95, max(0.0, effective_mix_ratio * (1.0 + delta)))
             if hermaphrodites:
                 effective_mix_ratio = effective_mix_ratio / float(getattr(self, 'hermaphrodite_mate_bias', 2.5))
+            if parent_retired:
+                effective_mix_ratio = 0.0
             if self.rng.random() < effective_mix_ratio:
                 parent = parent_candidate
                 if parent.sex == 'hermaphrodite':
@@ -4467,8 +4719,8 @@ class ReproPlanaNEATPlus:
             else:
                 use_sexual_reproduction = True
             if use_sexual_reproduction:
-                potential_mothers = females + hermaphrodites
-                potential_fathers = males + hermaphrodites
+                potential_mothers = _filter_retired(females + hermaphrodites)
+                potential_fathers = _filter_retired(males + hermaphrodites)
                 if potential_mothers and potential_fathers and (self.rng.random() > self.pollen_flow_rate):
                     mother = potential_mothers[int(self.rng.integers(len(potential_mothers)))]
                     if potential_fathers:
@@ -4484,9 +4736,9 @@ class ReproPlanaNEATPlus:
                 elif len(species_pool) > 1:
                     mother = pool[int(self.rng.integers(len(pool)))]
                     other = species_pool[(sidx + 1) % len(species_pool)]
-                    other_pool = [g for g, _ in other.members]
-                    other_males = [g for g, _ in other.members if g.sex == 'male']
-                    other_herm = [g for g, _ in other.members if g.sex == 'hermaphrodite']
+                    other_pool = _filter_retired([g for g, _ in other.members])
+                    other_males = _filter_retired([g for g, _ in other.members if g.sex == 'male'])
+                    other_herm = _filter_retired([g for g, _ in other.members if g.sex == 'hermaphrodite'])
                     father_pool = other_males + other_herm if other_males or other_herm else other_pool
                     father = father_pool[int(self.rng.integers(len(father_pool)))]
                     mode = 'sexual_cross'
@@ -6025,7 +6277,20 @@ class ReproPlanaNEATPlus:
                             div_str += f" hh{float(div_snap.get('household_pressure', 0.0)):.2f}"
                         except Exception:
                             div_str = ''
-                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}{div_str}")
+                    retire_str = ''
+                    retire_snap = getattr(self, '_altruism_retirement_snapshot', None)
+                    if isinstance(retire_snap, dict) and retire_snap:
+                        try:
+                            pressure_val = float(retire_snap.get('pressure', 0.0))
+                            retired_count = int(retire_snap.get('retired', 0) or 0)
+                            candidate_count = int(retire_snap.get('candidates', 0) or 0)
+                            static_count = int(retire_snap.get('static_count', 0) or 0)
+                            retire_str = f" | retire ϕ{pressure_val:.2f} ρ{retired_count}@{candidate_count}"
+                            if static_count:
+                                retire_str += f" s{static_count}"
+                        except Exception:
+                            retire_str = ''
+                    print(f"Gen {gen:3d} | best {best_fit:.4f} | axis {context_best:.4f} | avg {avg_fit:.4f} | difficulty {diff:.2f} | noise {noise:.2f} | sexual {ev.get('sexual_within', 0) + ev.get('sexual_cross', 0)} | regen {ev.get('asexual_regen', 0)}{herm_str}{top3_str}{mono_str}{div_str}{retire_str}")
                 if context_best > best_ever_fit:
                     best_ever_fit = context_best
                     best_ever = self.population[best_idx].copy()
@@ -11532,7 +11797,8 @@ class SelfReproducingEvaluator:
         else:
             code_norm = float(np.clip((code_idx / palette_span) * 2.0 - 1.0, -1.0, 1.0))
         focus_norm = float(np.clip(getattr(env, 'noise_focus', 0.0), 0.0, 1.5) / 1.5)
-        entropy_norm = float(np.clip(getattr(env, 'noise_entropy', 0.0), 0.0, 4.0) / 4.0)
+        entropy_raw_val = float(getattr(env, 'noise_entropy', 0.0) or 0.0)
+        entropy_norm = float(max(0.0, entropy_raw_val)) / 4.0
         bias_norm = float(style.get('bias', 0.0))
         base = [
             math.cos(theta),
@@ -11678,7 +11944,7 @@ class SelfReproducingEvaluator:
         div_state = getattr(self, '_diversity_feedback', {}) or {}
         scarcity = float(np.clip(div_state.get('scarcity', 0.0), 0.0, 1.0))
         spread = float(np.clip(div_state.get('structural_spread', 0.0), 0.0, 4.0))
-        entropy_norm = float(np.clip(div_state.get('entropy_norm', div_state.get('entropy', 0.0)), 0.0, 1.2))
+        entropy_norm = float(max(0.0, div_state.get('entropy_norm', div_state.get('entropy', 0.0))))
         entropy_raw = float(max(0.0, div_state.get('entropy', entropy_norm)))
         share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
         prev_noise = float(getattr(env, 'noise', 0.05))
@@ -11842,7 +12108,7 @@ class SelfReproducingEvaluator:
         div_state = getattr(self, '_diversity_feedback', {}) or {}
         scarcity = float(np.clip(div_state.get('scarcity', 0.0), 0.0, 1.0))
         spread = float(np.clip(div_state.get('structural_spread', 0.0), 0.0, 4.0))
-        entropy_norm = float(np.clip(div_state.get('entropy_norm', div_state.get('entropy', 0.0)), 0.0, 1.2))
+        entropy_norm = float(max(0.0, div_state.get('entropy_norm', div_state.get('entropy', 0.0))))
         entropy_raw = float(max(0.0, div_state.get('entropy', entropy_norm)))
         share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
         lazy_pressure = float(np.clip(share * (1.0 + 0.5 * stasis + 0.25 * abs(gap)), 0.0, 1.6))
@@ -12249,7 +12515,7 @@ class SpinorNomologyDatasetController:
         else:
             energy_scale = 1.0
         energy_norm = float(np.clip(group_energy / energy_scale, 0.0, 1.0))
-        entropy_norm = float(np.clip(getattr(self.env, 'noise_entropy', 0.0) / 4.0, 0.0, 1.0))
+        entropy_norm = float(max(0.0, getattr(self.env, 'noise_entropy', 0.0) / 4.0))
         focus_norm = float(np.clip(getattr(self.env, 'noise_focus', 0.0) / 1.5, 0.0, 1.0))
         ctx = np.array(
             [
