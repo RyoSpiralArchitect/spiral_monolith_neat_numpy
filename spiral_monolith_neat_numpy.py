@@ -25,6 +25,10 @@
 #   一度コンパイルして NumPy で高速評価します。
 #   リプレイ DSL: cpp ライクな DSL で優先度付きリプレイ／利他シグナル／スケジューラを
 #   事前コンパイルし NumPy と共に実行して高速化します。
+# • Advantage-weighted replay: GAE-smoothed returns feed sample-weighted policy cloning
+#   so agents improve under harsh council pressure without collapsing exploration.
+#   アドバンテージ重み付きリプレイ: GAE 平滑化報酬とサンプル重み学習で、過酷な評議会圧の下でも
+#   探索を維持したまま方策を強化します。
 #
 # Systems overview / システム概要
 # 1. Genome & caches / ゲノムとキャッシュ
@@ -312,6 +316,13 @@ _RL_SCHED_COEFF_DEFAULTS: Dict[str, float] = {
     'gamma_team': 0.1,
     'gamma_span': 0.05,
     'gamma_success': 0.15,
+    'lambda_bias': 0.02,
+    'lambda_norm_gain': 0.18,
+    'lambda_instability': 0.22,
+    'lambda_novelty': 0.12,
+    'lambda_team': 0.14,
+    'lambda_success': 0.2,
+    'lambda_span': 0.08,
 }
 
 _RL_SCHED_DSL_TEMPLATE = """
@@ -350,6 +361,18 @@ gamma = clamp(
     + {gamma_success} * success_rate
     + {gamma_span} * reward_span_norm,
     0.4,
+    0.9995
+);
+gae_lambda = clamp(
+    gae_lambda
+    + {lambda_bias}
+    + {lambda_norm_gain} * norm_delta
+    - {lambda_instability} * instability
+    + {lambda_novelty} * novelty_scale
+    + {lambda_team} * team_alignment
+    + {lambda_success} * success_rate
+    - {lambda_span} * reward_span_norm,
+    0.2,
     0.9995
 );
 """
@@ -1238,6 +1261,7 @@ def _rl_default_meta() -> Dict[str, Any]:
         'advantage_ema': 0.0,
         'advantage_span': 0.0,
         'advantage_peak': 0.0,
+        'lambda_push': 0.95,
     }
 
 
@@ -1585,7 +1609,7 @@ def _rl_run_scheduler_program(state: Dict[str, Any], program: str) -> Optional[D
     except Exception:
         return None
     result: Dict[str, float] = {}
-    for key in ('entropy', 'lr', 'gamma'):
+    for key in ('entropy', 'lr', 'gamma', 'gae_lambda'):
         val = locals_dict.get(key, state.get(key))
         if val is None:
             return None
@@ -2607,6 +2631,7 @@ class Genome:
             'lr': float(np.clip(np.random.uniform(5e-4, 5e-2), 1e-5, 0.2)),
             'gamma': float(np.clip(np.random.uniform(0.88, 0.997), 0.0, 0.9995)),
             'entropy': float(np.clip(np.random.uniform(5e-4, 5e-2), 0.0, 0.5)),
+            'gae_lambda': float(np.clip(np.random.uniform(0.85, 0.99), 0.2, 0.9995)),
         }
         self.rl_memory_limit = int(_DEFAULT_RL_MEMORY_LIMIT)
         self.rl_memory: deque = deque(maxlen=self.rl_memory_limit)
@@ -5822,6 +5847,8 @@ class ReproPlanaNEATPlus:
             genome.mutate_parameter('gamma', self.rng, sigma=0.08, low=0.4, high=0.9995, log_scale=False)
         if rl_rate > 0.0 and self.rng.random() < rl_rate:
             genome.mutate_parameter('entropy', self.rng, sigma=0.45, low=0.0, high=0.5, log_scale=True)
+        if rl_rate > 0.0 and self.rng.random() < rl_rate:
+            genome.mutate_parameter('gae_lambda', self.rng, sigma=0.25, low=0.2, high=0.9995, log_scale=False)
         if rl_rate > 0.0 and self.rng.random() < 0.5 * rl_rate:
             _mutate_rl_weight_kernel(genome, self.rng)
         if rl_rate > 0.0 and self.rng.random() < 0.5 * rl_rate:
@@ -8055,15 +8082,33 @@ def _softmax(logits):
     ex = np.exp(x)
     return ex / (ex.sum(axis=1, keepdims=True) + 1e-09)
 
-def loss_and_output_delta(comp, Z, y, l2, w):
+def loss_and_output_delta(comp, Z, y, l2, w, sample_weight=None):
     out_idx = comp['outputs']
     B = Z.shape[0]
+    weight_vec = None
+    weight_sum = float(B)
+    if sample_weight is not None:
+        try:
+            weight_vec = np.asarray(sample_weight, dtype=np.float64).reshape(B)
+            weight_vec = np.nan_to_num(np.clip(weight_vec, 0.0, None), nan=0.0, posinf=0.0, neginf=0.0)
+            weight_sum = float(np.sum(weight_vec))
+            if not np.isfinite(weight_sum) or weight_sum <= 0:
+                weight_vec = None
+                weight_sum = float(B)
+        except Exception:
+            weight_vec = None
+            weight_sum = float(B)
     if len(out_idx) == 1:
         z = Z[:, out_idx[0:1]]
         p = 1.0 / (1.0 + np.exp(-z))
         yv = y.reshape(B, 1).astype(np.float64)
-        loss = (np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0) - yv * z).mean()
-        delta_out = p - yv
+        loss_vec = (np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0) - yv * z).reshape(B)
+        if weight_vec is not None:
+            loss = float(np.sum(loss_vec * weight_vec) / max(1e-12, weight_sum))
+            delta_out = (p - yv) * weight_vec.reshape(B, 1)
+        else:
+            loss = float(loss_vec.mean())
+            delta_out = p - yv
         probs = p
     else:
         logits = Z[:, out_idx]
@@ -8080,12 +8125,18 @@ def loss_and_output_delta(comp, Z, y, l2, w):
             y_one[np.arange(B, dtype=np.int64), y_idx] = 1.0
         else:
             y_one = y.astype(np.float64)
-        loss = -(y_one * np.log(probs + 1e-09)).sum(axis=1).mean()
-        delta_out = probs - y_one
+        loss_vec = -(y_one * np.log(probs + 1e-09)).sum(axis=1)
+        if weight_vec is not None:
+            loss = float(np.sum(loss_vec * weight_vec) / max(1e-12, weight_sum))
+            delta_out = (probs - y_one) * weight_vec.reshape(B, 1)
+        else:
+            loss = float(loss_vec.mean())
+            delta_out = probs - y_one
     loss = float(loss + 0.5 * l2 * np.sum(w * w))
-    return (loss, delta_out, probs)
+    norm = float(weight_sum) if weight_vec is not None else float(B)
+    return (loss, delta_out, probs, norm)
 
-def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
+def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001, sample_weight=None):
     """
     Hardened backprop with gradient/weight clipping and NaN guards.
     既存シグネチャ互換（追加引数は train_* から供給）。
@@ -8094,7 +8145,7 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
     grad_clip = 5.0
     w_clip = 12.0
     A, Z = forward_batch(comp, X, w)
-    loss, delta_out, _ = loss_and_output_delta(comp, Z, y, l2, w)
+    loss, delta_out, _, norm = loss_and_output_delta(comp, Z, y, l2, w, sample_weight=sample_weight)
     if not _np.isfinite(loss):
         w = _np.tanh(w) * 0.1
         loss = float(_np.nan_to_num(loss, nan=1000.0, posinf=1000.0, neginf=1000.0))
@@ -8215,7 +8266,8 @@ def backprop_step(comp, X, y, w, lr=0.01, l2=0.0001):
                     delta_update = push_term * (src_mix * mem_gain)
                     delta_update = _np.nan_to_num(delta_update, nan=0.0, posinf=0.0, neginf=0.0)
                     delta_a[:, s] += delta_update
-    grad_w = grad_w / max(1, B) + l2 * w
+    denom = max(1.0, float(norm))
+    grad_w = grad_w / denom + l2 * w
     if not _np.all(_np.isfinite(grad_w)):
         grad_w = _np.nan_to_num(grad_w, nan=0.0, posinf=0.0, neginf=0.0)
     if grad_clip and grad_clip > 0:
@@ -8241,11 +8293,22 @@ def train_with_backprop_numpy(
     profile_out: Optional[Dict[str, Any]]=None,
     rng: Optional[np.random.Generator]=None,
     collective_signal: Optional[Dict[str, float]]=None,
+    sample_weight: Optional[Sequence[float]]=None,
 ):
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
     np.nan_to_num(X, copy=False)
     np.nan_to_num(y, copy=False)
+    sample_weight_arr: Optional[np.ndarray] = None
+    if sample_weight is not None:
+        try:
+            sw = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+        except Exception:
+            sw = None
+        if sw is not None and sw.size == X.shape[0]:
+            sw = np.nan_to_num(np.clip(sw, 0.0, None), nan=0.0, posinf=0.0, neginf=0.0)
+            if np.any(sw > 0):
+                sample_weight_arr = sw
     collective_signal = dict(collective_signal or {})
     altruism_target = float(collective_signal.get('altruism_target', 0.5))
     solidarity = float(collective_signal.get('solidarity', 0.5))
@@ -8286,7 +8349,7 @@ def train_with_backprop_numpy(
     if w.size == 0:
         return history
     for _ in range(int(steps)):
-        w, L, profile = backprop_step(comp, X, y, w, lr=lr, l2=l2)
+        w, L, profile = backprop_step(comp, X, y, w, lr=lr, l2=l2, sample_weight=sample_weight_arr)
         if not np.isfinite(L):
             L = float(np.nan_to_num(L, nan=1000.0, posinf=1000.0, neginf=1000.0))
         history.append(L)
@@ -10588,14 +10651,21 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
                 novelty = 0.0
         reward_val = float(exp.get('reward', 0.0))
         ret_val = float(exp.get('return', exp.get('reward', 0.0)))
-        advantage_val = float(ret_val - baseline)
-        success_flag = advantage_val >= 0.0
+        if 'advantage' in exp:
+            advantage_val = float(exp.get('advantage', ret_val - baseline))
+        else:
+            advantage_val = float(ret_val - baseline)
+        success_flag = bool(exp.get('success', advantage_val >= 0.0))
         if success_flag:
             success_count += 1
-        if reward_sigma > 0.0:
-            norm_advantage = float(np.tanh(advantage_val / reward_sigma))
+        if 'advantage_norm' in exp:
+            norm_advantage = float(exp.get('advantage_norm', 0.0))
         else:
-            norm_advantage = float(np.tanh(advantage_val))
+            if reward_sigma > 0.0:
+                norm_advantage = float(np.tanh(advantage_val / reward_sigma))
+            else:
+                denom = abs(baseline) + reward_sigma + 1e-6
+                norm_advantage = float(np.tanh(advantage_val / denom))
         payload = {
             'obs': obs,
             'action': action,
@@ -10835,6 +10905,25 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
         return
     selected = selected[:sample_size]
     picked = [items[int(i)] for i in selected]
+    sample_weights = None
+    try:
+        idx_arr = np.asarray(selected, dtype=np.int64)
+        weights_selected = weights[idx_arr]
+    except Exception:
+        weights_selected = None
+    if weights_selected is not None and len(weights_selected) == len(picked):
+        local_weights = np.asarray(weights_selected, dtype=np.float64)
+        local_weights = np.nan_to_num(local_weights, nan=0.0, posinf=0.0, neginf=0.0)
+        adv_selected = np.asarray([float(p.get('advantage_norm', 0.0)) for p in picked], dtype=np.float64)
+        success_selected = np.asarray([1.0 if p.get('success') else 0.0 for p in picked], dtype=np.float64)
+        local_weights *= (1.0 + 0.6 * np.maximum(0.0, adv_selected))
+        local_weights += 0.1 * success_selected
+        local_weights = np.clip(local_weights, 1e-4, None)
+        if np.all(np.isfinite(local_weights)) and np.any(local_weights > 0):
+            mean_w = float(np.mean(local_weights))
+            if mean_w > 0:
+                local_weights = local_weights / mean_w
+            sample_weights = local_weights
     try:
         obs_stack = [np.asarray(p['obs'], dtype=np.float64).ravel() for p in picked]
         X = _stack_replay_observations(obs_stack)
@@ -10874,6 +10963,7 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
             lr=float(lr),
             l2=l2,
             collective_signal=collective_signal,
+            sample_weight=sample_weights,
         )
     except Exception as err:
         print('[warn] rl replay update skipped:', err)
@@ -10905,6 +10995,12 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
         }
         if history:
             meta['last_replay']['final_loss'] = float(history[-1])
+        if sample_weights is not None:
+            try:
+                meta['last_replay']['sample_weight_mean'] = float(np.mean(sample_weights))
+                meta['last_replay']['sample_weight_max'] = float(np.max(sample_weights))
+            except Exception:
+                pass
     try:
         genome.meta_reflect(
             'rl_replay_train',
@@ -10920,6 +11016,7 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
                 'signal_kernel': dict(signal_kernel),
                 'signal_program_requested': signal_program_requested,
                 'signal_program': signal_program_active,
+                'sample_weight_mean': float(np.mean(sample_weights)) if sample_weights is not None else 0.0,
             },
         )
     except Exception:
@@ -10946,6 +11043,9 @@ def _rl_update_meta_profile(
         meta['lr_push'] = float(lr)
         meta['gamma_push'] = float(gamma)
         meta['memory_util'] = memory_util
+        params_now = getattr(genome, 'rl_params', {}) or {}
+        gae_now = float(np.clip(params_now.get('gae_lambda', 0.95), 0.2, 0.9995))
+        meta['lambda_push'] = gae_now
         meta['collective_signal'] = _rl_collective_signal(genome, meta, rewards=[], experiences=experiences)
         signal_kernel = dict(_ensure_rl_signal_coeffs(genome))
         meta['signal_kernel'] = signal_kernel
@@ -10965,6 +11065,7 @@ def _rl_update_meta_profile(
             'entropy': float(entropy),
             'lr': float(lr),
             'gamma': float(gamma),
+            'gae_lambda': float(gae_now),
         }
         return
     rewards_arr = np.asarray(rewards, dtype=np.float64)
@@ -11080,6 +11181,7 @@ def _rl_update_meta_profile(
     limit = float(getattr(genome, 'rl_memory_limit', len(memory_buf) or 1))
     memory_util = float(np.clip(len(memory_buf) / max(1.0, limit), 0.0, 1.0))
     params = getattr(genome, 'rl_params', {}) or {}
+    gae_seed = float(np.clip(params.get('gae_lambda', 0.95), 0.2, 0.9995))
     scheduler_program_used: Optional[str] = None
     scheduler_requested: Optional[str] = None
     scheduler_outputs: Optional[Dict[str, float]] = None
@@ -11087,11 +11189,13 @@ def _rl_update_meta_profile(
         entropy_now = float(np.clip(params.get('entropy', entropy), 0.0, 0.5))
         lr_now = float(np.clip(params.get('lr', lr), 1e-5, 0.2))
         gamma_now = float(np.clip(params.get('gamma', gamma), 0.4, 0.9995))
+        gae_now = float(np.clip(params.get('gae_lambda', gae_seed), 0.2, 0.9995))
         reward_span_norm = float(np.tanh(reward_span / denom)) if denom > 0 else 0.0
         scheduler_state = {
             'entropy': entropy_now,
             'lr': lr_now,
             'gamma': gamma_now,
+            'gae_lambda': gae_now,
             'norm_delta': norm_delta,
             'stability': stability,
             'novelty_scale': float(np.clip(novelty_scale, -1.0, 1.0)),
@@ -11136,30 +11240,46 @@ def _rl_update_meta_profile(
                     0.9995,
                 )
             )
+            lambda_target = float(
+                np.clip(
+                    gae_now
+                    + 0.18 * norm_delta
+                    + 0.12 * float(np.clip(novelty_scale, -1.0, 1.0))
+                    + 0.1 * float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+                    - 0.08 * reward_span_norm,
+                    0.2,
+                    0.9995,
+                )
+            )
             scheduler_outputs = {
                 'entropy': entropy_target,
                 'lr': lr_target,
                 'gamma': gamma_target,
+                'gae_lambda': lambda_target,
             }
         else:
             entropy_target = float(np.clip(scheduler_outputs.get('entropy', entropy_now), 1e-5, 0.5))
             lr_target = float(np.clip(scheduler_outputs.get('lr', lr_now), 1e-5, 0.2))
             gamma_target = float(np.clip(scheduler_outputs.get('gamma', gamma_now), 0.4, 0.9995))
+            lambda_target = float(np.clip(scheduler_outputs.get('gae_lambda', gae_now), 0.2, 0.9995))
             scheduler_outputs = {
                 'entropy': entropy_target,
                 'lr': lr_target,
                 'gamma': gamma_target,
+                'gae_lambda': lambda_target,
             }
         scheduler_program_used = program
-        params.update({'entropy': entropy_target, 'lr': lr_target, 'gamma': gamma_target})
+        params.update({'entropy': entropy_target, 'lr': lr_target, 'gamma': gamma_target, 'gae_lambda': lambda_target})
         genome.rl_params = params
         meta['entropy_push'] = entropy_target
         meta['lr_push'] = lr_target
         meta['gamma_push'] = gamma_target
+        meta['lambda_push'] = lambda_target
     else:
         meta['entropy_push'] = float(entropy)
         meta['lr_push'] = float(lr)
         meta['gamma_push'] = float(gamma)
+        meta['lambda_push'] = gae_seed
     sched_active = meta.get('scheduler_program')
     if not isinstance(sched_active, str) or not sched_active.strip():
         sched_active = _rl_scheduler_program_for(genome)
@@ -11178,6 +11298,7 @@ def _rl_update_meta_profile(
                 'entropy': float(meta['entropy_push']),
                 'lr': float(meta['lr_push']),
                 'gamma': float(meta['gamma_push']),
+                'gae_lambda': float(meta['lambda_push']),
             },
         )
     meta['memory_util'] = memory_util
@@ -11218,6 +11339,8 @@ def _rl_collect_episode(
     *,
     gamma: float,
     entropy: float,
+    gae_lambda: float,
+    meta: Optional[Dict[str, Any]]=None,
     max_steps: Optional[int]=None,
     render: bool=False,
     obs_norm=None,
@@ -11226,6 +11349,12 @@ def _rl_collect_episode(
     reset_out = env.reset()
     obs = reset_out[0] if isinstance(reset_out, tuple) and len(reset_out) >= 1 else reset_out
     experiences: List[Dict[str, Any]] = []
+    meta = meta or {}
+    baseline_reward = float(meta.get('reward_ema', 0.0)) if isinstance(meta, dict) else 0.0
+    baseline_adv = float(meta.get('advantage_ema', 0.0)) if isinstance(meta, dict) else 0.0
+    baseline = baseline_reward + baseline_adv
+    lam = float(np.clip(gae_lambda, 0.0, 0.9995))
+    entropy_gain = float(max(0.0, entropy))
     while not done:
         if render:
             try:
@@ -11249,12 +11378,15 @@ def _rl_collect_episode(
             done = bool(done)
         next_obs_vec = np.asarray(next_obs, dtype=np.float32).ravel()
         chosen_prob = None
+        entropy_term = 0.0
         if probs is not None:
             try:
                 if np.isscalar(action):
                     idx = int(action)
                     if 0 <= idx < len(probs):
                         chosen_prob = float(max(1e-8, probs[idx]))
+                        if entropy_gain > 0.0:
+                            entropy_term = float(max(0.0, -math.log(chosen_prob)))
             except Exception:
                 chosen_prob = None
         experiences.append(
@@ -11265,6 +11397,7 @@ def _rl_collect_episode(
                 'next_obs': next_obs_vec.copy(),
                 'prob': chosen_prob,
                 'done': bool(done),
+                'entropy_bonus': entropy_term,
             }
         )
         total += float(reward)
@@ -11272,13 +11405,34 @@ def _rl_collect_episode(
         steps += 1
         if max_steps is not None and steps >= int(max_steps):
             break
-    G = 0.0
-    for exp in reversed(experiences):
-        G = float(exp.get('reward', 0.0)) + float(gamma) * G
-        prob = exp.get('prob')
-        if prob is not None and float(entropy) > 0.0:
-            G += float(entropy) * (-math.log(prob))
-        exp['return'] = float(G)
+    if not experiences:
+        return total, experiences
+    returns = np.zeros(len(experiences), dtype=np.float64)
+    future = 0.0
+    for idx in reversed(range(len(experiences))):
+        exp = experiences[idx]
+        reward = float(exp.get('reward', 0.0))
+        done_flag = 1.0 if exp.get('done') else 0.0
+        future = reward + float(gamma) * future * (1.0 - done_flag)
+        if entropy_gain > 0.0:
+            future += entropy_gain * float(exp.get('entropy_bonus', 0.0))
+        returns[idx] = future
+    reward_std = float(np.std(returns)) if returns.size else 0.0
+    norm_denom = max(1e-6, abs(baseline_reward) + reward_std)
+    next_smoothed = baseline
+    for idx in reversed(range(len(experiences))):
+        exp = experiences[idx]
+        ret = returns[idx]
+        smoothed_val = (1.0 - lam) * ret + lam * next_smoothed
+        advantage = smoothed_val - baseline
+        exp['return'] = float(smoothed_val)
+        exp['advantage'] = float(advantage)
+        exp['advantage_norm'] = float(np.tanh(advantage / norm_denom))
+        if exp.get('done'):
+            next_smoothed = baseline
+        else:
+            next_smoothed = smoothed_val
+        exp.pop('entropy_bonus', None)
     return total, experiences
 
 
@@ -11287,12 +11441,16 @@ def _rollout_policy_in_env(genome, env, mapper, max_steps=None, render=False, ob
     params = getattr(genome, 'rl_params', {}) or {}
     gamma = float(np.clip(params.get('gamma', 0.99), 0.0, 0.9995))
     entropy = float(max(0.0, params.get('entropy', 0.01)))
+    gae_lambda = float(np.clip(params.get('gae_lambda', 0.95), 0.0, 0.9995))
+    meta = getattr(genome, 'rl_meta', {}) or {}
     total, _ = _rl_collect_episode(
         genome,
         env,
         mapper,
         gamma=gamma,
         entropy=entropy,
+        gae_lambda=gae_lambda,
+        meta=meta,
         max_steps=max_steps,
         render=render,
         obs_norm=obs_norm,
@@ -11313,10 +11471,12 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
         params = getattr(genome, 'rl_params', {}) or {}
         gamma = float(np.clip(params.get('gamma', 0.99), 0.0, 0.9995))
         entropy = float(max(0.0, params.get('entropy', 0.01)))
+        gae_lambda = float(np.clip(params.get('gae_lambda', 0.95), 0.0, 0.9995))
         lr = float(np.clip(params.get('lr', 0.01), 1e-6, 1.0))
         total = 0.0
         reward_list: List[float] = []
         replay_batch: List[Dict[str, Any]] = []
+        meta_state = getattr(genome, 'rl_meta', {}) or {}
         for _ in range(n_episodes):
             reward, experiences = _rl_collect_episode(
                 genome,
@@ -11324,6 +11484,8 @@ def gym_fitness_factory(env_id, stochastic=False, temp=1.0, max_steps=1000, epis
                 mapper,
                 gamma=gamma,
                 entropy=entropy,
+                gae_lambda=gae_lambda,
+                meta=meta_state,
                 max_steps=max_steps,
                 render=False,
                 obs_norm=obs_norm,
