@@ -204,6 +204,12 @@ _RL_SIGNAL_COEFF_DEFAULTS: Dict[str, float] = {
     'advantage_novelty': 0.1,
     'advantage_team': 0.2,
     'advantage_best': 0.12,
+    'team_objective_bias': 0.1,
+    'team_objective_alignment': 0.45,
+    'team_objective_trend': 0.28,
+    'team_objective_pressure': 0.5,
+    'team_objective_best': 0.26,
+    'team_objective_span': 0.22,
 }
 
 _RL_SIGNAL_DSL_TEMPLATE = """
@@ -245,6 +251,16 @@ advantage = clamp(
     + {advantage_best} * team_best,
     0.0,
     1.0
+);
+team_objective = clamp(
+    {team_objective_bias}
+    + {team_objective_alignment} * team_alignment
+    + {team_objective_trend} * trend_norm
+    - {team_objective_pressure} * team_pressure
+    + {team_objective_best} * team_best
+    + {team_objective_span} * span_component,
+    -3.0,
+    3.0
 );
 """
 
@@ -311,6 +327,26 @@ gamma = clamp(
 _RL_SCHED_PROGRAM_CACHE: Dict[str, Any] = {}
 
 
+def _dsl_coeff_signature(
+    template: str,
+    coeffs: Dict[str, float],
+    defaults: Dict[str, float],
+) -> Tuple[str, Tuple[Tuple[str, float], ...]]:
+    template_key = template.strip() if isinstance(template, str) else ''
+    keys = sorted(set(defaults.keys()) | set(coeffs.keys()))
+    pairs: List[Tuple[str, float]] = []
+    for key in keys:
+        default = defaults.get(key, 0.0)
+        try:
+            val = float(coeffs.get(key, default))
+        except Exception:
+            val = float(default)
+        if not np.isfinite(val):
+            val = float(default)
+        pairs.append((key, round(val, 12)))
+    return template_key, tuple(pairs)
+
+
 _MONODROMY_COEFF_DEFAULTS: Dict[str, float] = {
     'growth_scale': 1.0,
     'slump_scale': 1.0,
@@ -374,6 +410,783 @@ target *= family_factor
 
 
 _MONODROMY_PROGRAM_CACHE: Dict[str, Any] = {}
+
+
+_ENV_LEADER_COEFF_DEFAULTS: Dict[str, float] = {
+    'share_scarcity_penalty': 0.25,
+    'share_scarcity_lo': 0.2,
+    'share_scarcity_hi': 1.0,
+    'share_pressure_penalty': 0.18,
+    'share_objective_gain': 0.12,
+    'share_pressure_lo': 0.15,
+    'share_pressure_hi': 1.0,
+    'mod0_share': 0.35,
+    'mod0_anchor': 0.35,
+    'mod1_share': 0.3,
+    'mod1_anchor': 0.3,
+    'mod1_gap': 0.5,
+    'mod2_share': 0.3,
+    'mod2_gap': 0.6,
+    'noise_base': 0.05,
+    'noise_trend_gain': 0.12,
+    'noise_align_penalty': 0.1,
+    'noise_pressure_gain': 0.02,
+    'noise_objective_penalty': 0.015,
+    'noise_cap': 0.25,
+    'turns_base': 1.6,
+    'turns_objective_gain': 0.1,
+    'turns_spread_gain': 0.05,
+    'turns_cap_low': 0.6,
+    'turns_cap_high': 3.2,
+    'rot_align_gain': 0.25,
+    'anchor_noise_trend': 0.06,
+    'anchor_noise_align': 0.02,
+    'anchor_turns_gap': 0.25,
+    'anchor_turns_objective': 0.08,
+    'rot_anchor_anchor': 0.4,
+    'rot_anchor_gap': 0.6,
+    'rot_anchor_align': 0.25,
+    'inertia_base': 0.25,
+    'inertia_share_gain': 0.5,
+    'inertia_stasis_gain': 0.25,
+    'inertia_cap': 0.9,
+    'inertia_scarcity_penalty': 0.4,
+    'inertia_spread_gain': 0.15,
+    'inertia_drive_penalty': 0.2,
+    'inertia_obj_gain': 0.28,
+    'inertia_stage_lo': 0.2,
+    'inertia_stage_hi': 1.05,
+    'inertia_final_lo': 0.05,
+    'inertia_final_hi': 1.0,
+    'anchor_mix_ratio': 0.5,
+    'env_shift_noise_gain': 4.0,
+    'env_shift_turn_gain': 1.0,
+    'env_shift_rot_gain': 0.5,
+    'advantage_scarcity_gain': 0.35,
+    'advantage_env_bias': 0.5,
+    'advantage_cap': 3.5,
+    'advantage_pressure_gain': 0.2,
+    'advantage_objective_penalty': 0.25,
+    'advantage_alignment_gain': 0.1,
+}
+
+
+_ENV_LEADER_DSL_TEMPLATE = """
+// DSL for leader-mode environment steering.
+share = float(np.clip(share * (1.0 - {share_scarcity_penalty} * scarcity), {share_scarcity_lo}, {share_scarcity_hi}));
+share = float(np.clip(
+    share * (1.0 - {share_pressure_penalty} * reward_pressure + {share_objective_gain} * max(0.0, reward_objective)),
+    {share_pressure_lo},
+    {share_pressure_hi}
+));
+mod_out0 = output0 * (1.0 - {mod0_share} * share) + anchor * {mod0_anchor};
+mod_out1 = output1 * (1.0 - {mod1_share} * share) + (anchor + gap * {mod1_gap}) * {mod1_anchor};
+mod_out2 = output2 * (1.0 - {mod2_share} * share) + gap * {mod2_gap};
+target_noise = float(np.clip(
+    {noise_base}
+    + scale_noise * (mod_out0 + {noise_trend_gain} * reward_trend - {noise_align_penalty} * reward_alignment)
+    + {noise_pressure_gain} * reward_pressure
+    - {noise_objective_penalty} * reward_objective,
+    0.0,
+    {noise_cap}
+));
+target_turns = float(np.clip(
+    {turns_base}
+    + scale_turns * (mod_out1 + {turns_objective_gain} * reward_objective)
+    + {turns_spread_gain} * reward_spread,
+    {turns_cap_low},
+    {turns_cap_high}
+));
+rot_target = prev_rot + scale_rot * (mod_out2 + {rot_align_gain} * reward_alignment);
+anchor_noise = float(np.clip(
+    {noise_base}
+    + scale_noise * (anchor + {anchor_noise_trend} * reward_trend)
+    - {anchor_noise_align} * reward_alignment,
+    0.0,
+    {noise_cap}
+));
+anchor_turns = float(np.clip(
+    {turns_base}
+    + scale_turns * (anchor + gap * {anchor_turns_gap} + {anchor_turns_objective} * reward_objective),
+    {turns_cap_low},
+    {turns_cap_high}
+));
+rot_anchor = prev_rot + scale_rot * (
+    anchor * {rot_anchor_anchor} + gap * {rot_anchor_gap} + {rot_anchor_align} * reward_alignment
+);
+inertia = float(np.clip(
+    {inertia_base} + {inertia_share_gain} * share + {inertia_stasis_gain} * stasis,
+    0.0,
+    {inertia_cap}
+));
+inertia *= float(np.clip(
+    1.0 - {inertia_scarcity_penalty} * scarcity + {inertia_spread_gain} * spread,
+    {inertia_stage_lo},
+    {inertia_stage_hi}
+));
+inertia *= float(np.clip(
+    0.65 + {inertia_obj_gain} * max(0.0, reward_objective) - {inertia_drive_penalty} * reward_drive,
+    {inertia_final_lo},
+    {inertia_final_hi}
+));
+slip = max(0.0, 1.0 - inertia);
+anchor_mix = slip * {anchor_mix_ratio} * stasis;
+leader_mix = max(0.0, slip - anchor_mix);
+noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, {noise_cap}));
+turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, {turns_cap_low}, {turns_cap_high}));
+rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix;
+rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi);
+env_shift = (
+    abs(noise - prev_noise) * {env_shift_noise_gain}
+    + abs(turns - prev_turns) * {env_shift_turn_gain}
+    + abs(rot_blend - prev_rot) * {env_shift_rot_gain}
+);
+selfish_drive = max(0.0, leader_mix - anchor_mix) * (1.0 - share);
+advantage_score = float(np.clip(
+    selfish_drive * (max(0.0, gap) + {advantage_scarcity_gain} * scarcity) * ({advantage_env_bias} + env_shift)
+    + {advantage_pressure_gain} * reward_pressure
+    - {advantage_objective_penalty} * reward_objective
+    + {advantage_alignment_gain} * max(0.0, -reward_alignment),
+    0.0,
+    {advantage_cap}
+));
+altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0));
+share = float(share);
+stasis = float(stasis);
+gap = float(gap);
+anchor = float(anchor);
+reward_alignment = float(reward_alignment);
+reward_trend = float(reward_trend);
+reward_spread = float(reward_spread);
+reward_pressure = float(reward_pressure);
+reward_objective = float(reward_objective);
+reward_drive = float(reward_drive);
+scarcity = float(scarcity);
+spread = float(spread);
+prev_noise = float(prev_noise);
+prev_turns = float(prev_turns);
+prev_rot = float(prev_rot);
+output0 = float(output0);
+output1 = float(output1);
+output2 = float(output2);
+scale_noise = float(scale_noise);
+scale_turns = float(scale_turns);
+scale_rot = float(scale_rot);
+reward_trend = float(reward_trend);
+reward_alignment = float(reward_alignment);
+reward_spread = float(reward_spread);
+reward_pressure = float(reward_pressure);
+reward_objective = float(reward_objective);
+reward_drive = float(reward_drive);
+"""
+
+
+_ENV_LEADER_PROGRAM_CACHE: Dict[str, Any] = {}
+
+
+_ENV_COUNCIL_COEFF_DEFAULTS: Dict[str, float] = {
+    'noise_base': 0.05,
+    'noise_cap': 0.25,
+    'turns_base': 1.6,
+    'turns_cap_low': 0.6,
+    'turns_cap_high': 3.2,
+    'rot_anchor_anchor': 0.4,
+    'rot_anchor_gap': 0.6,
+    'anchor_pull_base': 0.35,
+    'anchor_pull_lazy': 0.25,
+    'anchor_pull_focus': 0.15,
+    'gap_pull_base': 0.45,
+    'gap_pull_lazy': 0.25,
+    'gap_pull_drive': 0.2,
+    'mod0_align_gain': 0.2,
+    'mod1_gap': 0.5,
+    'mod1_focus_gain': 0.3,
+    'mod2_delta_gain': 0.35,
+    'anchor_noise_lazy': 0.2,
+    'anchor_noise_align': 0.1,
+    'anchor_turns_gap': 0.25,
+    'anchor_turns_lazy': 0.15,
+    'anchor_turns_mean': 0.2,
+    'rot_anchor_lazy': 0.2,
+    'rot_anchor_delta': 0.25,
+    'inertia_base': 0.25,
+    'inertia_share_gain': 0.6,
+    'inertia_stasis_gain': 0.25,
+    'inertia_focus_gain': 0.15,
+    'inertia_cap': 0.92,
+    'inertia_stage_scarcity': 0.35,
+    'inertia_stage_spread': 0.25,
+    'inertia_stage_lazy': 0.15,
+    'inertia_stage_focus': 0.15,
+    'inertia_stage_drive': 0.1,
+    'inertia_stage_lo': 0.2,
+    'inertia_stage_hi': 1.1,
+    'anchor_ratio_base': 0.3,
+    'anchor_ratio_stasis': 0.4,
+    'anchor_ratio_lazy': 0.3,
+    'anchor_ratio_focus': 0.2,
+    'anchor_ratio_drive': 0.15,
+    'anchor_ratio_cap': 0.95,
+    'env_shift_noise_gain': 4.0,
+    'env_shift_turn_gain': 1.0,
+    'env_shift_rot_gain': 0.5,
+    'env_shift_dispersion_gain': 1.0,
+    'env_shift_lazy_gain': 1.2,
+    'env_shift_drive_gain': 0.8,
+    'env_shift_delta_gain': 0.6,
+    'advantage_scarcity_gain': 0.35,
+    'advantage_lazy_gain': 0.25,
+    'advantage_focus_gain': 0.3,
+    'advantage_env_bias': 0.5,
+    'advantage_drive_gain': 0.7,
+    'advantage_cap': 3.5,
+    'selfish_share_penalty': 0.6,
+    'selfish_drive_bonus': 0.25,
+    'altruism_align_gain': 0.15,
+    'altruism_pressure_penalty': 0.1,
+}
+
+
+_ENV_COUNCIL_DSL_TEMPLATE = """
+// DSL for council-mode environment steering.
+anchor_pull = float(np.clip(
+    {anchor_pull_base} + {anchor_pull_lazy} * lazy_pressure + {anchor_pull_focus} * reward_focus,
+    0.0,
+    0.9
+));
+gap_pull = float(np.clip(
+    {gap_pull_base} + {gap_pull_lazy} * lazy_pressure + {gap_pull_drive} * reward_drive,
+    0.0,
+    0.95
+));
+mod_out0 = consensus0 * (1.0 - anchor_pull) + anchor * anchor_pull + {mod0_align_gain} * reward_alignment * rl_recency;
+mod_out1 = consensus1 * (1.0 - anchor_pull) + (anchor + gap * {mod1_gap}) * anchor_pull + {mod1_focus_gain} * reward_mean_norm * rl_recency;
+mod_out2 = consensus2 * (1.0 - gap_pull) + gap * gap_pull + {mod2_delta_gain} * reward_delta_norm * rl_recency;
+target_noise = float(np.clip({noise_base} + scale_noise * mod_out0, 0.0, {noise_cap}));
+target_turns = float(np.clip({turns_base} + scale_turns * mod_out1, {turns_cap_low}, {turns_cap_high}));
+rot_target = prev_rot + scale_rot * mod_out2;
+anchor_noise = float(np.clip(
+    {noise_base} + scale_noise * (anchor + {anchor_noise_lazy} * lazy_pressure + {anchor_noise_align} * reward_alignment * rl_recency),
+    0.0,
+    {noise_cap}
+));
+anchor_turns = float(np.clip(
+    {turns_base}
+    + scale_turns * (anchor + gap * {anchor_turns_gap} + {anchor_turns_lazy} * lazy_pressure + {anchor_turns_mean} * reward_mean_norm * rl_recency),
+    {turns_cap_low},
+    {turns_cap_high}
+));
+rot_anchor = prev_rot + scale_rot * (
+    anchor * {rot_anchor_anchor} + gap * {rot_anchor_gap} + {rot_anchor_lazy} * lazy_pressure + {rot_anchor_delta} * reward_delta_norm * rl_recency
+);
+inertia = float(np.clip(
+    {inertia_base} + {inertia_share_gain} * share + {inertia_stasis_gain} * stasis + {inertia_focus_gain} * reward_focus,
+    0.0,
+    {inertia_cap}
+));
+inertia *= float(np.clip(
+    1.0
+    - {inertia_stage_scarcity} * scarcity
+    + {inertia_stage_spread} * spread
+    + {inertia_stage_lazy} * lazy_pressure
+    + {inertia_stage_focus} * reward_focus
+    - {inertia_stage_drive} * reward_drive,
+    {inertia_stage_lo},
+    {inertia_stage_hi}
+));
+slip = max(0.0, 1.0 - inertia);
+anchor_ratio = float(np.clip(
+    {anchor_ratio_base}
+    + {anchor_ratio_stasis} * stasis
+    + {anchor_ratio_lazy} * lazy_pressure
+    + {anchor_ratio_focus} * reward_focus
+    - {anchor_ratio_drive} * reward_drive,
+    0.0,
+    {anchor_ratio_cap}
+));
+anchor_mix = min(slip, slip * anchor_ratio);
+leader_mix = max(0.0, slip - anchor_mix);
+noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, {noise_cap}));
+turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, {turns_cap_low}, {turns_cap_high}));
+rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix;
+rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi);
+env_shift = (
+    abs(noise - prev_noise) * {env_shift_noise_gain}
+    + abs(turns - prev_turns) * {env_shift_turn_gain}
+    + abs(rot_blend - prev_rot) * {env_shift_rot_gain}
+    + dispersion * {env_shift_dispersion_gain}
+    + lazy_pressure * {env_shift_lazy_gain}
+    + reward_drive * {env_shift_drive_gain}
+    + abs(reward_delta_norm) * {env_shift_delta_gain}
+);
+selfish_drive = max(0.0, leader_mix - anchor_mix) * (1.0 - {selfish_share_penalty} * share) + {selfish_drive_bonus} * reward_drive;
+advantage_score = float(np.clip(
+    selfish_drive
+    * (max(0.0, gap) + {advantage_scarcity_gain} * scarcity + {advantage_lazy_gain} * lazy_pressure + {advantage_focus_gain} * reward_focus)
+    * ({advantage_env_bias} + env_shift + {advantage_drive_gain} * reward_drive),
+    0.0,
+    {advantage_cap}
+));
+altruism_signal = float(np.clip(
+    1.0 - min(1.0, advantage_score) + {altruism_align_gain} * reward_alignment * rl_recency - {altruism_pressure_penalty} * reward_pressure_norm,
+    0.0,
+    1.0
+));
+share = float(share);
+stasis = float(stasis);
+gap = float(gap);
+anchor = float(anchor);
+scarcity = float(scarcity);
+spread = float(spread);
+lazy_pressure = float(lazy_pressure);
+reward_alignment = float(reward_alignment);
+reward_mean_norm = float(reward_mean_norm);
+reward_delta_norm = float(reward_delta_norm);
+reward_focus = float(reward_focus);
+reward_drive = float(reward_drive);
+reward_pressure_norm = float(reward_pressure_norm);
+rl_recency = float(rl_recency);
+dispersion = float(dispersion);
+prev_noise = float(prev_noise);
+prev_turns = float(prev_turns);
+prev_rot = float(prev_rot);
+scale_noise = float(scale_noise);
+scale_turns = float(scale_turns);
+scale_rot = float(scale_rot);
+consensus0 = float(consensus0);
+consensus1 = float(consensus1);
+consensus2 = float(consensus2);
+"""
+
+
+_ENV_COUNCIL_PROGRAM_CACHE: Dict[str, Any] = {}
+
+def _env_leader_sanitise_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_ENV_LEADER_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _ENV_LEADER_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            base[key] = val
+    return base
+
+
+def _env_council_sanitise_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_ENV_COUNCIL_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _ENV_COUNCIL_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            base[key] = val
+    return base
+
+
+def _env_leader_program_for(evaluator: 'SelfReproducingEvaluator') -> str:
+    template = getattr(evaluator, 'env_leader_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _ENV_LEADER_DSL_TEMPLATE
+        evaluator.env_leader_program_template = template
+    coeffs = getattr(evaluator, 'env_leader_program_coeffs', None)
+    if not isinstance(coeffs, dict):
+        coeffs = dict(_ENV_LEADER_COEFF_DEFAULTS)
+        evaluator.env_leader_program_coeffs = coeffs
+    else:
+        coeffs = _env_leader_sanitise_coeffs(coeffs)
+        evaluator.env_leader_program_coeffs = coeffs
+    signature = _dsl_coeff_signature(template, coeffs, _ENV_LEADER_COEFF_DEFAULTS)
+    cache = getattr(evaluator, '_env_leader_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {}
+    for key, default in _ENV_LEADER_COEFF_DEFAULTS.items():
+        val = coeffs.get(key, default)
+        try:
+            val = float(val)
+        except Exception:
+            val = default
+        if not np.isfinite(val):
+            val = default
+        formatted[key] = repr(val)
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        template = _ENV_LEADER_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _ENV_LEADER_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _ENV_LEADER_COEFF_DEFAULTS, _ENV_LEADER_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+        evaluator.env_leader_program_template = template
+        evaluator.env_leader_program_coeffs = dict(_ENV_LEADER_COEFF_DEFAULTS)
+    evaluator._env_leader_program_cache = (signature, program)
+    return program
+
+
+def _env_council_program_for(evaluator: 'SelfReproducingEvaluator') -> str:
+    template = getattr(evaluator, 'env_council_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _ENV_COUNCIL_DSL_TEMPLATE
+        evaluator.env_council_program_template = template
+    coeffs = getattr(evaluator, 'env_council_program_coeffs', None)
+    if not isinstance(coeffs, dict):
+        coeffs = dict(_ENV_COUNCIL_COEFF_DEFAULTS)
+        evaluator.env_council_program_coeffs = coeffs
+    else:
+        coeffs = _env_council_sanitise_coeffs(coeffs)
+        evaluator.env_council_program_coeffs = coeffs
+    signature = _dsl_coeff_signature(template, coeffs, _ENV_COUNCIL_COEFF_DEFAULTS)
+    cache = getattr(evaluator, '_env_council_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {}
+    for key, default in _ENV_COUNCIL_COEFF_DEFAULTS.items():
+        val = coeffs.get(key, default)
+        try:
+            val = float(val)
+        except Exception:
+            val = default
+        if not np.isfinite(val):
+            val = default
+        formatted[key] = repr(val)
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        template = _ENV_COUNCIL_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _ENV_COUNCIL_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _ENV_COUNCIL_COEFF_DEFAULTS, _ENV_COUNCIL_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+        evaluator.env_council_program_template = template
+        evaluator.env_council_program_coeffs = dict(_ENV_COUNCIL_COEFF_DEFAULTS)
+    evaluator._env_council_program_cache = (signature, program)
+    return program
+
+
+def _env_leader_compile_program(program: str):
+    cached = _ENV_LEADER_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty leader env program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<env_leader_program>', 'exec')
+    _ENV_LEADER_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _env_council_compile_program(program: str):
+    cached = _ENV_COUNCIL_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty council env program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<env_council_program>', 'exec')
+    _ENV_COUNCIL_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _env_leader_python(state: Dict[str, float]) -> Dict[str, float]:
+    share = float(state['share'])
+    stasis = float(state['stasis'])
+    anchor = float(state['anchor'])
+    gap = float(state['gap'])
+    scarcity = float(state['scarcity'])
+    spread = float(state['spread'])
+    reward_pressure = float(state['reward_pressure'])
+    reward_objective = float(state['reward_objective'])
+    scale_noise = float(state['scale_noise'])
+    scale_turns = float(state['scale_turns'])
+    scale_rot = float(state['scale_rot'])
+    output0 = float(state['output0'])
+    output1 = float(state['output1'])
+    output2 = float(state['output2'])
+    prev_noise = float(state['prev_noise'])
+    prev_turns = float(state['prev_turns'])
+    prev_rot = float(state['prev_rot'])
+    reward_trend = float(state['reward_trend'])
+    reward_alignment = float(state['reward_alignment'])
+    reward_spread = float(state['reward_spread'])
+    reward_drive = float(state['reward_drive'])
+    share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
+    share *= float(np.clip(1.0 - 0.18 * reward_pressure + 0.12 * max(0.0, reward_objective), 0.15, 1.0))
+    mod_out0 = output0 * (1.0 - 0.35 * share) + anchor * 0.35
+    mod_out1 = output1 * (1.0 - 0.3 * share) + (anchor + gap * 0.5) * 0.3
+    mod_out2 = output2 * (1.0 - 0.3 * share) + gap * 0.6
+    target_noise = float(
+        np.clip(
+            0.05
+            + scale_noise * (mod_out0 + 0.12 * reward_trend - 0.1 * reward_alignment)
+            + 0.02 * reward_pressure
+            - 0.015 * reward_objective,
+            0.0,
+            0.25,
+        )
+    )
+    target_turns = float(
+        np.clip(
+            1.6 + scale_turns * (mod_out1 + 0.1 * reward_objective) + 0.05 * reward_spread,
+            0.6,
+            3.2,
+        )
+    )
+    rot_target = prev_rot + scale_rot * (mod_out2 + 0.25 * reward_alignment)
+    anchor_noise = float(
+        np.clip(
+            0.05 + scale_noise * (anchor + 0.06 * reward_trend) - 0.02 * reward_alignment,
+            0.0,
+            0.25,
+        )
+    )
+    anchor_turns = float(
+        np.clip(
+            1.6 + scale_turns * (anchor + gap * 0.25 + 0.08 * reward_objective),
+            0.6,
+            3.2,
+        )
+    )
+    rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6 + 0.25 * reward_alignment)
+    inertia = float(np.clip(0.25 + 0.5 * share + 0.25 * stasis, 0.0, 0.9))
+    inertia *= float(np.clip(1.0 - 0.4 * scarcity + 0.15 * spread, 0.2, 1.05))
+    inertia *= float(np.clip(0.65 + 0.28 * max(0.0, reward_objective) - 0.2 * reward_drive, 0.05, 1.0))
+    slip = max(0.0, 1.0 - inertia)
+    anchor_mix = slip * 0.5 * stasis
+    leader_mix = max(0.0, slip - anchor_mix)
+    noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
+    turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
+    rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
+    rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+    env_shift = (
+        abs(noise - prev_noise) * 4.0
+        + abs(turns - prev_turns)
+        + 0.5 * abs(rot_blend - prev_rot)
+    )
+    selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - share))
+    advantage_score = float(
+        np.clip(
+            selfish_drive * (max(0.0, gap) + 0.35 * scarcity) * (0.5 + env_shift),
+            0.0,
+            3.5,
+        )
+    )
+    altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0))
+    return {
+        'share': share,
+        'noise': noise,
+        'turns': turns,
+        'rot_blend': rot_blend,
+        'rot_bias': rot_bias,
+        'anchor_mix': anchor_mix,
+        'leader_mix': leader_mix,
+        'inertia': inertia,
+        'selfish_drive': selfish_drive,
+        'advantage_score': advantage_score,
+        'altruism_signal': altruism_signal,
+        'env_shift': env_shift,
+    }
+
+
+def _env_council_python(state: Dict[str, float]) -> Dict[str, float]:
+    share = float(state['share'])
+    stasis = float(state['stasis'])
+    anchor = float(state['anchor'])
+    gap = float(state['gap'])
+    scarcity = float(state['scarcity'])
+    spread = float(state['spread'])
+    lazy_pressure = float(state['lazy_pressure'])
+    reward_alignment = float(state['reward_alignment'])
+    reward_mean_norm = float(state['reward_mean_norm'])
+    reward_delta_norm = float(state['reward_delta_norm'])
+    reward_focus = float(state['reward_focus'])
+    reward_drive = float(state['reward_drive'])
+    reward_pressure_norm = float(state['reward_pressure_norm'])
+    rl_recency = float(state['rl_recency'])
+    dispersion = float(state['dispersion'])
+    prev_noise = float(state['prev_noise'])
+    prev_turns = float(state['prev_turns'])
+    prev_rot = float(state['prev_rot'])
+    scale_noise = float(state['scale_noise'])
+    scale_turns = float(state['scale_turns'])
+    scale_rot = float(state['scale_rot'])
+    consensus0 = float(state['consensus0'])
+    consensus1 = float(state['consensus1'])
+    consensus2 = float(state['consensus2'])
+    reward_spread = float(state.get('reward_spread', 0.0))
+    entropy_norm = float(state.get('entropy_norm', 0.0))
+    anchor_pull = float(np.clip(0.35 + 0.25 * lazy_pressure + 0.15 * reward_focus, 0.0, 0.9))
+    gap_pull = float(np.clip(0.45 + 0.25 * lazy_pressure + 0.2 * reward_drive, 0.0, 0.95))
+    mod_out0 = consensus0 * (1.0 - anchor_pull) + anchor * anchor_pull + reward_alignment * 0.2 * rl_recency
+    mod_out1 = consensus1 * (1.0 - anchor_pull) + (anchor + gap * 0.5) * anchor_pull + reward_mean_norm * 0.3 * rl_recency
+    mod_out2 = consensus2 * (1.0 - gap_pull) + gap * gap_pull + reward_delta_norm * 0.35 * rl_recency
+    target_noise = float(np.clip(0.05 + scale_noise * mod_out0, 0.0, 0.25))
+    target_turns = float(np.clip(1.6 + scale_turns * mod_out1, 0.6, 3.2))
+    rot_target = prev_rot + scale_rot * mod_out2
+    anchor_noise = float(np.clip(0.05 + scale_noise * (anchor + 0.2 * lazy_pressure + 0.1 * reward_alignment * rl_recency), 0.0, 0.25))
+    anchor_turns = float(
+        np.clip(
+            1.6 + scale_turns * (anchor + gap * 0.25 + 0.15 * lazy_pressure + 0.2 * reward_mean_norm * rl_recency),
+            0.6,
+            3.2,
+        )
+    )
+    rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6 + 0.2 * lazy_pressure + 0.25 * reward_delta_norm * rl_recency)
+    inertia = float(np.clip(0.25 + 0.6 * share + 0.25 * stasis + 0.15 * reward_focus, 0.0, 0.92))
+    inertia *= float(
+        np.clip(
+            1.0 - 0.35 * scarcity + 0.25 * spread + 0.15 * lazy_pressure + 0.15 * reward_focus - 0.1 * reward_drive,
+            0.2,
+            1.1,
+        )
+    )
+    slip = max(0.0, 1.0 - inertia)
+    anchor_ratio = float(np.clip(0.3 + 0.4 * stasis + 0.3 * lazy_pressure + 0.2 * reward_focus - 0.15 * reward_drive, 0.0, 0.95))
+    anchor_mix = min(slip, slip * anchor_ratio)
+    leader_mix = max(0.0, slip - anchor_mix)
+    noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
+    turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
+    rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
+    rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+    env_shift = (
+        abs(noise - prev_noise) * 4.0
+        + abs(turns - prev_turns)
+        + 0.5 * abs(rot_blend - prev_rot)
+        + dispersion
+        + 1.2 * lazy_pressure
+        + 0.8 * reward_drive
+        + 0.6 * abs(reward_delta_norm)
+    )
+    selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - 0.6 * share) + 0.25 * reward_drive)
+    advantage_score = float(
+        np.clip(
+            selfish_drive
+            * (max(0.0, gap) + 0.35 * scarcity + 0.25 * lazy_pressure + 0.3 * reward_focus)
+            * (0.5 + env_shift + 0.7 * reward_drive),
+            0.0,
+            3.5,
+        )
+    )
+    altruism_signal = float(
+        np.clip(
+            1.0 - min(1.0, advantage_score) + 0.15 * reward_alignment * rl_recency - 0.1 * reward_pressure_norm,
+            0.0,
+            1.0,
+        )
+    )
+    return {
+        'share': share,
+        'lazy_pressure': lazy_pressure,
+        'noise': noise,
+        'turns': turns,
+        'rot_blend': rot_blend,
+        'rot_bias': rot_bias,
+        'anchor_mix': anchor_mix,
+        'leader_mix': leader_mix,
+        'inertia': inertia,
+        'selfish_drive': selfish_drive,
+        'advantage_score': advantage_score,
+        'altruism_signal': altruism_signal,
+        'env_shift': env_shift,
+    }
+
+
+def _env_run_leader_program(state: Dict[str, Any], program: str) -> Optional[Dict[str, float]]:
+    try:
+        compiled = _env_leader_compile_program(program)
+    except Exception:
+        return None
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    required = (
+        'share',
+        'noise',
+        'turns',
+        'rot_blend',
+        'rot_bias',
+        'anchor_mix',
+        'leader_mix',
+        'inertia',
+        'selfish_drive',
+        'advantage_score',
+        'altruism_signal',
+        'env_shift',
+    )
+    result: Dict[str, float] = {}
+    for key in required:
+        val = locals_dict.get(key)
+        if val is None:
+            return None
+        try:
+            result[key] = float(val)
+        except Exception:
+            return None
+    return result
+
+
+def _env_run_council_program(state: Dict[str, Any], program: str) -> Optional[Dict[str, float]]:
+    try:
+        compiled = _env_council_compile_program(program)
+    except Exception:
+        return None
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    required = (
+        'share',
+        'noise',
+        'turns',
+        'rot_blend',
+        'rot_bias',
+        'anchor_mix',
+        'leader_mix',
+        'inertia',
+        'selfish_drive',
+        'advantage_score',
+        'altruism_signal',
+        'env_shift',
+    )
+    result: Dict[str, float] = {}
+    for key in required:
+        val = locals_dict.get(key)
+        if val is None:
+            return None
+        try:
+            result[key] = float(val)
+        except Exception:
+            return None
+    if 'lazy_pressure' in locals_dict:
+        try:
+            result['lazy_pressure'] = float(locals_dict['lazy_pressure'])
+        except Exception:
+            return None
+    return result
 
 
 def _rl_default_meta() -> Dict[str, Any]:
@@ -538,13 +1351,22 @@ def _rl_weight_program_for(genome: 'Genome') -> str:
         template = _RL_WEIGHT_DSL_TEMPLATE
         genome.rl_weight_program_template = template
     coeffs = _ensure_rl_weight_coeffs(genome)
-    formatted = {}
-    for key, value in coeffs.items():
-        formatted[key] = repr(float(value))
+    signature = _dsl_coeff_signature(template, coeffs, _RL_WEIGHT_COEFF_DEFAULTS)
+    cache = getattr(genome, '_rl_weight_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {
+        key: repr(float(coeffs.get(key, _RL_WEIGHT_COEFF_DEFAULTS.get(key, 0.0))))
+        for key in _RL_WEIGHT_COEFF_DEFAULTS
+    }
     try:
         program = template.format(**formatted)
     except KeyError:
-        program = _RL_WEIGHT_DSL_TEMPLATE.format(**{k: repr(v) for k, v in _RL_WEIGHT_COEFF_DEFAULTS.items()})
+        template = _RL_WEIGHT_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _RL_WEIGHT_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _RL_WEIGHT_COEFF_DEFAULTS, _RL_WEIGHT_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+    genome._rl_weight_program_cache = (signature, program)
     return program
 
 
@@ -554,13 +1376,22 @@ def _rl_signal_program_for(genome: 'Genome') -> str:
         template = _RL_SIGNAL_DSL_TEMPLATE
         genome.rl_signal_program_template = template
     coeffs = _ensure_rl_signal_coeffs(genome)
-    formatted = {key: repr(float(value)) for key, value in coeffs.items()}
+    signature = _dsl_coeff_signature(template, coeffs, _RL_SIGNAL_COEFF_DEFAULTS)
+    cache = getattr(genome, '_rl_signal_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {
+        key: repr(float(coeffs.get(key, _RL_SIGNAL_COEFF_DEFAULTS.get(key, 0.0))))
+        for key in _RL_SIGNAL_COEFF_DEFAULTS
+    }
     try:
         program = template.format(**formatted)
     except KeyError:
-        program = _RL_SIGNAL_DSL_TEMPLATE.format(
-            **{k: repr(v) for k, v in _RL_SIGNAL_COEFF_DEFAULTS.items()}
-        )
+        template = _RL_SIGNAL_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _RL_SIGNAL_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _RL_SIGNAL_COEFF_DEFAULTS, _RL_SIGNAL_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+    genome._rl_signal_program_cache = (signature, program)
     return program
 
 
@@ -570,13 +1401,22 @@ def _rl_scheduler_program_for(genome: 'Genome') -> str:
         template = _RL_SCHED_DSL_TEMPLATE
         genome.rl_scheduler_program_template = template
     coeffs = _ensure_rl_scheduler_coeffs(genome)
-    formatted = {key: repr(float(value)) for key, value in coeffs.items()}
+    signature = _dsl_coeff_signature(template, coeffs, _RL_SCHED_COEFF_DEFAULTS)
+    cache = getattr(genome, '_rl_scheduler_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {
+        key: repr(float(coeffs.get(key, _RL_SCHED_COEFF_DEFAULTS.get(key, 0.0))))
+        for key in _RL_SCHED_COEFF_DEFAULTS
+    }
     try:
         program = template.format(**formatted)
     except KeyError:
-        program = _RL_SCHED_DSL_TEMPLATE.format(
-            **{k: repr(v) for k, v in _RL_SCHED_COEFF_DEFAULTS.items()}
-        )
+        template = _RL_SCHED_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _RL_SCHED_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _RL_SCHED_COEFF_DEFAULTS, _RL_SCHED_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+    genome._rl_scheduler_program_cache = (signature, program)
     return program
 
 
@@ -681,7 +1521,7 @@ def _rl_run_signal_program(state: Dict[str, Any], program: str) -> Optional[Dict
     except Exception:
         return None
     result: Dict[str, float] = {}
-    for key in ('altruism_target', 'solidarity', 'stress', 'lazy_share', 'advantage'):
+    for key in ('altruism_target', 'solidarity', 'stress', 'lazy_share', 'advantage', 'team_objective'):
         val = locals_dict.get(key, state.get(key))
         if val is None:
             return None
@@ -751,6 +1591,10 @@ def _monodromy_program_for(neat_inst: 'ReproPlanaNEATPlus') -> str:
     else:
         coeffs = _monodromy_sanitise_coeffs(coeffs)
         neat_inst.monodromy_program_coeffs = coeffs
+    signature = _dsl_coeff_signature(template, coeffs, _MONODROMY_COEFF_DEFAULTS)
+    cache = getattr(neat_inst, '_monodromy_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
     formatted = {}
     for key, default in _MONODROMY_COEFF_DEFAULTS.items():
         val = coeffs.get(key, default)
@@ -764,9 +1608,11 @@ def _monodromy_program_for(neat_inst: 'ReproPlanaNEATPlus') -> str:
     try:
         program = template.format(**formatted)
     except KeyError:
-        program = _MONODROMY_DSL_TEMPLATE.format(
-            **{k: repr(v) for k, v in _MONODROMY_COEFF_DEFAULTS.items()}
-        )
+        template = _MONODROMY_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _MONODROMY_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _MONODROMY_COEFF_DEFAULTS, _MONODROMY_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+    neat_inst._monodromy_program_cache = (signature, program)
     return program
 
 
@@ -855,6 +1701,7 @@ def _mutate_rl_weight_kernel(genome: 'Genome', rng: np.random.Generator) -> None
         current = float(np.clip(current + rng.normal(0.0, 0.18), -2.0, 3.0))
     coeffs[key] = current
     genome.rl_weight_coeffs = coeffs
+    setattr(genome, '_rl_weight_program_cache', None)
 
 
 def _mutate_rl_signal_kernel(genome: 'Genome', rng: np.random.Generator) -> None:
@@ -869,6 +1716,7 @@ def _mutate_rl_signal_kernel(genome: 'Genome', rng: np.random.Generator) -> None
         current = float(np.clip(current + rng.normal(0.0, 0.12), -0.5, 1.5))
     coeffs[key] = current
     genome.rl_signal_coeffs = coeffs
+    setattr(genome, '_rl_signal_program_cache', None)
 
 
 def _mutate_rl_scheduler_kernel(genome: 'Genome', rng: np.random.Generator) -> None:
@@ -883,6 +1731,7 @@ def _mutate_rl_scheduler_kernel(genome: 'Genome', rng: np.random.Generator) -> N
         current = float(np.clip(current + rng.normal(0.0, 0.12), -1.5, 1.5))
     coeffs[key] = current
     genome.rl_scheduler_coeffs = coeffs
+    setattr(genome, '_rl_scheduler_program_cache', None)
 
 
 def _rl_collective_signal(
@@ -915,6 +1764,19 @@ def _rl_collective_signal(
     team_trend = float(np.clip(meta.get('population_reward_trend_norm', 0.0), -1.0, 1.0))
     team_best = float(np.clip(meta.get('population_reward_best_norm', 0.0), 0.0, 1.0))
     team_pressure = float(max(0.0, meta.get('population_reward_pressure', 0.0)))
+    span_component = float(np.tanh((reward_span + reward_std) / denom)) if denom > 0 else 0.0
+    objective_default = float(
+        np.clip(
+            _RL_SIGNAL_COEFF_DEFAULTS['team_objective_bias']
+            + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_alignment'] * team_alignment
+            + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_trend'] * trend_norm
+            - _RL_SIGNAL_COEFF_DEFAULTS['team_objective_pressure'] * team_pressure
+            + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_best'] * team_best
+            + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_span'] * span_component,
+            -3.0,
+            3.0,
+        )
+    )
     done_ratio = 0.0
     if experiences:
         done_flags = [1.0 if bool(exp.get('done')) else 0.0 for exp in experiences]
@@ -939,6 +1801,7 @@ def _rl_collective_signal(
         'team_trend': team_trend,
         'team_best': team_best,
         'team_pressure': team_pressure,
+        'span_component': span_component,
     }
     signal = _rl_run_signal_program(state, program)
     if signal is None:
@@ -956,6 +1819,8 @@ def _rl_collective_signal(
             'group_reward_best': float(team_best),
             'group_reward_pressure': float(team_pressure),
             'group_reward_delta': float(meta.get('population_reward_delta', 0.0)),
+            'team_objective': objective_default,
+            'group_reward_objective': objective_default,
         }
     else:
         signal = {
@@ -969,11 +1834,17 @@ def _rl_collective_signal(
             'group_reward_best': float(np.clip(signal.get('group_reward_best', team_best), 0.0, 1.0)),
             'group_reward_pressure': float(max(0.0, signal.get('group_reward_pressure', team_pressure))),
             'group_reward_delta': float(signal.get('group_reward_delta', meta.get('population_reward_delta', 0.0))),
+            'team_objective': float(np.clip(signal.get('team_objective', objective_default), -3.0, 3.0)),
+            'group_reward_objective': float(np.clip(signal.get('team_objective', objective_default), -3.0, 3.0)),
         }
     if isinstance(meta, dict):
         meta['signal_kernel'] = dict(coeffs)
         meta['signal_program_requested'] = requested_program
         meta['signal_program'] = program
+        meta['team_objective'] = float(signal.get('team_objective', objective_default))
+        meta['group_reward_objective'] = float(
+            signal.get('group_reward_objective', signal.get('team_objective', objective_default))
+        )
     return signal
 
 
@@ -1690,6 +2561,9 @@ class Genome:
         self.rl_signal_program_template: str = _RL_SIGNAL_DSL_TEMPLATE
         self.rl_scheduler_coeffs: Dict[str, float] = dict(_RL_SCHED_COEFF_DEFAULTS)
         self.rl_scheduler_program_template: str = _RL_SCHED_DSL_TEMPLATE
+        self._rl_weight_program_cache: Optional[Tuple[Any, str]] = None
+        self._rl_signal_program_cache: Optional[Tuple[Any, str]] = None
+        self._rl_scheduler_program_cache: Optional[Tuple[Any, str]] = None
 
     def meta_reflect(self, event: str, payload: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
         info = dict(payload or {})
@@ -1785,6 +2659,9 @@ class Genome:
         g.rl_scheduler_coeffs = _rl_sanitise_scheduler_coeffs(sched_coeffs)
         sched_template = getattr(self, 'rl_scheduler_program_template', _RL_SCHED_DSL_TEMPLATE)
         g.rl_scheduler_program_template = sched_template if isinstance(sched_template, str) else _RL_SCHED_DSL_TEMPLATE
+        g._rl_weight_program_cache = None
+        g._rl_signal_program_cache = None
+        g._rl_scheduler_program_cache = None
         return g
 
     def invalidate_caches(self, structure: bool=False, weights: bool=False):
@@ -3602,6 +4479,7 @@ class ReproPlanaNEATPlus:
         self.monodromy_program_coeffs: Dict[str, float] = dict(_MONODROMY_COEFF_DEFAULTS)
         self._monodromy_program_source: Optional[str] = None
         self._monodromy_program_dirty: bool = True
+        self._monodromy_program_cache: Optional[Tuple[Any, str]] = None
         nodes = {}
         for i in range(num_inputs):
             nodes[i] = NodeGene(i, 'input', 'identity')
@@ -3950,6 +4828,20 @@ class ReproPlanaNEATPlus:
         best_norm = float(np.tanh(pop_best / (1.0 + pop_std + abs(pop_mean))))
         spread = float(np.tanh(float(np.std(reward_mean)) / (1.0 + abs(pop_mean) + pop_std))) if reward_mean.size else 0.0
         pressure = float(np.clip(max(0.0, -trend_norm) + 0.5 * max(0.0, 0.35 - alignment), 0.0, 2.0))
+        denom = max(1.0, abs(pop_mean) + pop_std)
+        span_component = float(np.tanh((pop_std + spread) / denom))
+        objective = float(
+            np.clip(
+                _RL_SIGNAL_COEFF_DEFAULTS['team_objective_bias']
+                + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_alignment'] * alignment
+                + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_trend'] * trend_norm
+                - _RL_SIGNAL_COEFF_DEFAULTS['team_objective_pressure'] * pressure
+                + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_best'] * best_norm
+                + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_span'] * span_component,
+                -3.0,
+                3.0,
+            )
+        )
         history = getattr(self, '_rl_collective_history', None)
         prev_delta = 0.0
         if isinstance(history, deque) and history:
@@ -3967,6 +4859,7 @@ class ReproPlanaNEATPlus:
             'spread': spread,
             'pressure': pressure,
             'delta_mean': prev_delta,
+            'objective': objective,
         }
         if isinstance(history, deque):
             history.append(snapshot)
@@ -3981,6 +4874,7 @@ class ReproPlanaNEATPlus:
             meta['population_reward_pressure'] = pressure
             meta['population_reward_spread'] = spread
             meta['population_reward_delta'] = prev_delta
+            meta['population_reward_objective'] = objective
         self._rl_collective_objective = snapshot
         controller = getattr(self, 'spinor_controller', None)
         if controller is not None and hasattr(controller, 'update_rl_objective'):
@@ -5030,6 +5924,7 @@ class ReproPlanaNEATPlus:
         ]
         templates = [tpl for tpl in templates if isinstance(tpl, str) and tpl.strip()]
         child.rl_weight_program_template = templates[0] if templates else _RL_WEIGHT_DSL_TEMPLATE
+        child._rl_weight_program_cache = None
         sig_m = _rl_sanitise_signal_coeffs(getattr(mother, 'rl_signal_coeffs', None) if mother is not None else None)
         sig_f = _rl_sanitise_signal_coeffs(getattr(father, 'rl_signal_coeffs', None) if father is not None else None)
         sig_mix: Dict[str, float] = {}
@@ -5045,6 +5940,7 @@ class ReproPlanaNEATPlus:
         ]
         sig_templates = [tpl for tpl in sig_templates if isinstance(tpl, str) and tpl.strip()]
         child.rl_signal_program_template = sig_templates[0] if sig_templates else _RL_SIGNAL_DSL_TEMPLATE
+        child._rl_signal_program_cache = None
         sched_m = _rl_sanitise_scheduler_coeffs(getattr(mother, 'rl_scheduler_coeffs', None) if mother is not None else None)
         sched_f = _rl_sanitise_scheduler_coeffs(getattr(father, 'rl_scheduler_coeffs', None) if father is not None else None)
         sched_mix: Dict[str, float] = {}
@@ -5060,6 +5956,7 @@ class ReproPlanaNEATPlus:
         ]
         sched_templates = [tpl for tpl in sched_templates if isinstance(tpl, str) and tpl.strip()]
         child.rl_scheduler_program_template = sched_templates[0] if sched_templates else _RL_SCHED_DSL_TEMPLATE
+        child._rl_scheduler_program_cache = None
         limit = int(getattr(child, 'rl_memory_limit', _DEFAULT_RL_MEMORY_LIMIT))
         child.rl_memory_limit = limit
         merged = deque(maxlen=limit)
@@ -12138,6 +13035,9 @@ class NomologyEnv:
     _noise_counter: float = field(default=0.0, init=False, repr=False)
     _last_weaver_error: Optional[str] = field(default=None, init=False, repr=False)
     diversity_signal: Dict[str, float] = field(default_factory=dict)
+    rl_objective: Dict[str, float] = field(default_factory=dict)
+    rl_mode: bool = False
+    last_reward_objective: float = 0.0
 
     def __post_init__(self) -> None:
         self._rng = np.random.default_rng(self.seed)
@@ -12187,6 +13087,64 @@ class NomologyEnv:
             'drift_scale': float(self.drift_scale),
         }
 
+    def register_rl_objective(self, snapshot: Dict[str, Any]) -> None:
+        if not isinstance(snapshot, dict):
+            self.rl_objective = {}
+            self.rl_mode = False
+            self.last_reward_objective = 0.0
+            return
+        payload: Dict[str, float] = {}
+        for key, val in snapshot.items():
+            if key == 'generation':
+                try:
+                    payload['generation'] = float(int(val))
+                except Exception:
+                    continue
+            elif isinstance(val, (int, float)):
+                try:
+                    payload[key] = float(val)
+                except Exception:
+                    continue
+        self.rl_objective = payload
+        self.rl_mode = bool(payload)
+        alignment = float(np.clip(payload.get('alignment', 0.0), -1.0, 1.0))
+        pressure = float(np.clip(payload.get('pressure', 0.0), 0.0, 4.0))
+        trend = float(np.clip(payload.get('trend_norm', 0.0), -1.0, 1.0))
+        best_norm = float(np.clip(payload.get('best_norm', 0.0), 0.0, 1.0))
+        spread = float(np.clip(payload.get('spread', 0.0), 0.0, 3.0))
+        span = float(np.clip(payload.get('delta_mean', 0.0), -3.0, 3.0))
+        objective = float(
+            np.clip(
+                payload.get(
+                    'objective',
+                    payload.get(
+                        'team_objective',
+                        _RL_SIGNAL_COEFF_DEFAULTS['team_objective_bias']
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_alignment'] * alignment
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_trend'] * trend
+                        - _RL_SIGNAL_COEFF_DEFAULTS['team_objective_pressure'] * pressure
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_best'] * best_norm
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_span'] * float(np.tanh(abs(span))),
+                    ),
+                ),
+                -3.0,
+                3.0,
+            )
+        )
+        self.last_reward_objective = objective
+        intensity_gain = float(np.clip(0.9 + 0.25 * pressure - 0.12 * objective, 0.6, 1.25))
+        self.intensity = float(np.clip(self.intensity * intensity_gain + 0.05 * max(0.0, -alignment), 0.05, 1.2))
+        jitter_gain = float(np.clip(0.96 + 0.08 * spread + 0.05 * pressure, 0.8, 1.4))
+        self.noise_jitter = float(np.clip(self.noise_jitter * jitter_gain, 0.001, 0.08))
+        noise_gain = float(np.clip(0.95 + 0.02 * pressure - 0.03 * objective, 0.75, 1.2))
+        self.noise = float(np.clip(self.noise * noise_gain + 0.005 * max(0.0, pressure), self.noise_min, self.noise_max))
+        profile = getattr(self, 'noise_profile', None)
+        if isinstance(profile, dict):
+            profile['reward_objective'] = objective
+            profile['reward_pressure'] = pressure
+            profile['reward_alignment'] = alignment
+            profile['reward_spread'] = spread
+
     def register_diversity(self, snapshot: Dict[str, float]) -> None:
         if not isinstance(snapshot, dict):
             return
@@ -12208,6 +13166,22 @@ class NomologyEnv:
         profile.setdefault('band_label', kind)
         profile.setdefault('cycle_phase', 0.0)
         profile['jitter'] = float(profile.get('jitter', 0.0) + jitter_extra)
+        if self.rl_mode:
+            reward_obj = float(self.last_reward_objective)
+            objective_pressure = float(np.clip(self.rl_objective.get('pressure', 0.0), 0.0, 4.0))
+            objective_alignment = float(np.clip(self.rl_objective.get('alignment', 0.0), -1.0, 1.0))
+            std = float(
+                np.clip(
+                    std * (1.0 + 0.05 * objective_pressure - 0.04 * reward_obj)
+                    + 0.01 * max(0.0, -objective_alignment),
+                    self.noise_min,
+                    self.noise_max,
+                )
+            )
+            profile['reward_objective'] = reward_obj
+            profile['reward_pressure'] = objective_pressure
+            profile['reward_alignment'] = objective_alignment
+            profile['rl_mode'] = True
         weaver = getattr(self, 'noise_weaver', None)
         if weaver is not None:
             weaver_ctx = self._noise_ctx(surge)
@@ -12380,11 +13354,12 @@ class SelfReproducingEvaluator:
     rl_mode: bool = field(default=False, init=False)
     _rl_objective: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _rl_objective_generation: int = field(default=-1, init=False, repr=False)
-    _rl_feature_dim: int = field(default=8, init=False, repr=False)
+    _rl_feature_dim: int = field(default=9, init=False, repr=False)
     last_reward_alignment: float = field(default=0.0, init=False, repr=False)
     last_reward_trend: float = field(default=0.0, init=False, repr=False)
     last_reward_pressure: float = field(default=0.0, init=False, repr=False)
     last_reward_mean: float = field(default=0.0, init=False, repr=False)
+    last_reward_objective: float = field(default=0.0, init=False, repr=False)
     lazy_feedback_smoothing: float = 0.35
     lazy_feedback_decay: float = 0.25
     _lazy_feedback: Dict[str, Any] = field(
@@ -12397,6 +13372,20 @@ class SelfReproducingEvaluator:
         init=False,
         repr=False,
     )
+    env_leader_program_template: str = field(default=_ENV_LEADER_DSL_TEMPLATE, init=False)
+    env_council_program_template: str = field(default=_ENV_COUNCIL_DSL_TEMPLATE, init=False)
+    env_leader_program_coeffs: Dict[str, float] = field(
+        default_factory=lambda: dict(_ENV_LEADER_COEFF_DEFAULTS),
+        init=False,
+        repr=False,
+    )
+    env_council_program_coeffs: Dict[str, float] = field(
+        default_factory=lambda: dict(_ENV_COUNCIL_COEFF_DEFAULTS),
+        init=False,
+        repr=False,
+    )
+    _env_leader_program_cache: Optional[Tuple[Any, str]] = field(default=None, init=False, repr=False)
+    _env_council_program_cache: Optional[Tuple[Any, str]] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.rng is not None:
@@ -12503,6 +13492,8 @@ class SelfReproducingEvaluator:
         delta_norm = float(np.tanh(delta / denom))
         pressure_norm = float(np.clip(pressure / 2.0, 0.0, 1.5))
         spread_norm = float(np.clip(spread / 2.0, 0.0, 1.5))
+        objective_val = float(np.clip(rl_obj.get('objective', rl_obj.get('team_objective', 0.0)), -3.0, 3.0))
+        objective_norm = float(np.clip(objective_val / 3.0, -1.0, 1.0))
         rl_features = [
             align,
             trend,
@@ -12512,6 +13503,7 @@ class SelfReproducingEvaluator:
             mean_norm,
             rl_recency,
             spread_norm,
+            objective_norm,
         ]
         rl_len = getattr(self, '_rl_feature_dim', len(rl_features))
         if len(rl_features) < rl_len:
@@ -12608,6 +13600,16 @@ class SelfReproducingEvaluator:
                 self._rl_objective = {}
                 self._rl_objective_generation = -1
                 self.rl_mode = False
+                self.last_reward_alignment = 0.0
+                self.last_reward_trend = 0.0
+                self.last_reward_pressure = 0.0
+                self.last_reward_mean = 0.0
+                self.last_reward_objective = 0.0
+            if hasattr(self.base_env, 'register_rl_objective'):
+                try:
+                    self.base_env.register_rl_objective({})
+                except Exception:
+                    pass
             return
         merged: Dict[str, Any] = dict(getattr(self, '_rl_objective', {}))
         for key, val in payload.items():
@@ -12624,6 +13626,16 @@ class SelfReproducingEvaluator:
         self._rl_objective = merged
         self._rl_objective_generation = int(merged.get('generation', getattr(self, '_rl_objective_generation', -1)))
         self.rl_mode = bool(self._rl_objective)
+        self.last_reward_alignment = float(merged.get('alignment', 0.0))
+        self.last_reward_trend = float(merged.get('trend_norm', 0.0))
+        self.last_reward_pressure = float(max(0.0, merged.get('pressure', 0.0)))
+        self.last_reward_mean = float(merged.get('mean', self.last_reward_mean))
+        self.last_reward_objective = float(np.clip(merged.get('objective', merged.get('team_objective', 0.0)), -3.0, 3.0))
+        if hasattr(self.base_env, 'register_rl_objective'):
+            try:
+                self.base_env.register_rl_objective(merged)
+            except Exception:
+                pass
 
     def _record_resilience(self, err: BaseException, generation: int) -> str:
         label = f'{type(err).__name__}@{generation}'
@@ -12672,44 +13684,79 @@ class SelfReproducingEvaluator:
         spread = float(np.clip(div_state.get('structural_spread', 0.0), 0.0, 4.0))
         entropy_norm = float(max(0.0, div_state.get('entropy_norm', div_state.get('entropy', 0.0))))
         entropy_raw = float(max(0.0, div_state.get('entropy', entropy_norm)))
-        share *= float(np.clip(1.0 - 0.25 * scarcity, 0.2, 1.0))
+        rl_obj = getattr(self, '_rl_objective', {}) or {}
+        reward_alignment = float(np.clip(rl_obj.get('alignment', rl_obj.get('population_reward_alignment', 0.0)), -1.0, 1.0))
+        reward_trend = float(np.clip(rl_obj.get('trend_norm', rl_obj.get('population_reward_trend_norm', 0.0)), -1.0, 1.0))
+        reward_best = float(np.clip(rl_obj.get('best_norm', rl_obj.get('population_reward_best_norm', 0.0)), 0.0, 1.0))
+        reward_pressure = float(np.clip(rl_obj.get('pressure', rl_obj.get('population_reward_pressure', 0.0)), 0.0, 3.0))
+        reward_spread = float(np.clip(rl_obj.get('spread', rl_obj.get('population_reward_spread', 0.0)), 0.0, 2.5))
+        reward_objective = float(
+            np.clip(
+                rl_obj.get(
+                    'objective',
+                    rl_obj.get(
+                        'team_objective',
+                        _RL_SIGNAL_COEFF_DEFAULTS['team_objective_bias']
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_alignment'] * reward_alignment
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_trend'] * reward_trend
+                        - _RL_SIGNAL_COEFF_DEFAULTS['team_objective_pressure'] * reward_pressure
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_best'] * reward_best
+                        + _RL_SIGNAL_COEFF_DEFAULTS['team_objective_span'] * float(np.tanh(reward_spread)),
+                    ),
+                ),
+                -3.0,
+                3.0,
+            )
+        )
+        reward_drive = float(np.clip(reward_pressure + max(0.0, -reward_trend), 0.0, 4.0))
+        exploration_gain = float(np.clip(1.0 + 0.25 * reward_pressure + 0.18 * reward_spread - 0.15 * reward_objective, 0.6, 2.4))
+        exploitation_gain = float(np.clip(1.0 + 0.32 * reward_objective - 0.2 * reward_pressure, 0.5, 1.8))
         prev_noise = float(getattr(env, 'noise', 0.05))
         prev_turns = float(getattr(env, 'turns', 1.6))
         prev_rot = float(getattr(env, 'rot_bias', 0.0))
         scale_noise, scale_turns, scale_rot = self.output_scale
-        scale_noise *= float(1.0 + 0.35 * scarcity)
-        scale_turns *= float(1.0 + 0.2 * spread)
-        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy_norm))
-        mod_out0 = float(out[0] * (1.0 - 0.35 * share) + anchor * 0.35)
-        mod_out1 = float(out[1] * (1.0 - 0.3 * share) + (anchor + gap * 0.5) * 0.3)
-        mod_out2 = float(out[2] * (1.0 - 0.3 * share) + gap * 0.6)
-        target_noise = float(np.clip(0.05 + scale_noise * mod_out0, 0.0, 0.25))
-        target_turns = float(np.clip(1.6 + scale_turns * mod_out1, 0.6, 3.2))
-        rot_target = prev_rot + scale_rot * mod_out2
-        anchor_noise = float(np.clip(0.05 + scale_noise * anchor, 0.0, 0.25))
-        anchor_turns = float(np.clip(1.6 + scale_turns * (anchor + gap * 0.25), 0.6, 3.2))
-        rot_anchor = prev_rot + scale_rot * (anchor * 0.4 + gap * 0.6)
-        inertia = float(np.clip(0.25 + 0.5 * share + 0.25 * stasis, 0.0, 0.9))
-        inertia *= float(np.clip(1.0 - 0.4 * scarcity + 0.15 * spread, 0.2, 1.05))
-        slip = max(0.0, 1.0 - inertia)
-        anchor_mix = slip * 0.5 * stasis
-        leader_mix = slip - anchor_mix
-        env.noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
-        env.turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
-        rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
-        env.rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+        scale_noise *= float(1.0 + 0.35 * scarcity) * exploration_gain
+        scale_turns *= float(1.0 + 0.2 * spread) * float(np.clip(0.85 + 0.2 * reward_spread, 0.5, 2.2))
+        scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy_norm)) * exploitation_gain
+        leader_state = {
+            'share': float(share),
+            'stasis': float(stasis),
+            'anchor': float(anchor),
+            'gap': float(gap),
+            'scarcity': float(scarcity),
+            'spread': float(spread),
+            'reward_pressure': float(reward_pressure),
+            'reward_objective': float(reward_objective),
+            'scale_noise': float(scale_noise),
+            'scale_turns': float(scale_turns),
+            'scale_rot': float(scale_rot),
+            'output0': float(out[0]),
+            'output1': float(out[1]),
+            'output2': float(out[2]),
+            'prev_noise': prev_noise,
+            'prev_turns': prev_turns,
+            'prev_rot': prev_rot,
+            'reward_trend': float(reward_trend),
+            'reward_alignment': float(reward_alignment),
+            'reward_spread': float(reward_spread),
+            'reward_drive': float(reward_drive),
+        }
+        program = _env_leader_program_for(self)
+        result = _env_run_leader_program(dict(leader_state), program)
+        if result is None:
+            result = _env_leader_python(dict(leader_state))
+        share = float(result['share'])
+        env.noise = float(np.clip(result['noise'], 0.0, 0.25))
+        env.turns = float(np.clip(result['turns'], 0.6, 3.2))
+        env.rot_bias = float(result['rot_bias'])
         env.lazy_share = float(share)
         env.lazy_anchor = float(anchor)
         env.lazy_gap = float(gap)
         env.lazy_stasis = float(stasis)
-        env_shift = (
-            abs(env.noise - prev_noise) * 4.0
-            + abs(env.turns - prev_turns)
-            + 0.5 * abs(rot_blend - prev_rot)
-        )
-        selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - share))
-        advantage_score = float(np.clip(selfish_drive * (max(0.0, gap) + 0.35 * scarcity) * (0.5 + env_shift), 0.0, 3.0))
-        altruism_signal = float(np.clip(1.0 - min(1.0, advantage_score), 0.0, 1.0))
+        env_shift = float(result['env_shift'])
+        selfish_drive = float(result['selfish_drive'])
+        advantage_score = float(np.clip(result['advantage_score'], 0.0, 3.5))
+        altruism_signal = float(np.clip(result['altruism_signal'], 0.0, 1.0))
         self.last_advantage_score = advantage_score
         self.last_leader_id = leader.id
         self.last_leader_council = (leader.id,)
@@ -12717,6 +13764,11 @@ class SelfReproducingEvaluator:
         self.last_altruism_signal = altruism_signal
         self.last_selfish_drive = selfish_drive
         self.last_env_shift = env_shift
+        self.last_reward_alignment = reward_alignment
+        self.last_reward_trend = reward_trend
+        self.last_reward_pressure = reward_pressure
+        self.last_reward_mean = float(rl_obj.get('mean', self.last_reward_mean))
+        self.last_reward_objective = reward_objective
         try:
             summary = self._mutate_child(leader, bundle, feats, out, generation)
         except Exception as mutate_err:
@@ -12748,6 +13800,8 @@ class SelfReproducingEvaluator:
             summary = f'{summary} | gap {gap:+.2f}'
         if advantage_score > 0.05:
             summary = f'{summary} | adv {advantage_score:.2f}'
+        if reward_pressure > 0.0 or abs(reward_objective) > 0.05:
+            summary = f'{summary} | reward {reward_objective:+.2f}/{reward_pressure:.2f}'
         self.last_event = summary
         return {
             'genome_id': leader.id,
@@ -12883,80 +13937,51 @@ class SelfReproducingEvaluator:
         scale_noise *= float(1.0 + 0.35 * scarcity + 0.55 * lazy_pressure + 0.25 * reward_drive + 0.15 * abs(reward_alignment) * rl_recency)
         scale_turns *= float(1.0 + 0.2 * spread + 0.4 * lazy_pressure + 0.2 * reward_focus + 0.12 * abs(reward_delta_norm))
         scale_rot *= float(1.0 + 0.15 * max(0.0, 0.5 - entropy_norm) + 0.35 * lazy_pressure + 0.2 * reward_drive + 0.1 * reward_spread * rl_recency)
-        anchor_pull = float(np.clip(0.35 + 0.25 * lazy_pressure + 0.15 * reward_focus, 0.0, 0.9))
-        gap_pull = float(np.clip(0.45 + 0.25 * lazy_pressure + 0.2 * reward_drive, 0.0, 0.95))
-        mod_out0 = float(consensus[0] * (1.0 - anchor_pull) + anchor * anchor_pull + reward_alignment * 0.2 * rl_recency)
-        mod_out1 = float(
-            consensus[1] * (1.0 - anchor_pull)
-            + (anchor + gap * 0.5) * anchor_pull
-            + reward_mean_norm * 0.3 * rl_recency
-        )
-        mod_out2 = float(consensus[2] * (1.0 - gap_pull) + gap * gap_pull + reward_delta_norm * 0.35 * rl_recency)
-        target_noise = float(np.clip(0.05 + scale_noise * mod_out0, 0.0, 0.25))
-        target_turns = float(np.clip(1.6 + scale_turns * mod_out1, 0.6, 3.2))
-        rot_target = prev_rot + scale_rot * mod_out2
-        anchor_noise = float(
-            np.clip(0.05 + scale_noise * (anchor + 0.2 * lazy_pressure + 0.1 * reward_alignment * rl_recency), 0.0, 0.25)
-        )
-        anchor_turns = float(
-            np.clip(
-                1.6 + scale_turns * (anchor + gap * 0.25 + 0.15 * lazy_pressure + 0.2 * reward_mean_norm * rl_recency),
-                0.6,
-                3.2,
-            )
-        )
-        rot_anchor = prev_rot + scale_rot * (
-            anchor * 0.4 + gap * 0.6 + 0.2 * lazy_pressure + 0.25 * reward_delta_norm * rl_recency
-        )
-        inertia = float(np.clip(0.25 + 0.6 * share + 0.25 * stasis + 0.15 * reward_focus, 0.0, 0.92))
-        inertia *= float(
-            np.clip(
-                1.0 - 0.35 * scarcity + 0.25 * spread + 0.15 * lazy_pressure + 0.15 * reward_focus - 0.1 * reward_drive,
-                0.2,
-                1.1,
-            )
-        )
-        slip = max(0.0, 1.0 - inertia)
-        anchor_ratio = float(np.clip(0.3 + 0.4 * stasis + 0.3 * lazy_pressure + 0.2 * reward_focus - 0.15 * reward_drive, 0.0, 0.95))
-        anchor_mix = min(slip, slip * anchor_ratio)
-        leader_mix = slip - anchor_mix
-        env.noise = float(np.clip(prev_noise * inertia + target_noise * leader_mix + anchor_noise * anchor_mix, 0.0, 0.25))
-        env.turns = float(np.clip(prev_turns * inertia + target_turns * leader_mix + anchor_turns * anchor_mix, 0.6, 3.2))
-        rot_blend = prev_rot * inertia + rot_target * leader_mix + rot_anchor * anchor_mix
-        env.rot_bias = float(((rot_blend) + math.pi) % (2.0 * math.pi) - math.pi)
+        council_state = {
+            'share': float(share),
+            'stasis': float(stasis),
+            'anchor': float(anchor),
+            'gap': float(gap),
+            'scarcity': float(scarcity),
+            'spread': float(spread),
+            'lazy_pressure': float(lazy_pressure),
+            'reward_alignment': float(reward_alignment),
+            'reward_mean_norm': float(reward_mean_norm),
+            'reward_delta_norm': float(reward_delta_norm),
+            'reward_focus': float(reward_focus),
+            'reward_drive': float(reward_drive),
+            'reward_pressure_norm': float(reward_pressure_norm),
+            'rl_recency': float(rl_recency),
+            'dispersion': float(dispersion),
+            'prev_noise': prev_noise,
+            'prev_turns': prev_turns,
+            'prev_rot': prev_rot,
+            'scale_noise': float(scale_noise),
+            'scale_turns': float(scale_turns),
+            'scale_rot': float(scale_rot),
+            'consensus0': float(consensus[0]),
+            'consensus1': float(consensus[1]),
+            'consensus2': float(consensus[2]),
+            'reward_spread': float(reward_spread),
+            'entropy_norm': float(entropy_norm),
+        }
+        program = _env_council_program_for(self)
+        council_result = _env_run_council_program(dict(council_state), program)
+        if council_result is None:
+            council_result = _env_council_python(dict(council_state))
+        share = float(council_result['share'])
+        lazy_pressure = float(council_result.get('lazy_pressure', lazy_pressure))
+        env.noise = float(np.clip(council_result['noise'], 0.0, 0.25))
+        env.turns = float(np.clip(council_result['turns'], 0.6, 3.2))
+        env.rot_bias = float(council_result['rot_bias'])
         env.lazy_share = float(share)
         env.lazy_anchor = float(anchor)
         env.lazy_gap = float(gap)
         env.lazy_stasis = float(stasis)
-        env_shift = (
-            abs(env.noise - prev_noise) * 4.0
-            + abs(env.turns - prev_turns)
-            + 0.5 * abs(rot_blend - prev_rot)
-            + dispersion
-            + 1.2 * lazy_pressure
-            + 0.8 * reward_drive
-            + 0.6 * abs(reward_delta_norm)
-        )
-        selfish_drive = float(max(0.0, leader_mix - anchor_mix) * (1.0 - 0.6 * share) + 0.25 * reward_drive)
-        advantage_score = float(
-            np.clip(
-                selfish_drive
-                * (max(0.0, gap) + 0.35 * scarcity + 0.25 * lazy_pressure + 0.3 * reward_focus)
-                * (0.5 + env_shift + 0.7 * reward_drive),
-                0.0,
-                3.5,
-            )
-        )
-        altruism_signal = float(
-            np.clip(
-                1.0
-                - min(1.0, advantage_score)
-                + 0.15 * reward_alignment * rl_recency
-                - 0.1 * reward_pressure_norm,
-                0.0,
-                1.0,
-            )
-        )
+        env_shift = float(council_result['env_shift'])
+        selfish_drive = float(council_result['selfish_drive'])
+        advantage_score = float(np.clip(council_result['advantage_score'], 0.0, 3.5))
+        altruism_signal = float(np.clip(council_result['altruism_signal'], 0.0, 1.0))
         resilience_flag = ''
         if resilience_marks:
             uniq = list(dict.fromkeys(resilience_marks))
@@ -13265,7 +14290,7 @@ class SpinorNomologyDatasetController:
         self.mandatory_mode = bool(mandatory_mode)
         embed_dim = self.spin.group.embed_dim if self.spin.group else 0
         self._context_dim = 7
-        self._rl_feature_dim = 8
+        self._rl_feature_dim = 9
         self.feature_dim = 5 + embed_dim + self._context_dim
         self.evaluator_feature_dim = 12 + embed_dim + self._rl_feature_dim
         self.last_bundle: Optional[Tuple[float, int, Optional[int], Optional[np.ndarray], Optional[np.ndarray], float]] = None
@@ -13436,11 +14461,22 @@ class SpinorNomologyDatasetController:
     def update_rl_objective(self, generation: int, snapshot: Dict[str, Any]) -> None:
         if not isinstance(snapshot, dict):
             self._rl_objective = {'generation': -1}
+            self.rl_mode = False
             if self.evaluator is not None and hasattr(self.evaluator, 'update_rl_objective'):
                 try:
                     self.evaluator.update_rl_objective({})
                 except Exception:
                     pass
+            if hasattr(self.env, 'register_rl_objective'):
+                try:
+                    self.env.register_rl_objective({})
+                except Exception:
+                    pass
+            self.last_reward_alignment = 0.0
+            self.last_reward_trend = 0.0
+            self.last_reward_pressure = 0.0
+            self.last_reward_mean = 0.0
+            self.last_reward_objective = 0.0
             return
         payload: Dict[str, Any] = {'generation': int(generation)}
         keys = (
@@ -13453,15 +14489,29 @@ class SpinorNomologyDatasetController:
             'mean',
             'best',
             'std',
+            'objective',
         )
         for key in keys:
             val = snapshot.get(key)
             if isinstance(val, (int, float)):
                 payload[key] = float(val)
         self._rl_objective = payload
+        self.rl_mode = bool(payload)
+        self.last_reward_alignment = float(payload.get('alignment', self.last_reward_alignment))
+        self.last_reward_trend = float(payload.get('trend_norm', self.last_reward_trend))
+        self.last_reward_pressure = float(max(0.0, payload.get('pressure', self.last_reward_pressure)))
+        self.last_reward_mean = float(payload.get('mean', self.last_reward_mean))
+        self.last_reward_objective = float(
+            np.clip(payload.get('objective', payload.get('team_objective', self.last_reward_objective)), -3.0, 3.0)
+        )
         if self.evaluator is not None and hasattr(self.evaluator, 'update_rl_objective'):
             try:
                 self.evaluator.update_rl_objective(payload)
+            except Exception:
+                pass
+        if hasattr(self.env, 'register_rl_objective'):
+            try:
+                self.env.register_rl_objective(payload)
             except Exception:
                 pass
 
