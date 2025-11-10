@@ -16,6 +16,16 @@
 # • Tunable: tweak council weights, lazy pressure, or mandatory policies inline and re-run instantly.
 #   調整容易: 合議制ウェイトや怠惰個体圧、mandatory ポリシーをその場で書き換えすぐ検証できます。
 #
+# Reinforcement learning & DSL accelerations / RL 強化と DSL 高速化
+# • Meta-RL: genomes evolve learning rates, discount factors, entropy pushes, replay limits,
+#   and cooperative retirement heuristics that react to team-wide reward telemetry.
+#   メタ RL: ゲノムが学習率・割引率・エントロピー押し・リプレイ上限・協調的リタイア判定を
+#   集団全体の報酬テレメトリに連動させて進化させます。
+# • Replay DSL: cpp 風 DSL で優先度付き経験リプレイや集団利他シグナル、スケジューラを
+#   一度コンパイルして NumPy で高速評価します。
+#   リプレイ DSL: cpp ライクな DSL で優先度付きリプレイ／利他シグナル／スケジューラを
+#   事前コンパイルし NumPy と共に実行して高速化します。
+#
 # Systems overview / システム概要
 # 1. Genome & caches / ゲノムとキャッシュ
 #    • `NodeGene` / `ConnectionGene` / `Genome` encode graph-structured policies with
@@ -159,6 +169,8 @@ _RL_MEMORY_LIMIT_MIN = 128
 _RL_MEMORY_LIMIT_MAX = 16384
 _RL_META_ALPHA = 0.3
 _RL_META_VAR_ALPHA = 0.18
+_RL_SUCCESS_ARCHIVE_LIMIT = 512
+_RL_SUCCESS_ALPHA = 0.3
 
 _RL_WEIGHT_COEFF_DEFAULTS: Dict[str, float] = {
     'novel_bias': 0.5,
@@ -167,6 +179,8 @@ _RL_WEIGHT_COEFF_DEFAULTS: Dict[str, float] = {
     'recency_scale': 1.0,
     'entropy_gain': 0.05,
     'stability_gain': 0.1,
+    'advantage_gain': 0.45,
+    'success_gain': 0.2,
 }
 
 _RL_WEIGHT_DSL_TEMPLATE = """
@@ -177,6 +191,8 @@ weights += priority * {priority_gain};
 weights += recency_gain * recency * {recency_scale};
 weights += entropy * {entropy_gain};
 weights += (1.0 - stability) * {stability_gain};
+weights += advantage * {advantage_gain};
+weights += success_rate * {success_gain};
 weights = clamp(weights, 1e-8, None);
 """
 
@@ -188,16 +204,19 @@ _RL_SIGNAL_COEFF_DEFAULTS: Dict[str, float] = {
     'stress_trend': 0.2,
     'stress_done': 0.15,
     'stress_team': 0.25,
+    'stress_success': 0.3,
     'altruism_base': 0.4,
     'altruism_stability': 0.4,
     'altruism_relief': 0.2,
     'altruism_novelty': 0.15,
     'altruism_team': 0.25,
+    'altruism_success': 0.25,
     'solidarity_base': 0.3,
     'solidarity_stability': 0.4,
     'solidarity_lazy': 0.15,
     'solidarity_done_relief': 0.15,
     'solidarity_team': 0.2,
+    'solidarity_success': 0.2,
     'advantage_base': 0.45,
     'advantage_trend': 0.35,
     'advantage_span': 0.25,
@@ -210,6 +229,7 @@ _RL_SIGNAL_COEFF_DEFAULTS: Dict[str, float] = {
     'team_objective_pressure': 0.5,
     'team_objective_best': 0.26,
     'team_objective_span': 0.22,
+    'team_objective_success': 0.25,
 }
 
 _RL_SIGNAL_DSL_TEMPLATE = """
@@ -219,7 +239,8 @@ stress = clamp(
     + {stress_instability} * (1.0 - stability)
     + {stress_trend} * abs(trend_norm)
     + {stress_done} * done_ratio
-    + {stress_team} * team_pressure,
+    + {stress_team} * team_pressure
+    - {stress_success} * success_rate,
     0.0,
     1.0
 );
@@ -228,7 +249,8 @@ altruism_target = clamp(
     + {altruism_stability} * stability
     + {altruism_relief} * (1.0 - stress)
     + {altruism_novelty} * novelty_scale
-    + {altruism_team} * team_alignment,
+    + {altruism_team} * team_alignment
+    + {altruism_success} * success_rate,
     0.0,
     1.0
 );
@@ -237,7 +259,8 @@ solidarity = clamp(
     + {solidarity_stability} * stability
     + {solidarity_lazy} * lazy_share
     + {solidarity_done_relief} * (1.0 - done_ratio)
-    + {solidarity_team} * team_alignment,
+    + {solidarity_team} * team_alignment
+    + {solidarity_success} * success_rate,
     0.0,
     1.0
 );
@@ -258,7 +281,8 @@ team_objective = clamp(
     + {team_objective_trend} * trend_norm
     - {team_objective_pressure} * team_pressure
     + {team_objective_best} * team_best
-    + {team_objective_span} * span_component,
+    + {team_objective_span} * span_component
+    + {team_objective_success} * success_rate,
     -3.0,
     3.0
 );
@@ -273,18 +297,21 @@ _RL_SCHED_COEFF_DEFAULTS: Dict[str, float] = {
     'entropy_novelty': 0.25,
     'entropy_team': 0.18,
     'entropy_span': 0.12,
+    'entropy_success': 0.2,
     'lr_bias': 0.0,
     'lr_norm_gain': 0.55,
     'lr_instability': 0.25,
     'lr_memory': -0.35,
     'lr_team': 0.18,
     'lr_span': 0.1,
+    'lr_success': 0.25,
     'gamma_bias': 0.0,
     'gamma_norm_gain': 0.12,
     'gamma_stability': 0.08,
     'gamma_novelty': 0.18,
     'gamma_team': 0.1,
     'gamma_span': 0.05,
+    'gamma_success': 0.15,
 }
 
 _RL_SCHED_DSL_TEMPLATE = """
@@ -297,6 +324,7 @@ entropy = clamp(
     + {entropy_instability} * instability
     + {entropy_novelty} * novelty_scale
     + {entropy_team} * team_alignment
+    + {entropy_success} * success_rate
     + {entropy_span} * reward_span_norm,
     1e-5,
     0.5
@@ -307,6 +335,7 @@ lr = clamp(
     + {lr_instability} * instability
     + {lr_memory} * (1.0 - memory_util)
     + {lr_team} * team_alignment
+    + {lr_success} * success_rate
     + {lr_span} * reward_span_norm,
     1e-5,
     0.2
@@ -318,6 +347,7 @@ gamma = clamp(
     + {gamma_stability} * stability
     + {gamma_novelty} * novelty_scale
     + {gamma_team} * team_alignment
+    + {gamma_success} * success_rate
     + {gamma_span} * reward_span_norm,
     0.4,
     0.9995
@@ -1203,6 +1233,11 @@ def _rl_default_meta() -> Dict[str, Any]:
         'entropy_push': 0.0,
         'lr_push': 0.0,
         'gamma_push': 0.0,
+        'success_rate': 0.0,
+        'success_window': 0.0,
+        'advantage_ema': 0.0,
+        'advantage_span': 0.0,
+        'advantage_peak': 0.0,
     }
 
 
@@ -1244,9 +1279,16 @@ def _rl_merge_meta(meta_a: Optional[Dict[str, Any]], meta_b: Optional[Dict[str, 
     merged['novelty_ema'] = _avg('novelty_ema', merged['novelty_ema'])
     merged['memory_util'] = _avg('memory_util', merged['memory_util'])
     merged['entropy_push'] = _avg('entropy_push', merged['entropy_push'])
+    merged['success_rate'] = _avg('success_rate', merged['success_rate'])
+    merged['success_window'] = _avg('success_window', merged['success_window'])
+    merged['advantage_ema'] = _avg('advantage_ema', merged['advantage_ema'])
+    merged['advantage_span'] = _avg('advantage_span', merged['advantage_span'])
     best_vals = [float(m.get('best_reward', float('-inf'))) for m in metas]
     if best_vals:
         merged['best_reward'] = float(max(best_vals))
+    peak_vals = [float(m.get('advantage_peak', merged['advantage_peak'])) for m in metas if 'advantage_peak' in m]
+    if peak_vals:
+        merged['advantage_peak'] = float(max(peak_vals))
     extras: Dict[str, Any] = {}
     for meta in metas:
         for key, value in meta.items():
@@ -1765,6 +1807,10 @@ def _rl_collective_signal(
     team_best = float(np.clip(meta.get('population_reward_best_norm', 0.0), 0.0, 1.0))
     team_pressure = float(max(0.0, meta.get('population_reward_pressure', 0.0)))
     span_component = float(np.tanh((reward_span + reward_std) / denom)) if denom > 0 else 0.0
+    success_rate = float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+    success_window = float(np.clip(meta.get('success_window', success_rate), 0.0, 1.0))
+    advantage_span = float(np.clip(meta.get('advantage_span', 0.0), 0.0, 10.0))
+    advantage_peak = float(meta.get('advantage_peak', 0.0))
     objective_default = float(
         np.clip(
             _RL_SIGNAL_COEFF_DEFAULTS['team_objective_bias']
@@ -1802,6 +1848,10 @@ def _rl_collective_signal(
         'team_best': team_best,
         'team_pressure': team_pressure,
         'span_component': span_component,
+        'success_rate': success_rate,
+        'success_window': success_window,
+        'advantage_span': advantage_span,
+        'advantage_peak': advantage_peak,
     }
     signal = _rl_run_signal_program(state, program)
     if signal is None:
@@ -1821,6 +1871,10 @@ def _rl_collective_signal(
             'group_reward_delta': float(meta.get('population_reward_delta', 0.0)),
             'team_objective': objective_default,
             'group_reward_objective': objective_default,
+            'success_rate': success_rate,
+            'success_window': success_window,
+            'advantage_span': advantage_span,
+            'advantage_peak': advantage_peak,
         }
     else:
         signal = {
@@ -1836,6 +1890,10 @@ def _rl_collective_signal(
             'group_reward_delta': float(signal.get('group_reward_delta', meta.get('population_reward_delta', 0.0))),
             'team_objective': float(np.clip(signal.get('team_objective', objective_default), -3.0, 3.0)),
             'group_reward_objective': float(np.clip(signal.get('team_objective', objective_default), -3.0, 3.0)),
+            'success_rate': float(np.clip(signal.get('success_rate', success_rate), 0.0, 1.0)),
+            'success_window': float(np.clip(signal.get('success_window', success_window), 0.0, 1.0)),
+            'advantage_span': float(np.clip(signal.get('advantage_span', advantage_span), 0.0, 10.0)),
+            'advantage_peak': float(signal.get('advantage_peak', advantage_peak)),
         }
     if isinstance(meta, dict):
         meta['signal_kernel'] = dict(coeffs)
@@ -2552,6 +2610,7 @@ class Genome:
         }
         self.rl_memory_limit = int(_DEFAULT_RL_MEMORY_LIMIT)
         self.rl_memory: deque = deque(maxlen=self.rl_memory_limit)
+        self.rl_success_archive: deque = deque(maxlen=_RL_SUCCESS_ARCHIVE_LIMIT)
         self.rl_train_steps = int(18)
         self.rl_l2 = float(0.0001)
         self.rl_meta: Dict[str, Any] = _rl_default_meta()
@@ -2629,6 +2688,11 @@ class Genome:
         except Exception:
             buf = []
         g.rl_memory = deque(buf, maxlen=limit)
+        try:
+            success_buf = list(getattr(self, 'rl_success_archive', []))
+        except Exception:
+            success_buf = []
+        g.rl_success_archive = deque(success_buf, maxlen=_RL_SUCCESS_ARCHIVE_LIMIT)
         g.rl_train_steps = int(getattr(self, 'rl_train_steps', 18))
         g.rl_l2 = float(getattr(self, 'rl_l2', 0.0001))
         try:
@@ -5974,6 +6038,20 @@ class ReproPlanaNEATPlus:
         if f_buf:
             merged.extend(f_buf[-tail:])
         child.rl_memory = merged
+        archive = deque(maxlen=_RL_SUCCESS_ARCHIVE_LIMIT)
+        try:
+            m_archive = list(getattr(mother, 'rl_success_archive', []) or []) if mother is not None else []
+        except Exception:
+            m_archive = []
+        try:
+            f_archive = list(getattr(father, 'rl_success_archive', []) or []) if father is not None else []
+        except Exception:
+            f_archive = []
+        if m_archive:
+            archive.extend(m_archive[-max(1, _RL_SUCCESS_ARCHIVE_LIMIT // 2):])
+        if f_archive:
+            archive.extend(f_archive[-max(1, _RL_SUCCESS_ARCHIVE_LIMIT // 2):])
+        child.rl_success_archive = archive
         child.rl_meta = _rl_merge_meta(getattr(mother, 'rl_meta', None), getattr(father, 'rl_meta', None))
 
     def _make_offspring(self, species, offspring_counts, sidx, species_pool):
@@ -10474,6 +10552,16 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
             buf = deque(maxlen=limit)
     meta = _rl_prepare_meta(genome)
     reward_anchor = float(meta.get('reward_ema', 0.0))
+    archive = getattr(genome, 'rl_success_archive', None)
+    if not isinstance(archive, deque):
+        archive = deque(maxlen=_RL_SUCCESS_ARCHIVE_LIMIT)
+    elif archive.maxlen != _RL_SUCCESS_ARCHIVE_LIMIT:
+        archive = deque(list(archive)[- _RL_SUCCESS_ARCHIVE_LIMIT:], maxlen=_RL_SUCCESS_ARCHIVE_LIMIT)
+    baseline = float(meta.get('reward_ema', meta.get('last_reward', 0.0)))
+    reward_var = float(max(0.0, meta.get('reward_var', 0.0)))
+    reward_sigma = float(math.sqrt(reward_var + 1e-9))
+    success_count = 0
+    new_advantages: List[float] = []
     for exp in experiences:
         try:
             obs = np.asarray(exp.get('obs'), dtype=np.float64).reshape(-1)
@@ -10500,6 +10588,14 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
                 novelty = 0.0
         reward_val = float(exp.get('reward', 0.0))
         ret_val = float(exp.get('return', exp.get('reward', 0.0)))
+        advantage_val = float(ret_val - baseline)
+        success_flag = advantage_val >= 0.0
+        if success_flag:
+            success_count += 1
+        if reward_sigma > 0.0:
+            norm_advantage = float(np.tanh(advantage_val / reward_sigma))
+        else:
+            norm_advantage = float(np.tanh(advantage_val))
         payload = {
             'obs': obs,
             'action': action,
@@ -10508,11 +10604,18 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
             'return': ret_val,
             'novelty': float(novelty),
             'done': bool(exp.get('done', False)),
+            'advantage': advantage_val,
+            'advantage_norm': norm_advantage,
+            'success': bool(success_flag),
         }
         surprise = abs(reward_val - reward_anchor)
         payload['priority'] = float(abs(ret_val) + 0.1 * abs(reward_val) + 0.5 * payload['novelty'] + 0.3 * surprise)
         buf.append(payload)
+        if success_flag:
+            archive.append(dict(payload))
+        new_advantages.append(advantage_val)
     genome.rl_memory = buf
+    genome.rl_success_archive = archive
     try:
         util = len(buf) / float(buf.maxlen or len(buf) or 1)
     except Exception:
@@ -10520,6 +10623,20 @@ def _rl_store_experiences(genome: Genome, experiences: Sequence[Dict[str, Any]])
     meta['memory_util'] = float(np.clip(util, 0.0, 1.0))
     meta['weight_kernel'] = dict(_ensure_rl_weight_coeffs(genome))
     meta['signal_kernel'] = dict(_ensure_rl_signal_coeffs(genome))
+    if experiences:
+        ratio = float(success_count) / float(len(experiences))
+        meta['success_window'] = float(ratio)
+        prev_rate = float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+        meta['success_rate'] = float((1.0 - _RL_SUCCESS_ALPHA) * prev_rate + _RL_SUCCESS_ALPHA * ratio)
+    if new_advantages:
+        mean_adv = float(sum(new_advantages) / len(new_advantages))
+        prev_adv = float(meta.get('advantage_ema', 0.0))
+        meta['advantage_ema'] = float((1.0 - _RL_SUCCESS_ALPHA) * prev_adv + _RL_SUCCESS_ALPHA * mean_adv)
+        span_now = float(max(new_advantages) - min(new_advantages))
+        prev_span = float(meta.get('advantage_span', 0.0))
+        meta['advantage_span'] = float((1.0 - 0.5 * _RL_SUCCESS_ALPHA) * prev_span + 0.5 * _RL_SUCCESS_ALPHA * span_now)
+        peak_prev = float(meta.get('advantage_peak', 0.0))
+        meta['advantage_peak'] = float(max(peak_prev, max(new_advantages)))
 
 
 def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> None:
@@ -10532,6 +10649,13 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
         act = item.get('action')
         if isinstance(act, (int, np.integer)):
             discrete.append((idx, item))
+    archive_list = list(getattr(genome, 'rl_success_archive', []) or [])
+    if archive_list:
+        base_index = len(buf)
+        for offset, item in enumerate(archive_list):
+            act = item.get('action')
+            if isinstance(act, (int, np.integer)):
+                discrete.append((base_index + offset, item))
     if len(discrete) < 4:
         return
     indices = np.asarray([idx for idx, _ in discrete], dtype=np.float64)
@@ -10548,6 +10672,24 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
         else:
             ret_weights = shifted
     ret_weights = ret_weights + float(max(0.0, entropy)) * (np.std(returns) + 1e-6)
+    advantages = np.asarray([float(d.get('advantage', d.get('return', 0.0))) for d in items], dtype=np.float64)
+    if advantages.size:
+        adv_center = float(meta.get('advantage_ema', 0.0))
+        adv_norm = advantages - adv_center
+        adv_std = float(np.std(adv_norm))
+        if adv_std > 1e-6:
+            adv_norm = adv_norm / (adv_std + 1e-6)
+        else:
+            adv_norm = np.tanh(adv_norm)
+    else:
+        adv_norm = np.zeros_like(ret_weights)
+    success_flags = np.asarray([1.0 if d.get('success') else 0.0 for d in items], dtype=np.float64)
+    if success_flags.size:
+        success_rate = float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+        success_bonus = success_flags * (0.5 + 0.5 * success_rate)
+    else:
+        success_bonus = np.zeros_like(ret_weights)
+    ret_weights = ret_weights + np.maximum(0.0, adv_norm) * 0.6 + success_bonus
     novelty = np.asarray([float(d.get('novelty', 0.0)) for d in items], dtype=np.float64)
     if novelty.size:
         min_novel = float(np.min(novelty))
@@ -10602,6 +10744,10 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
         'memory_util': float(np.clip(meta.get('memory_util', 0.0), 0.0, 1.0)),
         'lazy_strength': float(np.clip(getattr(genome, 'lazy_lineage_strength', 0.0), 0.0, 4.0)),
         'size': float(len(items)),
+        'advantage': adv_norm,
+        'advantage_raw': advantages,
+        'success_rate': float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0)),
+        'success_window': float(np.clip(meta.get('success_window', meta.get('success_rate', 0.0)), 0.0, 1.0)),
     }
     weights = _rl_run_weight_program(weight_state, program)
     if weights is None or weights.shape != ret_weights.shape:
@@ -10736,11 +10882,20 @@ def _rl_experience_replay_update(genome: Genome, lr: float, entropy: float) -> N
     if picked:
         novelty_mean = float(np.mean([p.get('novelty', 0.0) for p in picked]))
         priority_mean = float(np.mean([p.get('priority', 0.0) for p in picked]))
+        adv_array = np.asarray([float(p.get('advantage', p.get('return', 0.0))) for p in picked], dtype=np.float64)
+        adv_mean = float(np.mean(adv_array)) if adv_array.size else 0.0
+        adv_span = float(np.ptp(adv_array)) if adv_array.size else 0.0
+        success_ratio = float(np.mean([1.0 if p.get('success') else 0.0 for p in picked]))
         meta['last_replay'] = {
             'batch': len(picked),
             'mean_return': float(np.mean(batch_returns)) if batch_returns else 0.0,
             'novelty_mean': novelty_mean,
             'priority_mean': priority_mean,
+            'advantage_mean': adv_mean,
+            'advantage_span': adv_span,
+            'advantage_peak': float(meta.get('advantage_peak', adv_span)),
+            'success_ratio': success_ratio,
+            'success_rate': float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0)),
             'weight_kernel': dict(coeffs),
             'weight_program_requested': requested_program,
             'weight_program': program,
@@ -10828,8 +10983,15 @@ def _rl_update_meta_profile(
     meta['trend'] = float(0.6 * meta.get('trend', 0.0) + 0.4 * diff)
     meta['stability'] = float(1.0 / (1.0 + max(1e-9, meta['reward_var'])))
     meta['best_reward'] = float(max(meta.get('best_reward', float('-inf')), float(np.max(rewards_arr))))
+    success_threshold = float(meta.get('reward_ema', avg_reward))
+    success_count = sum(1 for r in rewards if r >= success_threshold)
+    success_ratio = float(success_count) / float(len(rewards)) if rewards else 0.0
+    meta['success_window'] = float(success_ratio)
+    prev_rate = float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+    meta['success_rate'] = float((1.0 - _RL_SUCCESS_ALPHA) * prev_rate + _RL_SUCCESS_ALPHA * success_ratio)
     if experiences:
         novelty_vals: List[float] = []
+        adv_vals: List[float] = []
         for exp in experiences:
             obs = exp.get('obs')
             next_obs = exp.get('next_obs')
@@ -10849,9 +11011,22 @@ def _rl_update_meta_profile(
                 novelty_vals.append(float(np.linalg.norm(next_arr - obs_arr)))
             except Exception:
                 continue
+            try:
+                adv_vals.append(float(exp.get('advantage', exp.get('return', 0.0)) - success_threshold))
+            except Exception:
+                pass
         if novelty_vals:
             mean_novelty = float(sum(novelty_vals) / len(novelty_vals))
             meta['novelty_ema'] = float(0.8 * meta.get('novelty_ema', 0.0) + 0.2 * mean_novelty)
+        if adv_vals:
+            adv_mean = float(sum(adv_vals) / len(adv_vals))
+            prev_adv = float(meta.get('advantage_ema', 0.0))
+            meta['advantage_ema'] = float((1.0 - _RL_SUCCESS_ALPHA) * prev_adv + _RL_SUCCESS_ALPHA * adv_mean)
+            span_now = float(max(adv_vals) - min(adv_vals))
+            prev_span = float(meta.get('advantage_span', 0.0))
+            meta['advantage_span'] = float((1.0 - 0.5 * _RL_SUCCESS_ALPHA) * prev_span + 0.5 * _RL_SUCCESS_ALPHA * span_now)
+            peak_prev = float(meta.get('advantage_peak', 0.0))
+            meta['advantage_peak'] = float(max(peak_prev, max(adv_vals)))
     params_before = dict(getattr(genome, 'rl_params', {}) or {})
     stability = float(meta['stability'])
     denom = max(1.0, abs(prev_ema) + reward_std + 1e-6)
@@ -10926,6 +11101,9 @@ def _rl_update_meta_profile(
             'team_pressure': float(max(0.0, meta.get('population_reward_pressure', 0.0))),
             'team_best': float(np.clip(meta.get('population_reward_best_norm', 0.0), 0.0, 1.0)),
             'reward_span_norm': reward_span_norm,
+            'success_rate': float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0)),
+            'success_window': float(np.clip(meta.get('success_window', meta.get('success_rate', 0.0)), 0.0, 1.0)),
+            'advantage_span': float(np.clip(meta.get('advantage_span', 0.0), 0.0, 10.0)),
         }
         scheduler_requested = _rl_scheduler_program_for(genome)
         default_sched_program = _RL_SCHED_DSL_TEMPLATE.format(
@@ -11257,8 +11435,19 @@ def _episode_bc_update(genome: 'Genome', obs_list, act_list, ret_list, steps=20,
     if len(obs_list) == 0:
         return
     n = len(obs_list)
-    k = max(1, int(max(1.0 / n, top_frac) * n))
-    idx = np.argsort(ret_list)[::-1][:k]
+    meta = getattr(genome, 'rl_meta', {}) or {}
+    success_rate = float(np.clip(meta.get('success_rate', 0.0), 0.0, 1.0))
+    adaptive_frac = float(np.clip(top_frac + 0.2 * success_rate, 0.05, 0.95))
+    k = max(1, int(max(1.0 / n, adaptive_frac) * n))
+    returns = np.asarray(ret_list, dtype=np.float64)
+    baseline = float(meta.get('reward_ema', 0.0))
+    if returns.size:
+        scores = returns - baseline
+        if not np.any(np.abs(scores) > 1e-6):
+            scores = returns
+    else:
+        scores = np.asarray(ret_list)
+    idx = np.argsort(scores)[::-1][:k]
     X = np.asarray([obs_list[i] for i in idx], dtype=np.float64)
     y = np.asarray([act_list[i] for i in idx], dtype=np.int32)
     try:
