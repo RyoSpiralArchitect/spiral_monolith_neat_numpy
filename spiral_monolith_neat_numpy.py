@@ -25,6 +25,11 @@
 #   一度コンパイルして NumPy で高速評価します。
 #   リプレイ DSL: cpp ライクな DSL で優先度付きリプレイ／利他シグナル／スケジューラを
 #   事前コンパイルし NumPy と共に実行して高速化します。
+# • Diversity DSL: structural diversity scaling now uses compiled kernels, exposing
+#   scarcity, household, and entropy coefficients for aggressive tuning without
+#   Python overhead.
+#   多様性 DSL: 構造的多様性スケーリングをコンパイル済みカーネルで処理し、希少性・ハウスホールド・エントロピー係数を
+#   Python のオーバーヘッドなしで過激に調律できます。
 # • Advantage-weighted replay: GAE-smoothed returns feed sample-weighted policy cloning
 #   so agents improve under harsh council pressure without collapsing exploration.
 #   アドバンテージ重み付きリプレイ: GAE 平滑化報酬とサンプル重み学習で、過酷な評議会圧の下でも
@@ -463,6 +468,234 @@ target *= family_factor
 
 
 _MONODROMY_PROGRAM_CACHE: Dict[str, Any] = {}
+
+
+_DIVERSITY_COEFF_DEFAULTS: Dict[str, float] = {
+    'adaptive_bias': 1.0,
+    'scarcity_gain': 0.65,
+    'noise_gain': 0.25,
+    'focus_gain': 0.18,
+    'entropy_gain': 0.35,
+    'entropy_norm_gain': 0.4,
+    'spread_gain': 0.35,
+    'lazy_gain': 0.18,
+    'household_gain': 0.12,
+    'scarcity_push': 1.5,
+    'focus_push': 0.6,
+    'noise_focus_gain': 0.18,
+    'entropy_overflow_gain': 0.22,
+    'entropy_boost_cap': 2.8,
+    'entropy_floor': 1.0,
+    'family_penalty': 1.2,
+    'family_relief': 0.45,
+    'adaptive_lo': 0.5,
+    'adaptive_hi': 4.0,
+    'bonus_floor': 0.02,
+    'bonus_floor_scale': 0.2,
+    'bonus_cap_scale': 8.0,
+    'bonus_cap_bias': 0.5,
+    'power_gain': 0.5,
+    'power_spread_gain': 0.2,
+    'power_cap': 3.5,
+}
+
+
+_DIVERSITY_DSL_TEMPLATE = """
+// cpp-ish DSL for structural diversity scaling.
+// Inputs: base_bonus, base_power, entropy, entropy_norm, scarcity, structural_spread,
+//         env_noise, env_focus, env_entropy, lazy_share, household_pressure,
+//         family_entropy, top_family_share, family_count.
+adaptive = {adaptive_bias}
+adaptive += {scarcity_gain} * scarcity
+adaptive += {noise_gain} * env_noise
+adaptive += {focus_gain} * max(0.0, env_focus)
+adaptive += {entropy_gain} * max(0.0, env_entropy)
+adaptive += {entropy_norm_gain} * max(0.0, 1.0 - entropy_norm)
+adaptive += {spread_gain} * max(0.0, structural_spread)
+adaptive += {lazy_gain} * max(0.0, lazy_share)
+adaptive += {household_gain} * max(0.0, household_pressure)
+adaptive = clamp(adaptive, {adaptive_lo}, {adaptive_hi})
+
+scarcity_push = 1.0 + {scarcity_push} * scarcity
+focus_push = 1.0 + {focus_push} * max(0.0, env_focus)
+
+family_count_safe = max(1.0, float(family_count))
+expected_share = 1.0 / family_count_safe
+family_gap = max(0.0, top_family_share - expected_share)
+family_relief = 1.0 + {family_penalty} * family_gap - {family_relief} * max(0.0, family_entropy)
+family_relief = max(family_relief, 0.35)
+
+entropy_over = max(0.0, entropy - {entropy_floor})
+entropy_boost = clamp(1.0 + {entropy_overflow_gain} * entropy_over, 1.0, {entropy_boost_cap})
+
+bonus = base_bonus
+if bonus <= 0.0:
+    bonus = {bonus_floor}
+bonus *= adaptive
+bonus *= scarcity_push
+bonus *= focus_push
+bonus *= family_relief
+bonus *= 1.0 + {noise_focus_gain} * env_noise
+bonus *= entropy_boost
+
+min_scale = base_bonus * {bonus_floor_scale}
+if min_scale <= 0.0:
+    min_scale = {bonus_floor}
+max_scale = max(base_bonus * {bonus_cap_scale}, base_bonus + {bonus_cap_bias})
+bonus = clamp(bonus, min_scale, max_scale)
+
+power = clamp(
+    base_power * (1.0 + {power_gain} * scarcity + {power_spread_gain} * max(0.0, structural_spread)),
+    1.0,
+    {power_cap}
+)
+
+bonus_min = min_scale
+bonus_max = max_scale
+"""
+
+
+_DIVERSITY_PROGRAM_CACHE: Dict[str, Any] = {}
+
+
+def _diversity_sanitise_coeffs(raw: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    base = dict(_DIVERSITY_COEFF_DEFAULTS)
+    if isinstance(raw, dict):
+        for key, default in _DIVERSITY_COEFF_DEFAULTS.items():
+            val = raw.get(key, default)
+            try:
+                val = float(val)
+            except Exception:
+                val = default
+            if not np.isfinite(val):
+                val = default
+            if key.endswith('_lo'):
+                val = float(np.clip(val, 0.0, 16.0))
+            elif key.endswith('_hi'):
+                val = float(np.clip(val, 0.1, 64.0))
+            elif key.endswith('_cap'):
+                val = float(np.clip(val, 0.1, 64.0))
+            elif key.endswith('_gain'):
+                val = float(np.clip(val, -8.0, 8.0))
+            base[key] = val
+    lo = base.get('adaptive_lo', 0.5)
+    hi = base.get('adaptive_hi', 4.0)
+    if lo > hi:
+        base['adaptive_lo'], base['adaptive_hi'] = float(hi), float(lo)
+    floor = base.get('bonus_floor', 0.02)
+    if floor < 0.0:
+        base['bonus_floor'] = 0.0
+    scale = base.get('bonus_floor_scale', 0.2)
+    if scale < 0.0:
+        base['bonus_floor_scale'] = 0.0
+    return base
+
+
+def _diversity_program_for(neat_inst: 'ReproPlanaNEATPlus') -> str:
+    template = getattr(neat_inst, 'diversity_program_template', None)
+    if not isinstance(template, str) or not template.strip():
+        template = _DIVERSITY_DSL_TEMPLATE
+        neat_inst.diversity_program_template = template
+    coeffs = getattr(neat_inst, 'diversity_program_coeffs', None)
+    if not isinstance(coeffs, dict):
+        coeffs = dict(_DIVERSITY_COEFF_DEFAULTS)
+        neat_inst.diversity_program_coeffs = coeffs
+    else:
+        coeffs = _diversity_sanitise_coeffs(coeffs)
+        neat_inst.diversity_program_coeffs = coeffs
+    signature = _dsl_coeff_signature(template, coeffs, _DIVERSITY_COEFF_DEFAULTS)
+    cache = getattr(neat_inst, '_diversity_program_cache', None)
+    if isinstance(cache, tuple) and cache and cache[0] == signature:
+        return cache[1]
+    formatted = {}
+    for key, default in _DIVERSITY_COEFF_DEFAULTS.items():
+        val = coeffs.get(key, default)
+        try:
+            val = float(val)
+        except Exception:
+            val = default
+        if not np.isfinite(val):
+            val = default
+        formatted[key] = repr(val)
+    try:
+        program = template.format(**formatted)
+    except KeyError:
+        template = _DIVERSITY_DSL_TEMPLATE
+        formatted = {k: repr(v) for k, v in _DIVERSITY_COEFF_DEFAULTS.items()}
+        signature = _dsl_coeff_signature(template, _DIVERSITY_COEFF_DEFAULTS, _DIVERSITY_COEFF_DEFAULTS)
+        program = template.format(**formatted)
+    neat_inst._diversity_program_cache = (signature, program)
+    neat_inst._diversity_program_signature = signature
+    return program
+
+
+def _diversity_compile_program(program: str):
+    cached = _DIVERSITY_PROGRAM_CACHE.get(program)
+    if cached is not None:
+        return cached
+    lines: List[str] = []
+    for raw in program.strip().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.endswith(';'):
+            line = line[:-1]
+        lines.append(line)
+    if not lines:
+        raise ValueError('empty diversity program')
+    src = '\n'.join(lines)
+    compiled = compile(src, '<diversity_program>', 'exec')
+    _DIVERSITY_PROGRAM_CACHE[program] = compiled
+    return compiled
+
+
+def _diversity_prepare_executor(neat_inst: 'ReproPlanaNEATPlus') -> Optional[Any]:
+    dirty = bool(getattr(neat_inst, '_diversity_program_dirty', True))
+    program = getattr(neat_inst, '_diversity_program_source', None)
+    if dirty or not isinstance(program, str) or not program.strip():
+        program = _diversity_program_for(neat_inst)
+        neat_inst._diversity_program_source = program
+        neat_inst._diversity_program_dirty = False
+    try:
+        compiled = _diversity_compile_program(program)
+    except Exception:
+        return None
+    return compiled
+
+
+def _diversity_run_program(compiled: Any, state: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    locals_dict = dict(state)
+    try:
+        exec(compiled, {'np': np, 'math': math, 'clamp': _dsl_clamp}, locals_dict)
+    except Exception:
+        return None
+    required = ('bonus', 'power', 'entropy_boost')
+    result: Dict[str, float] = {}
+    for key in required:
+        val = locals_dict.get(key, state.get(key))
+        if val is None:
+            return None
+        try:
+            result[key] = float(val)
+        except Exception:
+            return None
+    optional_keys = (
+        'adaptive',
+        'family_relief',
+        'bonus_min',
+        'bonus_max',
+        'scarcity_push',
+        'focus_push',
+    )
+    for key in optional_keys:
+        val = locals_dict.get(key)
+        if val is None:
+            continue
+        try:
+            result[key] = float(val)
+        except Exception:
+            continue
+    return result
 
 
 _ENV_LEADER_COEFF_DEFAULTS: Dict[str, float] = {
@@ -4569,6 +4802,13 @@ class ReproPlanaNEATPlus:
         self._monodromy_program_source: Optional[str] = None
         self._monodromy_program_dirty: bool = True
         self._monodromy_program_cache: Optional[Tuple[Any, str]] = None
+        self.diversity_program_template: str = _DIVERSITY_DSL_TEMPLATE
+        self.diversity_program_coeffs: Dict[str, float] = dict(_DIVERSITY_COEFF_DEFAULTS)
+        self._diversity_program_source: Optional[str] = None
+        self._diversity_program_dirty: bool = True
+        self._diversity_program_cache: Optional[Tuple[Any, str]] = None
+        self._diversity_program_signature: Optional[Any] = None
+        self._diversity_program_last: Dict[str, float] = {}
         nodes = {}
         for i in range(num_inputs):
             nodes[i] = NodeGene(i, 'input', 'identity')
@@ -7657,13 +7897,76 @@ class ReproPlanaNEATPlus:
                 div_bonus_scale = float(base_div_bonus * adaptive_multiplier * scarcity_push * focus_push)
                 entropy_bonus_boost = float(np.clip(1.0 + 0.22 * max(0.0, diversity_entropy_raw - 1.0), 1.0, 2.8))
                 div_bonus_scale = float(div_bonus_scale * entropy_bonus_boost)
+                div_bonus_floor_val = float(base_div_bonus * 0.2) if base_div_bonus > 0.0 else 0.0
+                div_bonus_cap_val = float(max(base_div_bonus * 8.0, base_div_bonus + 0.5)) if base_div_bonus > 0.0 else float(base_div_bonus)
+                family_relief_factor = 1.0
                 if base_div_bonus > 0.0:
-                    upper_cap = float(max(base_div_bonus * 8.0, base_div_bonus + 0.5))
-                    div_bonus_scale = float(np.clip(div_bonus_scale, base_div_bonus * 0.2, upper_cap))
+                    div_bonus_scale = float(np.clip(div_bonus_scale, max(div_bonus_floor_val, base_div_bonus * 0.2), div_bonus_cap_val))
                     if diversity_scarcity > 0.2:
-                        div_bonus_scale = float(max(div_bonus_scale, base_div_bonus * (0.6 + 1.4 * diversity_scarcity)))
+                        scarcity_floor = float(base_div_bonus * (0.6 + 1.4 * diversity_scarcity))
+                        div_bonus_scale = float(max(div_bonus_scale, scarcity_floor))
+                        div_bonus_floor_val = float(max(div_bonus_floor_val, scarcity_floor))
+                    div_bonus_floor_val = float(max(div_bonus_floor_val, base_div_bonus * 0.2))
+                    div_bonus_cap_val = float(max(div_bonus_cap_val, div_bonus_scale))
+                else:
+                    div_bonus_floor_val = float(min(div_bonus_floor_val, div_bonus_scale))
+                    div_bonus_cap_val = float(max(div_bonus_cap_val, div_bonus_scale))
                 div_power = float(np.clip(base_div_power * (1.0 + 0.5 * diversity_scarcity), 1.0, 3.5))
                 household_pressure = float(self._household_pressure())
+                diversity_executor = _diversity_prepare_executor(self)
+                diversity_program_result: Optional[Dict[str, float]] = None
+                if diversity_executor is not None:
+                    diversity_state = {
+                        'base_bonus': float(base_div_bonus),
+                        'base_power': float(base_div_power),
+                        'entropy': float(diversity_entropy_raw),
+                        'entropy_norm': float(diversity_entropy_norm),
+                        'scarcity': float(diversity_scarcity),
+                        'structural_spread': float(structural_spread),
+                        'env_noise': float(env_noise),
+                        'env_focus': float(env_focus),
+                        'env_entropy': float(env_entropy),
+                        'lazy_share': float(lazy_share),
+                        'household_pressure': float(household_pressure),
+                        'family_entropy': float(family_entropy),
+                        'top_family_share': float(top_family_share),
+                        'family_count': float(family_count or 0),
+                    }
+                    diversity_program_result = _diversity_run_program(diversity_executor, diversity_state)
+                    if diversity_program_result:
+                        try:
+                            div_bonus_scale = float(diversity_program_result.get('bonus', div_bonus_scale))
+                        except Exception:
+                            diversity_program_result = None
+                        else:
+                            div_power = float(np.clip(diversity_program_result.get('power', div_power), 1.0, 16.0))
+                            entropy_bonus_boost = float(max(diversity_program_result.get('entropy_boost', entropy_bonus_boost), 1e-9))
+                            adaptive_multiplier = float(diversity_program_result.get('adaptive', adaptive_multiplier))
+                            scarcity_push = float(diversity_program_result.get('scarcity_push', scarcity_push))
+                            focus_push = float(diversity_program_result.get('focus_push', focus_push))
+                            div_bonus_floor_val = float(diversity_program_result.get('bonus_min', div_bonus_floor_val))
+                            div_bonus_cap_val = float(diversity_program_result.get('bonus_max', div_bonus_cap_val))
+                            family_relief_factor = float(diversity_program_result.get('family_relief', family_relief_factor))
+                if not np.isfinite(div_bonus_scale):
+                    div_bonus_scale = float(base_div_bonus)
+                if not np.isfinite(div_power):
+                    div_power = float(base_div_power)
+                if not np.isfinite(entropy_bonus_boost):
+                    entropy_bonus_boost = 1.0
+                if not np.isfinite(div_bonus_floor_val):
+                    div_bonus_floor_val = float(base_div_bonus)
+                if not np.isfinite(div_bonus_cap_val):
+                    div_bonus_cap_val = float(div_bonus_scale)
+                if not np.isfinite(family_relief_factor):
+                    family_relief_factor = 1.0
+                div_bonus_floor_val = float(max(0.0, div_bonus_floor_val))
+                div_bonus_cap_val = float(max(div_bonus_floor_val, div_bonus_cap_val))
+                self._diversity_program_last = diversity_program_result or {}
+                diversity_program_signature = getattr(self, '_diversity_program_signature', None)
+                if isinstance(diversity_program_signature, tuple):
+                    diversity_program_signature = repr(diversity_program_signature)
+                else:
+                    diversity_program_signature = ''
                 div_bonus_total = 0.0
                 div_bonus_max = 0.0
                 div_bonus_count = 0
@@ -7677,6 +7980,8 @@ class ReproPlanaNEATPlus:
                     'structural_spread': float(structural_spread),
                     'diversity_bonus': float(div_bonus_scale),
                     'diversity_bonus_scale': float(div_bonus_scale),
+                    'diversity_bonus_min': float(div_bonus_floor_val),
+                    'diversity_bonus_max': float(div_bonus_cap_val),
                     'diversity_power': float(div_power),
                     'diversity_entropy_boost': float(entropy_bonus_boost),
                     'env_noise': float(env_noise),
@@ -7690,7 +7995,14 @@ class ReproPlanaNEATPlus:
                     'family_surplus_ratio_max': float(family_surplus_ratio_max),
                     'family_surplus_ratio_mean': float(family_surplus_ratio_mean),
                     'household_pressure': float(household_pressure),
+                    'diversity_program_used': bool(diversity_program_result is not None),
+                    'diversity_program_signature': diversity_program_signature,
                 }
+                if diversity_program_result:
+                    diversity_snapshot['diversity_program_family_relief'] = float(family_relief_factor)
+                    diversity_snapshot['diversity_program_adaptive'] = float(diversity_program_result.get('adaptive', adaptive_multiplier))
+                    diversity_snapshot['diversity_program_bonus_min'] = float(div_bonus_floor_val)
+                    diversity_snapshot['diversity_program_bonus_max'] = float(div_bonus_cap_val)
                 self._update_collective_signal(diversity_entropy_norm, diversity_scarcity, family_surplus_ratio_mean, gen)
                 self._diversity_snapshot = diversity_snapshot
                 self.diversity_history.append(diversity_snapshot)
